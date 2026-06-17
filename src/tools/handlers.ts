@@ -36,7 +36,7 @@ import {
   type UpdateCookingRecordResult,
 } from "./update-cooking-record.js";
 import type { MealPlanEntry, MealType } from "../engine/meal-planner.js";
-import { loadCandidateDishes } from "./candidate-loader.js";
+import { loadCandidateDishes, loadUserPreferences } from "./candidate-loader.js";
 
 // ── Shared validation ──
 
@@ -266,8 +266,8 @@ export interface DailySummaryResult {
   eaten: { kcal: number; proteinGrams: number; carbsGrams: number; fatGrams: number; sodiumMg: number };
   target: { kcal: number; proteinGrams: number; carbsGrams: number; fatGrams: number };
   remaining: { kcal: number; proteinGrams: number; carbsGrams: number; fatGrams: number };
-  water: { totalMl: number; logs: number };
-  exercise: { kcalBurned: number; durationMinutes: number; logs: number };
+  water: { totalMl: number; targetMl: number; logs: number };
+  exercise: { kcalBurned: number; durationMinutes: number; targetMinutes: number; logs: number };
   mealCount: number;
   warnings: string[];
 }
@@ -310,10 +310,11 @@ export async function handleDailySummary(ctx: ToolContext, input: DailySummaryIn
       carbsGrams: round1(target.carbsGrams - eaten.carbsGrams),
       fatGrams: round1(target.fatGrams - eaten.fatGrams),
     },
-    water: { totalMl: sum(waterLogs.map((w) => w.amountMl)), logs: waterLogs.length },
+    water: { totalMl: sum(waterLogs.map((w) => w.amountMl)), targetMl: 2000, logs: waterLogs.length },
     exercise: {
       kcalBurned: sum(exerciseLogs.map((e) => e.caloriesBurnedKcal)),
       durationMinutes: sum(exerciseLogs.map((e) => e.durationMinutes)),
+      targetMinutes: 30,
       logs: exerciseLogs.length,
     },
     mealCount: dietLogs.length,
@@ -499,9 +500,10 @@ export async function handleSmartGenerateMealPlan(
     ? requireIsoDate(input.startDate)
     : tomorrow();
 
-  const [bmrProfile, candidates] = await Promise.all([
+  const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
+    loadUserPreferences(ctx),
   ]);
 
   const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
@@ -510,6 +512,7 @@ export async function handleSmartGenerateMealPlan(
     startDate,
     dailyKcalTarget,
     presetDishes: candidates,
+    preferences,
   });
 }
 
@@ -529,9 +532,10 @@ export async function handleSmartRecipeRecommend(
     throw new RangeError("mealType must be breakfast, lunch, or dinner");
   }
 
-  const [bmrProfile, candidates] = await Promise.all([
+  const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
+    loadUserPreferences(ctx),
   ]);
 
   const dailyTarget = bmrProfile?.targetKcal ?? 2000;
@@ -542,6 +546,7 @@ export async function handleSmartRecipeRecommend(
     mealType,
     maxKcal,
     candidates: [...candidates],
+    preferences,
   });
 }
 

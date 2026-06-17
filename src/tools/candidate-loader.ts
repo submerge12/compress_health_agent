@@ -1,7 +1,12 @@
-import type { RecipeDish } from "../engine/recipe-engine.js";
+import type { RecipeDish, RecipePreferences } from "../engine/recipe-engine.js";
 import type { CookingRecordRow } from "../db/repository.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import type { ToolContext } from "./context.js";
+
+export async function loadUserPreferences(ctx: ToolContext): Promise<RecipePreferences> {
+  const rejected = await ctx.repo.listRejectedSeasoningSlugs(ctx.userId);
+  return { rejectedSeasonings: rejected };
+}
 
 export async function loadCandidateDishes(ctx: ToolContext): Promise<RecipeDish[]> {
   const records = await ctx.repo.listCookingRecords(ctx.userId);

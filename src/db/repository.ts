@@ -320,6 +320,46 @@ export function createRepository(db: Db) {
         });
       }
     },
+    // ── Seasoning Preferences ──
+    async listRejectedSeasoningSlugs(userId: string): Promise<string[]> {
+      const rows = await db
+        .select({ slug: schema.seasonings.slug })
+        .from(schema.userSeasoningPreferences)
+        .innerJoin(schema.seasonings, eq(schema.seasonings.id, schema.userSeasoningPreferences.seasoningId))
+        .where(and(
+          eq(schema.userSeasoningPreferences.userId, userId),
+          eq(schema.userSeasoningPreferences.avoid, true),
+        ));
+      return rows.map((r) => r.slug);
+    },
+
+    async setSeasoningPreference(userId: string, seasoningSlug: string, avoid: boolean): Promise<void> {
+      const [seasoning] = await db.select({ id: schema.seasonings.id })
+        .from(schema.seasonings)
+        .where(eq(schema.seasonings.slug, seasoningSlug))
+        .limit(1);
+      if (!seasoning) return;
+
+      const existing = await db.select().from(schema.userSeasoningPreferences)
+        .where(and(
+          eq(schema.userSeasoningPreferences.userId, userId),
+          eq(schema.userSeasoningPreferences.seasoningId, seasoning.id),
+        ))
+        .limit(1);
+
+      if (existing[0]) {
+        await db.update(schema.userSeasoningPreferences)
+          .set({ avoid, preference: avoid ? "rejected" : "neutral", updatedAt: new Date() })
+          .where(eq(schema.userSeasoningPreferences.id, existing[0].id));
+      } else {
+        await db.insert(schema.userSeasoningPreferences).values({
+          userId,
+          seasoningId: seasoning.id,
+          avoid,
+          preference: avoid ? "rejected" : "neutral",
+        });
+      }
+    },
   };
 }
 
