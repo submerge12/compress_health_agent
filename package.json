@@ -1,0 +1,46 @@
+{
+  "name": "compass-health-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tools/context": {
+      "types": "./dist/tools/context.d.ts",
+      "import": "./dist/tools/context.js"
+    },
+    "./tools/handlers": {
+      "types": "./dist/tools/handlers.d.ts",
+      "import": "./dist/tools/handlers.js"
+    },
+    "./engine/types": {
+      "types": "./dist/engine/types.d.ts",
+      "import": "./dist/engine/types.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "tsx src/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "db:push": "drizzle-kit push",
+    "db:seed": "tsx src/db/run-seed.ts"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "drizzle-orm": "^0.45.2",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.21",
+    "drizzle-kit": "^0.31.10",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  }
+}

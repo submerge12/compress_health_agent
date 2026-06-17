@@ -1,0 +1,21 @@
+slug,name_zh,name_en,category,energy_kcal,fat_g,carbohydrate_g,sodium_mg,typical_serving_g,typical_serving_unit_zh,typical_serving_unit_en,source,basis
+olive_oil,橄榄油,Olive oil,oil,899.0,99.9,0.0,0.0,13.5,1汤匙,1 tablespoon,xlsx,per_100g
+sesame_oil,芝麻油,Sesame oil,oil,898.0,99.7,0.2,1.1,4.5,1茶匙,1 teaspoon,xlsx,per_100g
+light_soy_sauce,生抽,Light soy sauce,sauce,63.0,0.1,10.1,5757.0,18.0,1汤匙,1 tablespoon,xlsx,per_100g
+dark_soy_sauce,老抽,Dark soy sauce,sauce,71.0,0.2,9.0,4056.0,6.0,1茶匙,1 teaspoon,xlsx,per_100g
+oyster_sauce,蚝油,Oyster sauce,sauce,80.0,0.0,14.7,4367.0,18.0,1汤匙,1 tablespoon,xlsx,per_100g
+cooking_wine,料酒,Cooking wine (huangjiu),sauce,66.0,0.0,0.0,5.2,15.0,1汤匙,1 tablespoon,xlsx,per_100g
+aged_vinegar,陈醋,Aged vinegar (Shanxi),vinegar,114.0,0.3,17.9,836.0,15.0,1汤匙,1 tablespoon,xlsx,per_100g
+salt,精盐,Table salt,salt,0.0,0.0,0.0,39311.0,1.0,1小撮,1 pinch,xlsx,per_100g
+black_pepper,黑胡椒粉,Black pepper (ground),spice,361.0,2.2,76.9,4.9,0.5,1小撮,1 pinch,xlsx,per_100g
+white_pepper,白胡椒粉,White pepper (ground),spice,361.0,2.2,76.9,4.9,0.5,1小撮,1 pinch,xlsx,per_100g
+star_anise,八角,Star anise,spice,281.0,5.6,75.4,14.7,3.0,1颗,1 piece,xlsx,per_100g
+cinnamon,桂皮,Cinnamon (cassia bark),spice,278.0,2.7,71.5,0.6,5.0,1片,1 piece,xlsx,per_100g
+bay_leaf,香叶,Bay leaf,spice,313.0,8.4,48.7,23.0,0.5,1片,1 leaf,usda,per_100g
+fennel_seeds,茴香籽,Fennel seeds,spice,318.0,11.8,55.5,79.6,2.0,1茶匙,1 teaspoon,xlsx,per_100g
+tsaoko,草果,Tsaoko (Chinese black cardamom),spice,229.0,6.7,47.4,18.0,5.0,1颗,1 piece,usda,per_100g
+garlic,大蒜,Garlic,aromatic,128.0,0.2,27.6,19.6,5.0,1瓣,1 clove,xlsx,per_100g
+ginger,姜,Ginger (fresh),aromatic,41.0,0.7,10.3,14.9,3.0,1片,1 slice,xlsx,per_100g
+scallion,葱,Scallion (green onion),aromatic,30.0,0.3,6.5,4.8,15.0,1根,1 stalk,xlsx,per_100g
+onion,洋葱,Onion,aromatic,39.0,0.2,9.0,4.4,15.0,1片,1 slice,xlsx,per_100g
+cilantro,香菜,Cilantro (coriander leaf),aromatic,31.0,0.4,6.2,48.5,5.0,1小把,1 sprig,xlsx,per_100g
