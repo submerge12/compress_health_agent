@@ -32,7 +32,7 @@ interface MatchedFood {
   label: string;
 }
 
-const SPLIT_PATTERN = /\s*(?:\+|,|，|、|;|；|\band\b)\s*/i;
+const SPLIT_PATTERN = /\s*(?:\+|,|，|、|;|；|\band\b)\s*|(?<=[一-鿿])\s+(?=\d)/;
 const GRAMS_PATTERN = /(\d+(?:\.\d+)?)\s*(?:g|grams?|克)/i;
 const COUNT_UNIT_PATTERN = /(\d+(?:\.\d+)?)\s*([A-Za-z\u4e00-\u9fff]+)/;
 
@@ -51,21 +51,27 @@ export function parseMealItems(description: string, catalog: MealCatalog): Nutri
   validateCatalog(catalog);
   const safeDescription = requireText(description, "description");
   const segments = safeDescription.split(SPLIT_PATTERN).map((part) => part.trim()).filter(Boolean);
-  const items = segments.map((segment) => parseMealSegment(segment, catalog));
+  const items: NutritionEntry[] = [];
+  for (const segment of segments) {
+    const entry = parseMealSegment(segment, catalog);
+    if (entry) items.push(entry);
+  }
   if (items.length === 0) {
-    throw new RangeError("description must include at least one food");
+    throw new RangeError("description must include at least one recognized food");
   }
   return items;
 }
 
-function parseMealSegment(segment: string, catalog: MealCatalog): NutritionEntry {
+function parseMealSegment(segment: string, catalog: MealCatalog): NutritionEntry | undefined {
   const match = findFood(segment, catalog.foods);
-  if (match === undefined) {
-    throw new RangeError(`Unknown food in description segment: ${segment}`);
+  if (match === undefined) return undefined;
+  try {
+    const portion = extractPortion(segment, match.label);
+    const resolved = resolveNaturalPortion(portion, match.food, catalog.naturalUnits);
+    return { slug: match.food.slug, grams: resolved.grams };
+  } catch {
+    return undefined;
   }
-  const portion = extractPortion(segment, match.label);
-  const resolved = resolveNaturalPortion(portion, match.food, catalog.naturalUnits);
-  return { slug: match.food.slug, grams: resolved.grams };
 }
 
 function findFood(segment: string, foods: readonly FoodCatalogRecord[]): MatchedFood | undefined {
