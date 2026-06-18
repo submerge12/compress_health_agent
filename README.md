@@ -14,7 +14,7 @@ Built as a standalone TypeScript library with 12 tool handlers, a PostgreSQL per
 - **7-Day Meal Planner** — Greedy dish selection with per-slot kcal targets, ingredient-run constraints (no ingredient 3 meals in a row), and seasoning preference filtering
 - **Recipe Recommendation** — Score-based ranking by calorie fit, protein target, recency penalty, ingredient variety, and user preference bonuses
 - **Weekly Nutrition Report** — Macro split, adherence rate, sodium trend analysis, micronutrient gap detection, and actionable suggestions
-- **14 Preset Dishes** — Calibrated to a personal ingredient whitelist with accurate nutritional data
+- **14 Preset Dishes + Custom Dishes** — Ships with 14 built-in dishes calibrated to real nutritional data; users can add their own dishes via cooking records
 - **Bilingual i18n** — All user-facing templates available in both Chinese and English
 
 ## Architecture
