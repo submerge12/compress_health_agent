@@ -3,6 +3,7 @@ import {
   boolean,
   date,
   doublePrecision,
+  index,
   integer,
   jsonb,
   pgTable,
@@ -158,10 +159,23 @@ export const foodItems = pgTable("food_items", {
   name: text("name").notNull(),
   nameZh: text("name_zh"),
   category: text("category"),
+  executionBuckets: jsonb("execution_buckets").$type<string[]>().notNull().default(emptyArrayJson),
+  roles: jsonb("roles").$type<string[]>().notNull().default(emptyArrayJson),
+  weeklyFloor: integer("weekly_floor").notNull().default(0),
   source: text("source").notNull().default("csv"),
   ...nutritionColumns(),
   ...timestamps()
 });
+
+export const foodAliases = pgTable("food_aliases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  slug: text("slug").notNull(),
+  alias: text("alias").notNull(),
+  locale: text("locale"),
+  ...timestamps()
+}, (t) => [
+  unique().on(t.slug, t.alias),
+]);
 
 export const seasonings = pgTable("seasonings", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -206,6 +220,26 @@ export const cookingRecords = pgTable("cooking_records", {
   ...timestamps()
 });
 
+export const userDishes = pgTable("user_dishes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  slug: text("slug").notNull(),
+  name: text("name").notNull(),
+  mealCategory: text("meal_category").notNull(),
+  ingredientsJson: jsonb("ingredients_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  seasoningsJson: jsonb("seasonings_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  method: text("method"),
+  caloriesKcal: doublePrecision("calories_kcal").notNull().default(0),
+  proteinGrams: doublePrecision("protein_g").notNull().default(0),
+  carbsGrams: doublePrecision("carbs_g").notNull().default(0),
+  fatGrams: doublePrecision("fat_g").notNull().default(0),
+  sodiumMg: doublePrecision("sodium_mg").notNull().default(0),
+  source: text("source").notNull().default("user"),
+  ...timestamps()
+}, (t) => [
+  unique().on(t.userId, t.slug),
+]);
+
 export const mealCompositions = pgTable("meal_compositions", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
@@ -233,3 +267,23 @@ export const userSeasoningPreferences = pgTable("user_seasoning_preferences", {
   notes: text("notes"),
   ...timestamps()
 });
+
+export const memoryRecords = pgTable("memory_records", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  kind: text("kind").notNull(),
+  subject: text("subject").notNull(),
+  content: text("content").notNull(),
+  sourceText: text("source_text"),
+  confidence: doublePrecision("confidence").notNull().default(1),
+  status: text("status").notNull().default("active"),
+  supersededBy: uuid("superseded_by"),
+  validFrom: timestamp("valid_from", { withTimezone: true }).notNull().defaultNow(),
+  validTo: timestamp("valid_to", { withTimezone: true }),
+  lastConfirmedAt: timestamp("last_confirmed_at", { withTimezone: true }).defaultNow(),
+  timesReferenced: integer("times_referenced").notNull().default(0),
+  ...timestamps()
+}, (t) => [
+  index("memory_records_user_status_idx").on(t.userId, t.status),
+  index("memory_records_user_kind_subject_idx").on(t.userId, t.kind, t.subject),
+]);

@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, desc } from "drizzle-orm";
+import { and, eq, gte, lte, desc, inArray } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "./schema.js";
@@ -107,6 +107,58 @@ export interface CookingRecordRow {
   carbsGrams: number;
   fatGrams: number;
   sodiumMg: number;
+}
+
+export type UserDishMealCategory = "breakfast" | "main";
+
+export interface UserDishRow {
+  id: string;
+  userId: string;
+  slug: string;
+  name: string;
+  mealCategory: UserDishMealCategory;
+  ingredientsJson: Record<string, unknown>[];
+  seasoningsJson: Record<string, unknown>[];
+  method: string | null;
+  caloriesKcal: number;
+  proteinGrams: number;
+  carbsGrams: number;
+  fatGrams: number;
+  sodiumMg: number;
+  source: string;
+}
+
+export type MemoryKind = "preference" | "dislike" | "routine" | "note";
+export type MemoryStatus = "active" | "superseded" | "retracted";
+
+export interface MemoryRecordRow {
+  id: string;
+  userId: string;
+  kind: MemoryKind;
+  subject: string;
+  content: string;
+  sourceText: string | null;
+  confidence: number;
+  status: MemoryStatus;
+  supersededBy: string | null;
+  validFrom: Date;
+  validTo: Date | null;
+  lastConfirmedAt: Date | null;
+  timesReferenced: number;
+}
+
+export interface UpsertMemoryInput {
+  userId: string;
+  kind: MemoryKind;
+  subject: string;
+  content: string;
+  sourceText?: string | null;
+  confidence?: number;
+}
+
+export interface RecallMemoryOptions {
+  kinds?: readonly MemoryKind[];
+  limit?: number;
 }
 
 // ---------- Repository ----------
@@ -321,6 +373,53 @@ export function createRepository(db: Db) {
       }
     },
     // ── Seasoning Preferences ──
+    async upsertUserDish(data: Omit<UserDishRow, "id">): Promise<UserDishRow> {
+      const existing = await db.select().from(schema.userDishes)
+        .where(and(
+          eq(schema.userDishes.userId, data.userId),
+          eq(schema.userDishes.slug, data.slug),
+        ))
+        .limit(1);
+
+      const values = {
+        userId: data.userId,
+        slug: data.slug,
+        name: data.name,
+        mealCategory: data.mealCategory,
+        ingredientsJson: data.ingredientsJson,
+        seasoningsJson: data.seasoningsJson,
+        method: data.method,
+        caloriesKcal: data.caloriesKcal,
+        proteinGrams: data.proteinGrams,
+        carbsGrams: data.carbsGrams,
+        fatGrams: data.fatGrams,
+        sodiumMg: data.sodiumMg,
+        source: data.source,
+        updatedAt: new Date(),
+      };
+
+      if (existing[0]) {
+        const [updated] = await db.update(schema.userDishes)
+          .set(values)
+          .where(eq(schema.userDishes.id, existing[0].id))
+          .returning();
+        return updated as unknown as UserDishRow;
+      }
+
+      const [created] = await db.insert(schema.userDishes).values(values).returning();
+      if (!created) {
+        throw new Error("Failed to create user dish");
+      }
+      return created as unknown as UserDishRow;
+    },
+
+    async listUserDishes(userId: string): Promise<UserDishRow[]> {
+      const rows = await db.select().from(schema.userDishes)
+        .where(eq(schema.userDishes.userId, userId))
+        .orderBy(desc(schema.userDishes.createdAt));
+      return rows as unknown as UserDishRow[];
+    },
+
     async listRejectedSeasoningSlugs(userId: string): Promise<string[]> {
       const rows = await db
         .select({ slug: schema.seasonings.slug })
@@ -360,7 +459,158 @@ export function createRepository(db: Db) {
         });
       }
     },
+
+    // 鈹€鈹€ Memory Records 鈹€鈹€
+    async upsertMemory(input: UpsertMemoryInput): Promise<MemoryRecordRow> {
+      const subject = input.subject.trim();
+      const content = input.content.trim();
+      const now = new Date();
+      const [existing] = await db.select().from(schema.memoryRecords)
+        .where(and(
+          eq(schema.memoryRecords.userId, input.userId),
+          eq(schema.memoryRecords.kind, input.kind),
+          eq(schema.memoryRecords.subject, subject),
+          eq(schema.memoryRecords.status, "active"),
+        ))
+        .limit(1);
+
+      if (existing && existing.content === content) {
+        const [updated] = await db.update(schema.memoryRecords)
+          .set({
+            lastConfirmedAt: now,
+            timesReferenced: existing.timesReferenced + 1,
+            updatedAt: now,
+          })
+          .where(eq(schema.memoryRecords.id, existing.id))
+          .returning();
+        return updated as unknown as MemoryRecordRow;
+      }
+
+      const [created] = await db.insert(schema.memoryRecords).values({
+        userId: input.userId,
+        kind: input.kind,
+        subject,
+        content,
+        sourceText: input.sourceText ?? null,
+        confidence: input.confidence ?? 1,
+        status: "active",
+      }).returning();
+      if (!created) {
+        throw new Error("Failed to create memory record");
+      }
+
+      if (existing) {
+        await db.update(schema.memoryRecords)
+          .set({
+            status: "superseded",
+            supersededBy: created.id,
+            validTo: now,
+            updatedAt: now,
+          })
+          .where(eq(schema.memoryRecords.id, existing.id));
+      }
+
+      return created as unknown as MemoryRecordRow;
+    },
+
+    async recallMemories(
+      userId: string,
+      query: string,
+      options: RecallMemoryOptions = {},
+    ): Promise<MemoryRecordRow[]> {
+      const limit = Math.max(1, Math.min(options.limit ?? 5, 20));
+      const conditions = [
+        eq(schema.memoryRecords.userId, userId),
+        eq(schema.memoryRecords.status, "active"),
+      ];
+      if (options.kinds !== undefined && options.kinds.length > 0) {
+        conditions.push(inArray(schema.memoryRecords.kind, [...options.kinds]));
+      }
+
+      const rows = await db.select().from(schema.memoryRecords)
+        .where(and(...conditions))
+        .orderBy(desc(schema.memoryRecords.lastConfirmedAt), desc(schema.memoryRecords.updatedAt))
+        .limit(Math.max(limit * 4, limit));
+
+      const scored = (rows as unknown as MemoryRecordRow[])
+        .map((row) => ({ row, score: memoryRecallScore(row, query) }))
+        .filter((candidate) => candidate.score > 0)
+        .sort((left, right) => right.score - left.score);
+
+      const bySubject = new Map<string, MemoryRecordRow>();
+      for (const candidate of scored) {
+        if (!bySubject.has(candidate.row.subject)) {
+          bySubject.set(candidate.row.subject, candidate.row);
+        }
+        if (bySubject.size >= limit) break;
+      }
+
+      return [...bySubject.values()];
+    },
+
+    async confirmMemory(userId: string, memoryId: string): Promise<MemoryRecordRow | undefined> {
+      const [updated] = await db.update(schema.memoryRecords)
+        .set({ lastConfirmedAt: new Date(), updatedAt: new Date() })
+        .where(and(
+          eq(schema.memoryRecords.userId, userId),
+          eq(schema.memoryRecords.id, memoryId),
+        ))
+        .returning();
+      return updated as unknown as MemoryRecordRow | undefined;
+    },
+
+    async retractMemory(userId: string, memoryId: string): Promise<void> {
+      const now = new Date();
+      await db.update(schema.memoryRecords)
+        .set({ status: "retracted", validTo: now, updatedAt: now })
+        .where(and(
+          eq(schema.memoryRecords.userId, userId),
+          eq(schema.memoryRecords.id, memoryId),
+        ));
+    },
   };
 }
 
 export type Repository = ReturnType<typeof createRepository>;
+
+function memoryRecallScore(row: MemoryRecordRow, query: string): number {
+  const lexical = Math.max(
+    textSimilarity(row.subject, query),
+    textSimilarity(row.content, query),
+  );
+  if (lexical <= 0) return 0;
+
+  const confirmedAt = row.lastConfirmedAt?.getTime() ?? row.validFrom.getTime();
+  const ageDays = Math.max(0, (Date.now() - confirmedAt) / 86_400_000);
+  const recencyBoost = 1 / (1 + ageDays / 90);
+  return lexical * (1 + recencyBoost * 0.1);
+}
+
+function textSimilarity(left: string, right: string): number {
+  const normalizedLeft = normalizeMemoryText(left);
+  const normalizedRight = normalizeMemoryText(right);
+  if (!normalizedLeft || !normalizedRight) return 0;
+  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 1;
+
+  const leftSet = ngrams(normalizedLeft);
+  const rightSet = ngrams(normalizedRight);
+  let intersection = 0;
+  for (const gram of leftSet) {
+    if (rightSet.has(gram)) intersection += 1;
+  }
+  const union = new Set([...leftSet, ...rightSet]).size;
+  return union === 0 ? 0 : intersection / union;
+}
+
+function normalizeMemoryText(value: string): string {
+  return value.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s_]+/gu, "");
+}
+
+function ngrams(value: string): Set<string> {
+  if (value.length <= 3) return new Set([value]);
+  const grams = new Set<string>();
+  for (let index = 0; index <= value.length - 3; index += 1) {
+    grams.add(value.slice(index, index + 3));
+  }
+  return grams;
+}

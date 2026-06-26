@@ -33,6 +33,8 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     await db.delete(schema.exerciseLogs).where(eq(schema.exerciseLogs.userId, userId));
     await db.delete(schema.physicalConditions).where(eq(schema.physicalConditions.userId, userId));
     await db.delete(schema.mealPlanEntries).where(eq(schema.mealPlanEntries.userId, userId));
+    await db.delete(schema.memoryRecords).where(eq(schema.memoryRecords.userId, userId));
+    await db.delete(schema.userDishes).where(eq(schema.userDishes.userId, userId));
     await db.delete(schema.bmrProfiles).where(eq(schema.bmrProfiles.userId, userId));
     await db.delete(schema.users).where(eq(schema.users.id, userId));
     await pool.end({ timeout: 3 });
@@ -150,5 +152,86 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     const entries = await repo.listMealPlanEntries(userId, "2026-06-17");
     const updated = entries.find((e) => e.id === entry.id);
     expect(updated?.status).toBe("followed");
+  });
+
+  it("upserts and lists user dishes for the candidate library", async () => {
+    const created = await repo.upsertUserDish({
+      userId,
+      slug: "test_onion_beef",
+      name: "test onion beef",
+      mealCategory: "main",
+      ingredientsJson: [{ slug: "beef_tenderloin", grams: 150 }],
+      seasoningsJson: [{ slug: "light_soy_sauce" }],
+      method: "stir_fry",
+      caloriesKcal: 680,
+      proteinGrams: 42,
+      carbsGrams: 62,
+      fatGrams: 20,
+      sodiumMg: 640,
+      source: "user",
+    });
+
+    const updated = await repo.upsertUserDish({
+      ...created,
+      name: "test onion beef updated",
+      caloriesKcal: 700,
+    });
+    const rows = await repo.listUserDishes(userId);
+
+    expect(updated.id).toBe(created.id);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        slug: "test_onion_beef",
+        name: "test onion beef updated",
+        mealCategory: "main",
+        caloriesKcal: 700,
+      }),
+    ]);
+  });
+
+  it("upserts, supersedes, recalls, and retracts memory records", async () => {
+    const first = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+
+    const confirmed = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+    expect(confirmed.id).toBe(first.id);
+    expect(confirmed.timesReferenced).toBe(first.timesReferenced + 1);
+
+    const changed = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "现在可以吃少量香菜",
+      sourceText: "现在可以吃一点香菜",
+      confidence: 1,
+    });
+    expect(changed.id).not.toBe(first.id);
+
+    const recalled = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 5 });
+    expect(recalled).toEqual([
+      expect.objectContaining({
+        id: changed.id,
+        subject: "cilantro",
+        status: "active",
+      }),
+    ]);
+
+    await repo.retractMemory(userId, changed.id);
+    await repo.confirmMemory(userId, first.id);
+    const afterRetract = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 5 });
+    expect(afterRetract).toEqual([]);
   });
 });

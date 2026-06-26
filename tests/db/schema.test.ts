@@ -19,11 +19,14 @@ const requiredTables = [
   ["physicalConditions", "physical_conditions"],
   ["mealPlanEntries", "meal_plan_entries"],
   ["foodItems", "food_items"],
+  ["foodAliases", "food_aliases"],
   ["seasonings", "seasonings"],
   ["naturalUnits", "natural_units"],
   ["cookingRecords", "cooking_records"],
+  ["userDishes", "user_dishes"],
   ["mealCompositions", "meal_compositions"],
-  ["userSeasoningPreferences", "user_seasoning_preferences"]
+  ["userSeasoningPreferences", "user_seasoning_preferences"],
+  ["memoryRecords", "memory_records"]
 ] as const;
 
 const nutritionColumns = [
@@ -37,6 +40,12 @@ const nutritionColumns = [
   "calciumMg",
   "ironMg",
   "vitaminCMg"
+] as const;
+
+const classificationColumns = [
+  "executionBuckets",
+  "roles",
+  "weeklyFloor",
 ] as const;
 
 describe("database schema", () => {
@@ -58,6 +67,12 @@ describe("database schema", () => {
       for (const column of nutritionColumns) {
         expect(table).toHaveProperty(column);
       }
+    }
+  });
+
+  test("test_food_items_exposes_classification_columns_for_planner", () => {
+    for (const column of classificationColumns) {
+      expect(schema.foodItems).toHaveProperty(column);
     }
   });
 
@@ -88,6 +103,9 @@ describe("seed csv helpers", () => {
         slug: "chicken_breast",
         name: "Chicken breast",
         category: "protein",
+        executionBuckets: ["lean_white_meat"],
+        roles: ["b12"],
+        weeklyFloor: 0,
         caloriesKcal: 165,
         proteinGrams: 31,
         carbsGrams: 0,

@@ -7,15 +7,32 @@ import type { NaturalUnitRecord } from "../engine/types.js";
 type Db = PostgresJsDatabase<typeof schema>;
 
 export async function loadMealCatalog(db: Db): Promise<MealCatalog> {
-  const [foodRows, unitRows] = await Promise.all([
+  const [foodRows, aliasRows, unitRows] = await Promise.all([
     db.select().from(schema.foodItems),
+    db.select().from(schema.foodAliases),
     db.select().from(schema.naturalUnits),
   ]);
+
+  const aliasesBySlug = new Map<string, string[]>();
+  for (const row of aliasRows) {
+    const aliases = aliasesBySlug.get(row.slug) ?? [];
+    aliases.push(row.alias);
+    aliasesBySlug.set(row.slug, aliases);
+  }
 
   const foods: FoodCatalogRecord[] = foodRows.map((row) => ({
     slug: row.slug,
     name: row.nameZh ?? row.name,
-    aliases: [row.name, row.nameZh].filter((v): v is string => v !== null && v !== undefined),
+    nameZh: row.nameZh,
+    executionBuckets: row.executionBuckets,
+    roles: row.roles,
+    weeklyFloor: row.weeklyFloor,
+    aliases: uniqueLabels([
+      row.name,
+      row.nameZh,
+      ...(aliasesBySlug.get(row.slug) ?? []),
+    ]),
+    category: row.category,
     defaultGrams: null,
     defaultUnit: null,
     kcalPer100g: row.caloriesKcal,
@@ -33,6 +50,10 @@ export async function loadMealCatalog(db: Db): Promise<MealCatalog> {
   }));
 
   return { foods, naturalUnits };
+}
+
+function uniqueLabels(values: readonly (string | null | undefined)[]): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))];
 }
 
 export async function loadSeasoningRecords(db: Db) {

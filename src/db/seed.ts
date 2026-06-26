@@ -33,6 +33,9 @@ export interface FoodItemSeed extends NutritionSeed {
   name: string;
   nameZh?: string;
   category?: string;
+  executionBuckets: string[];
+  roles: string[];
+  weeklyFloor: number;
   source: string;
 }
 
@@ -192,6 +195,15 @@ function booleanValue(row: CsvRow, aliases: string[], fallback: boolean): boolea
   return ["1", "true", "yes", "y"].includes(value.toLowerCase());
 }
 
+function listValue(row: CsvRow, aliases: string[]): string[] | undefined {
+  const value = optionalText(row, aliases);
+  if (value === undefined) return undefined;
+  return value
+    .split(/[|;,]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
 function nutritionFromRow(row: CsvRow): NutritionSeed {
   return {
     caloriesKcal: numberValue(row, ["energy_kcal", "calories_kcal", "kcal"], 0),
@@ -217,15 +229,54 @@ function nutritionFromRow(row: CsvRow): NutritionSeed {
 
 function toFoodItemSeed(row: CsvRow): FoodItemSeed {
   const slug = requiredText(row, ["slug", "food_slug"], "food slug");
+  const category = optionalText(row, ["category_en", "category", "group"]);
+  const defaults = defaultFoodClassification(slug, category);
 
   return {
     slug,
     name: optionalText(row, ["name_en", "name", "food_name"]) ?? slug,
     nameZh: optionalText(row, ["name_zh", "zh_name"]),
-    category: optionalText(row, ["category_en", "category", "group"]),
+    category,
+    executionBuckets: listValue(row, ["execution_buckets", "buckets"]) ?? defaults.executionBuckets,
+    roles: listValue(row, ["roles", "execution_roles"]) ?? defaults.roles,
+    weeklyFloor: numberValue(row, ["weekly_floor"], defaults.weeklyFloor),
     source: optionalText(row, ["source", "basis"]) ?? "csv",
     ...nutritionFromRow(row)
   };
+}
+
+function defaultFoodClassification(
+  slug: string,
+  category: string | undefined,
+): Pick<FoodItemSeed, "executionBuckets" | "roles" | "weeklyFloor"> {
+  if (["beef_tenderloin", "pork_lean"].includes(slug)) {
+    return { executionBuckets: ["red_meat"], roles: ["iron", "zinc", "b12"], weeklyFloor: 2 };
+  }
+  if (["chicken_breast", "chicken_thigh"].includes(slug)) {
+    return { executionBuckets: ["lean_white_meat"], roles: ["b12"], weeklyFloor: 0 };
+  }
+  if (["salmon", "cod", "mackerel", "sardine", "hairtail", "sea_bream"].includes(slug)) {
+    return { executionBuckets: ["deep_sea_fish"], roles: ["omega3", "vitamin_d"], weeklyFloor: 2 };
+  }
+  if (["shrimp_jiweixia"].includes(slug)) {
+    return { executionBuckets: ["shellfish"], roles: ["zinc", "b12"], weeklyFloor: 1 };
+  }
+  if (slug === "tofu" || category === "legume") {
+    return { executionBuckets: ["soy_product"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "egg" || category === "egg") {
+    return { executionBuckets: ["egg"], roles: ["b12"], weeklyFloor: 0 };
+  }
+  if (category === "dairy") {
+    return { executionBuckets: ["dairy"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "vegetable" || category === "mushroom" || category === "seaweed") {
+    return { executionBuckets: ["vegetable"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "grain" || category === "bread" || category === "tuber") {
+    return { executionBuckets: ["staple"], roles: [], weeklyFloor: 0 };
+  }
+  return { executionBuckets: [], roles: [], weeklyFloor: 0 };
 }
 
 function toSeasoningSeed(row: CsvRow): SeasoningSeed {
