@@ -1,6 +1,7 @@
 import type { RecipeDish, RecipePreferences } from "../engine/recipe-engine.js";
-import type { CookingRecordRow } from "../db/repository.js";
+import type { UserDishRow } from "../db/repository.js";
 import { presetDishes } from "../data/preset-dishes.js";
+import { dishBucketsRoles } from "../engine/classification.js";
 import type { ToolContext } from "./context.js";
 
 export async function loadUserPreferences(ctx: ToolContext): Promise<RecipePreferences> {
@@ -9,24 +10,25 @@ export async function loadUserPreferences(ctx: ToolContext): Promise<RecipePrefe
 }
 
 export async function loadCandidateDishes(ctx: ToolContext): Promise<RecipeDish[]> {
-  const records = await ctx.repo.listCookingRecords(ctx.userId);
+  const records = await ctx.repo.listUserDishes(ctx.userId);
   const userDishes = records
-    .filter((r) => r.caloriesKcal > 0)
-    .map(cookingRecordToDish);
+    .filter(hasValidNutrition)
+    .map(userDishToDish);
   const presetSlugs = new Set(presetDishes.map((d) => d.slug));
   const dedupedUser = userDishes.filter((d) => !presetSlugs.has(d.slug));
-  return [...presetDishes, ...dedupedUser];
+  return [...presetDishes, ...dedupedUser].map((dish) => withClassification(dish, ctx));
 }
 
-function cookingRecordToDish(row: CookingRecordRow): RecipeDish {
+function userDishToDish(row: UserDishRow): RecipeDish {
   const ingredients = (row.ingredientsJson ?? []).map((item) => ({
     slug: String(item.slug ?? "unknown"),
     grams: Number(item.grams ?? 100),
   }));
   const seasonings = (row.seasoningsJson ?? []).map((item) => String(item.slug ?? item));
   return {
-    slug: slugify(row.dishName),
-    name: row.dishName,
+    slug: row.slug,
+    name: row.name,
+    mealTypes: row.mealCategory === "breakfast" ? ["breakfast"] : ["lunch", "dinner"],
     nutrition: {
       kcal: row.caloriesKcal,
       proteinGrams: row.proteinGrams,
@@ -36,13 +38,27 @@ function cookingRecordToDish(row: CookingRecordRow): RecipeDish {
     },
     ingredients,
     seasonings,
-    source: "cooking_record",
+    source: "user",
+    method: row.method ?? undefined,
   };
 }
 
-function slugify(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}]+/gu, "_")
-    .replace(/^_|_$/g, "");
+function hasValidNutrition(row: UserDishRow): boolean {
+  return [
+    row.caloriesKcal,
+    row.proteinGrams,
+    row.carbsGrams,
+    row.fatGrams,
+    row.sodiumMg,
+  ].every(Number.isFinite) && row.caloriesKcal > 0;
+}
+
+function withClassification(dish: RecipeDish, ctx: ToolContext): RecipeDish {
+  const classification = dishBucketsRoles(dish, ctx.catalog);
+  return {
+    ...dish,
+    buckets: classification.buckets,
+    roles: classification.roles,
+    weeklyFloors: classification.weeklyFloors,
+  };
 }

@@ -10,6 +10,7 @@ import type {
 import { calculateCaloriePlan } from "../engine/calorie.js";
 import type { CalorieProfile, CaloriePlan } from "../engine/types.js";
 import {
+  assertNutritionEstimateResolved,
   nutritionEstimate,
   parseMealItems,
   type NutritionEstimateInput,
@@ -20,6 +21,7 @@ import {
   type WeeklyReport,
   type WeeklyReportDay,
 } from "./weekly-report.js";
+import { dailyThresholdWarnings } from "./daily-thresholds.js";
 import {
   recipeRecommend,
   type RecipeRecommendInput,
@@ -35,8 +37,24 @@ import {
   type UpdateCookingRecordInput,
   type UpdateCookingRecordResult,
 } from "./update-cooking-record.js";
+import {
+  proposeDish,
+  userDishRowFromResolvedDish,
+  type ProposeDishInput,
+  type ResolvedDish,
+} from "./add-dish.js";
 import type { MealPlanEntry, MealType } from "../engine/meal-planner.js";
 import { loadCandidateDishes, loadUserPreferences } from "./candidate-loader.js";
+import { renderTemplate, type Language } from "../i18n.js";
+
+export {
+  handleRemember,
+  handleRecall,
+  type RecallInput,
+  type RecallResult,
+  type RememberInput,
+  type RememberResult,
+} from "./memory.js";
 
 // ── Shared validation ──
 
@@ -132,6 +150,7 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
   const description = requireText(input.description, "description");
 
   const estimate = nutritionEstimate({ description }, ctx.catalog);
+  assertNutritionEstimateResolved(estimate);
   const items = parseMealItems(description, ctx.catalog);
 
   return ctx.repo.insertDietLog({
@@ -297,8 +316,7 @@ export async function handleDailySummary(ctx: ToolContext, input: DailySummaryIn
     sodiumMg: sum(dietLogs.map((l) => l.sodiumMg)),
   };
 
-  const warnings: string[] = [];
-  if (eaten.sodiumMg > 2300) warnings.push("sodium_over_2300mg");
+  const warnings = dailyThresholdWarnings(eaten, target);
 
   return {
     date,
@@ -382,7 +400,7 @@ export async function handleGenerateMealPlan(
   const store = {
     insertMealPlanEntry: (entry: MealPlanEntry) => { entries.push(entry); },
   };
-  const result = generateMealPlanCore({ ...input, store });
+  const result = generateMealPlanCore({ ...input, catalog: ctx.catalog, store });
 
   for (const entry of entries) {
     await ctx.repo.insertMealPlanEntry({
@@ -447,6 +465,7 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
   if (status === "substituted" && input.actualDescription) {
     description = input.actualDescription;
     const estimate = nutritionEstimate({ description }, ctx.catalog);
+    assertNutritionEstimateResolved(estimate);
     kcal = estimate.kcal;
     protein = estimate.proteinGrams;
     carbs = estimate.carbsGrams;
@@ -472,6 +491,142 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
   return { entryId: entry.id, status, dietLogId: dietLog.id };
 }
 
+// ── 10b. Proactive Check (scheduled check-ins and summaries) ──
+
+type ProactiveMealType = "breakfast" | "lunch" | "dinner";
+type ProactiveCheckKind = "daily_summary" | "meal_checkin" | "missing_plan";
+
+export interface ProactiveCheckInput {
+  now?: Date | string;
+  locale?: Language;
+}
+
+export interface ProactiveThawIngredient {
+  slug: string;
+  grams?: number;
+  category: string;
+  name?: string;
+}
+
+export interface ProactiveThawItem {
+  entryId: string;
+  planDate: string;
+  mealType: string;
+  dishName: string;
+  ingredients: ProactiveThawIngredient[];
+}
+
+export interface ProactiveCheckResult {
+  kind: ProactiveCheckKind;
+  locale: Language;
+  date: string;
+  message: string;
+  mealType?: ProactiveMealType;
+  plannedMeal?: {
+    entryId: string;
+    dishName: string;
+    kcal: number;
+    proteinGrams: number;
+  };
+  thawItems: ProactiveThawItem[];
+}
+
+const THAW_CATEGORIES = new Set(["meat", "poultry", "seafood"]);
+const PROACTIVE_MEAL_ORDER: Record<ProactiveMealType, number> = {
+  breakfast: 0,
+  lunch: 1,
+  dinner: 2,
+};
+
+export async function handleProactiveCheck(
+  ctx: ToolContext,
+  input: ProactiveCheckInput = {},
+): Promise<ProactiveCheckResult> {
+  const now = requireDate(input.now);
+  const locale = input.locale ?? ctx.locale;
+  const hour = now.getHours();
+
+  if (hour >= 23 || hour < 1) {
+    const date = localDateIso(addDays(now, -1));
+    const summary = await handleDailySummary(ctx, { date });
+    return {
+      kind: "daily_summary",
+      locale,
+      date,
+      message: renderTemplate(locale, "proactiveDailySummary", {
+        date,
+        kcal: summary.eaten.kcal,
+        targetKcal: summary.target.kcal,
+        remainingKcal: summary.remaining.kcal,
+        waterMl: summary.water.totalMl,
+        targetWaterMl: summary.water.targetMl,
+        exerciseMinutes: summary.exercise.durationMinutes,
+        targetExerciseMinutes: summary.exercise.targetMinutes,
+        kcalBurned: summary.exercise.kcalBurned,
+      }),
+      thawItems: [],
+    };
+  }
+
+  const date = localDateIso(now);
+  const mealType = mealTypeForHour(hour);
+  const todayEntries = await ctx.repo.listMealPlanEntries(ctx.userId, date);
+  const planned = todayEntries.find((entry) => entry.mealType === mealType && entry.status === "planned");
+
+  if (!planned) {
+    return {
+      kind: "missing_plan",
+      locale,
+      date,
+      mealType,
+      message: renderTemplate(locale, "proactiveMissingPlan", {
+        date,
+        mealType: localizedMealType(mealType, locale),
+      }),
+      thawItems: [],
+    };
+  }
+
+  const upcomingPlanned = todayEntries.filter((entry) =>
+    entry.status === "planned" &&
+    isLaterSameDayMeal(entry.mealType, mealType)
+  );
+
+  if (mealType === "dinner") {
+    const tomorrow = localDateIso(addDays(now, 1));
+    const tomorrowEntries = await ctx.repo.listMealPlanEntries(ctx.userId, tomorrow);
+    upcomingPlanned.push(...tomorrowEntries.filter((entry) => entry.status === "planned"));
+  }
+
+  const thawItems = buildThawItems(ctx, upcomingPlanned);
+  const checkinMessage = renderTemplate(locale, "proactiveMealCheckin", {
+    mealType: localizedMealType(mealType, locale),
+    dishName: planned.dishName,
+    kcal: planned.caloriesKcal,
+    proteinGrams: planned.proteinGrams,
+  });
+  const message = thawItems.length === 0
+    ? checkinMessage
+    : `${checkinMessage}\n\n${renderTemplate(locale, "proactiveThawReminder", {
+      items: formatThawItems(thawItems, locale),
+    })}`;
+
+  return {
+    kind: "meal_checkin",
+    locale,
+    date,
+    mealType,
+    plannedMeal: {
+      entryId: planned.id,
+      dishName: planned.dishName,
+      kcal: planned.caloriesKcal,
+      proteinGrams: planned.proteinGrams,
+    },
+    thawItems,
+    message,
+  };
+}
+
 // ── 11. Update Cooking Record ──
 
 export async function handleUpdateCookingRecord(
@@ -487,6 +642,18 @@ export async function handleUpdateCookingRecord(
 }
 
 // ── 12. Smart Generate Meal Plan (auto-loads candidates & targets) ──
+
+export async function handleProposeDish(ctx: ToolContext, input: ProposeDishInput): Promise<ResolvedDish> {
+  return proposeDish(input, {
+    catalog: ctx.catalog,
+    seasoningRecords: ctx.seasoningRecords,
+  });
+}
+
+export async function handleSaveDish(ctx: ToolContext, input: ResolvedDish) {
+  const row = userDishRowFromResolvedDish(ctx.userId, input, ctx.catalog);
+  return { dish: await ctx.repo.upsertUserDish(row) };
+}
 
 export interface SmartGenerateMealPlanInput {
   startDate?: string;
@@ -511,6 +678,7 @@ export async function handleSmartGenerateMealPlan(
   return handleGenerateMealPlan(ctx, {
     startDate,
     dailyKcalTarget,
+    dailyProteinTarget: bmrProfile?.proteinTargetGrams,
     presetDishes: candidates,
     preferences,
   });
@@ -551,6 +719,116 @@ export async function handleSmartRecipeRecommend(
 }
 
 // ── Helpers ──
+
+function requireDate(value: Date | string | undefined): Date {
+  const date = value === undefined ? new Date() : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new RangeError("now must be a valid date");
+  }
+  return date;
+}
+
+function localDateIso(date: Date): string {
+  return [
+    date.getFullYear(),
+    pad2(date.getMonth() + 1),
+    pad2(date.getDate()),
+  ].join("-");
+}
+
+function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function mealTypeForHour(hour: number): ProactiveMealType {
+  if (hour < 10) return "breakfast";
+  if (hour < 14) return "lunch";
+  return "dinner";
+}
+
+function localizedMealType(mealType: ProactiveMealType, locale: Language): string {
+  if (locale === "en") return mealType;
+  const labels: Record<ProactiveMealType, string> = {
+    breakfast: "早餐",
+    lunch: "午餐",
+    dinner: "晚餐",
+  };
+  return labels[mealType];
+}
+
+function isLaterSameDayMeal(candidateMealType: string, currentMealType: ProactiveMealType): boolean {
+  if (!isProactiveMealType(candidateMealType)) return false;
+  return PROACTIVE_MEAL_ORDER[candidateMealType] > PROACTIVE_MEAL_ORDER[currentMealType];
+}
+
+function isProactiveMealType(value: string): value is ProactiveMealType {
+  return value === "breakfast" || value === "lunch" || value === "dinner";
+}
+
+function buildThawItems(ctx: ToolContext, entries: MealPlanEntryRow[]): ProactiveThawItem[] {
+  const catalogBySlug = new Map(ctx.catalog.foods.map((food) => [food.slug, food]));
+  const thawItems: ProactiveThawItem[] = [];
+
+  for (const entry of entries) {
+    const ingredients = entry.ingredientsJson
+      .map((ingredient) => thawIngredientFor(ingredient, catalogBySlug))
+      .filter((ingredient): ingredient is ProactiveThawIngredient => ingredient !== undefined);
+
+    if (ingredients.length > 0) {
+      thawItems.push({
+        entryId: entry.id,
+        planDate: entry.planDate,
+        mealType: entry.mealType,
+        dishName: entry.dishName,
+        ingredients,
+      });
+    }
+  }
+
+  return thawItems;
+}
+
+function thawIngredientFor(
+  ingredient: Record<string, unknown>,
+  catalogBySlug: ReadonlyMap<string, { category?: string | null; name?: string }>,
+): ProactiveThawIngredient | undefined {
+  const slug = ingredient["slug"];
+  if (typeof slug !== "string") return undefined;
+
+  const food = catalogBySlug.get(slug);
+  const category = food?.category?.toLowerCase();
+  if (category === undefined || !THAW_CATEGORIES.has(category)) return undefined;
+
+  const grams = ingredient["grams"];
+  return {
+    slug,
+    category,
+    ...(typeof grams === "number" && Number.isFinite(grams) ? { grams } : {}),
+    ...(food?.name ? { name: food.name } : {}),
+  };
+}
+
+function formatThawItems(items: ProactiveThawItem[], locale: Language): string {
+  const itemSeparator = locale === "zh" ? "；" : "; ";
+  const ingredientSeparator = locale === "zh" ? "、" : ", ";
+
+  return items
+    .map((item) => {
+      const ingredientNames = item.ingredients
+        .map((ingredient) => ingredient.name ?? ingredient.slug)
+        .join(ingredientSeparator);
+      return locale === "zh"
+        ? `${item.dishName}（${ingredientNames}）`
+        : `${item.dishName} (${ingredientNames})`;
+    })
+    .join(itemSeparator);
+}
 
 function tomorrow(): string {
   const d = new Date();

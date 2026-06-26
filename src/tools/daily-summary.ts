@@ -5,6 +5,7 @@ import type {
   NutrientSnapshot,
   PhysicalCondition,
 } from "./store.js";
+import { dailyThresholdWarnings } from "./daily-thresholds.js";
 
 export interface DailyTargets {
   kcal: number;
@@ -49,7 +50,7 @@ export function dailySummary(
     water: { totalMl: sum(waterLogs.map((row) => row.amountMl)), logs: waterLogs.length },
     exercise: exerciseTotals(exerciseLogs),
     latestPhysicalCondition: latestCondition(conditions),
-    warnings: eaten.sodiumMg > 2300 ? ["sodium_over_2300mg"] : [],
+    warnings: dailyThresholdWarnings(eaten, target),
   };
 }
 

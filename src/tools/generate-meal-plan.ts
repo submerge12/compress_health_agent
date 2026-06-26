@@ -4,6 +4,9 @@ import {
   type MealPlanRequest,
   type WeeklyMealPlan,
 } from "../engine/meal-planner.js";
+import { buildCoverageReport, type CoverageReport } from "../engine/plan-advisory.js";
+import { buildProcurementList, type ProcurementList } from "../engine/procurement.js";
+import type { MealCatalog } from "./nutrition-estimate.js";
 
 export interface MealPlanStore {
   insertMealPlanEntries?: (entries: readonly MealPlanEntry[]) => unknown;
@@ -16,18 +19,29 @@ export interface MealPlanStore {
 
 export interface GenerateMealPlanInput extends MealPlanRequest {
   store?: MealPlanStore;
+  catalog?: MealCatalog;
 }
 
 export interface GenerateMealPlanResult {
   plan: WeeklyMealPlan;
   overview: string;
+  coverage: CoverageReport;
+  procurement: ProcurementList;
   storedCount: number;
 }
 
 export function generateMealPlan(input: GenerateMealPlanInput): GenerateMealPlanResult {
   const plan = generateWeeklyMealPlan(input);
   const storedCount = storePlanEntries(input.store, plan.entries);
-  return { plan, overview: formatWeeklyOverview(plan), storedCount };
+  return {
+    plan,
+    overview: formatWeeklyOverview(plan),
+    coverage: buildCoverageReport(plan, {
+      dailyProteinTarget: input.dailyProteinTarget,
+    }),
+    procurement: buildProcurementList(plan, input.catalog),
+    storedCount,
+  };
 }
 
 function storePlanEntries(store: MealPlanStore | undefined, entries: readonly MealPlanEntry[]): number {

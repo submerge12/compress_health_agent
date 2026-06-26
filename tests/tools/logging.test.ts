@@ -201,8 +201,17 @@ describe("logging tools", () => {
     ]);
   });
 
-  test("nutritionEstimate_whenFoodIsUnknown_throwsRangeError", () => {
-    expect(() => nutritionEstimate({ description: "mystery food" }, catalog)).toThrow(RangeError);
+  test("nutritionEstimate_whenFoodIsUnknown_returnsUnmatchedWithoutWriting", () => {
+    const result = nutritionEstimate({ description: "mystery food" }, catalog);
+
+    expect(result.items).toEqual([]);
+    expect(result.kcal).toBe(0);
+    expect(result.unmatched).toEqual([
+      {
+        segment: "mystery food",
+        candidates: expect.any(Array),
+      },
+    ]);
   });
 
   test("logWater_whenCupPhraseProvided_logsDefaultCupAmount", () => {

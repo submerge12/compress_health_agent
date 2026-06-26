@@ -1,5 +1,6 @@
 import type { DietLog, HealthRepository } from "./store.js";
 import {
+  assertNutritionEstimateResolved,
   type MealCatalog,
   parseMealItems,
   nutritionEstimate,
@@ -23,6 +24,7 @@ export function logMeal(
   const mealType = requireMealType(fields.mealType);
   const description = requireText(fields.description, "description");
   const estimate = nutritionEstimate({ description }, catalog);
+  assertNutritionEstimateResolved(estimate);
   return repository.insertDietLog({
     date,
     mealType,

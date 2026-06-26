@@ -120,7 +120,7 @@ describe("dailySummary", () => {
     expect(summary.water.totalMl).toBe(750);
     expect(summary.exercise.kcalBurned).toBe(280);
     expect(summary.latestPhysicalCondition).toMatchObject({ weightKg: 72.5 });
-    expect(summary.warnings).toEqual(["sodium_over_2300mg"]);
+    expect(summary.warnings).toEqual(["kcal_under_80pct", "sodium_over_2300mg"]);
   });
 
   test("dailySummary_whenDayHasNoLogs_returnsZeroTotalsAndFullRemaining", () => {
@@ -139,7 +139,25 @@ describe("dailySummary", () => {
     expect(summary.water.totalMl).toBe(0);
     expect(summary.exercise.kcalBurned).toBe(0);
     expect(summary.latestPhysicalCondition).toBeUndefined();
-    expect(summary.warnings).toEqual([]);
+    expect(summary.warnings).toEqual(["kcal_under_80pct", "protein_under_80pct"]);
+  });
+
+  test("dailySummary_whenKcalOrProteinAreHigh_returnsThresholdWarnings", () => {
+    const repository = createInMemoryHealthRepository();
+
+    logMeal(
+      {
+        date: "2026-06-17",
+        mealType: "lunch",
+        description: "900g chicken breast + 1500g brown rice",
+      },
+      repository,
+      catalog,
+    );
+
+    const summary = dailySummary({ date: "2026-06-17", target }, repository);
+
+    expect(summary.warnings).toEqual(["kcal_over_115pct", "protein_over_130pct"]);
   });
 
   test("dailySummary_whenTargetIsInvalid_throwsRangeError", () => {
