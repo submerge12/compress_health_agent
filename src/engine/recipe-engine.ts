@@ -26,10 +26,15 @@ export interface RecipeDish {
   method?: string;
   notes?: string;
   lastServedAt?: string | null;
+  buckets?: readonly string[];
+  roles?: readonly string[];
+  weeklyFloors?: Readonly<Record<string, number>>;
 }
 
 export interface RecipePreferences {
   rejectedSeasonings?: readonly string[];
+  rejectedIngredients?: readonly string[];
+  allergens?: readonly string[];
   preferredIngredients?: readonly string[];
   preferredMethods?: readonly string[];
 }
@@ -157,7 +162,7 @@ function scoreVarietyBonus(dish: RecipeDish, context: ScoreContext): number {
   const overlapsRecentIngredient = dish.ingredients.some((ingredient) =>
     context.recentIngredientSlugs.has(ingredient.slug),
   );
-  return (overlapsRecentIngredient ? 0 : 5) + (dish.source === "cooking_record" ? 2 : 0);
+  return (overlapsRecentIngredient ? 0 : 5) + (dish.source === "user" ? 2 : 0);
 }
 
 function scorePreferenceBonus(dish: RecipeDish, preferences: RecipePreferences): number {

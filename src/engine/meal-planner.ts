@@ -1,17 +1,23 @@
 import {
   hasRejectedSeasoning,
-  recommendRecipes,
   type MealType,
   type RecipeDish,
   type RecipeNutrition,
   type RecipePreferences,
 } from "./recipe-engine.js";
+import { scorePlan, type MealPlanScore } from "./meal-plan-scoring.js";
+import {
+  ENERGY_TOLERANCE_RATIO,
+  MAX_ENERGY_TOLERANCE_RATIO,
+  PROTEIN_FLOOR_RATIO,
+} from "./scoring-weights.js";
 
 export type { MealType };
 
 export interface MealPlanRequest {
   startDate: string;
   dailyKcalTarget: number;
+  dailyProteinTarget?: number;
   presetDishes?: readonly RecipeDish[];
   userDishes?: readonly RecipeDish[];
   candidates?: readonly RecipeDish[];
@@ -40,11 +46,23 @@ export interface WeeklyMealPlan {
   days: readonly MealPlanDay[];
   entries: readonly MealPlanEntry[];
   distinctDishCount: number;
+  hardViolations: readonly HardViolation[];
+  score?: MealPlanScore;
+}
+
+export interface HardViolation {
+  type: "energy_band" | "protein_floor";
+  date: string;
+  actual: number;
+  target: number;
+  message: string;
 }
 
 export interface MealPlanValidationOptions {
   dailyKcalTarget: number;
+  dailyProteinTarget?: number;
   minimumDistinctDishes?: number;
+  energyToleranceRatio?: number;
 }
 
 export interface MealPlanValidationResult {
@@ -53,21 +71,42 @@ export interface MealPlanValidationResult {
 }
 
 const MEAL_TYPES: readonly MealType[] = ["breakfast", "lunch", "dinner"];
-const MEAL_KCAL_SPLIT: Readonly<Record<MealType, number>> = {
-  breakfast: 0.25,
-  lunch: 0.40,
-  dinner: 0.35,
-};
-const DAILY_KCAL_TOLERANCE_RATIO = 0.1;
 
 export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan {
   validateMealPlanRequest(request);
   const candidates = filterUsableCandidates(collectCandidates(request), request.preferences);
   if (candidates.length === 0) throw new RangeError("No usable meal-planning candidates");
-  const entries = buildEntries(request, candidates);
-  const plan = buildPlan(request.startDate, entries);
-  assertDailyKcalValid(plan, request.dailyKcalTarget);
-  return plan;
+
+  const breakfastPool = candidates.filter(matchesBreakfast);
+  const mainPool = candidates.filter(matchesMain);
+  if (breakfastPool.length === 0) throw new RangeError("No breakfast candidates");
+  if (mainPool.length === 0) throw new RangeError("No main meal candidates");
+
+  const entries: MealPlanEntry[] = [];
+  const usage = new Map<string, number>();
+  for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
+    const date = addDays(request.startDate, dayIndex);
+    const dayEntries = selectDayCombo(request, entries, usage, breakfastPool, mainPool, date, dayIndex);
+    for (const entry of dayEntries) {
+      entries.push(entry);
+      usage.set(entry.dish.slug, (usage.get(entry.dish.slug) ?? 0) + 1);
+    }
+  }
+
+  const plan = buildPlan(request.startDate, entries, []);
+  const hardViolations = hardViolationsForPlan(plan, request);
+  const withViolations = buildPlan(request.startDate, entries, hardViolations);
+  return {
+    ...withViolations,
+    score: scorePlan(
+      withViolations,
+      {
+        dailyKcalTarget: request.dailyKcalTarget,
+        dailyProteinTarget: request.dailyProteinTarget,
+      },
+      request.preferences,
+    ),
+  };
 }
 
 export function validateWeeklyMealPlan(
@@ -75,124 +114,49 @@ export function validateWeeklyMealPlan(
   options: MealPlanValidationOptions,
 ): MealPlanValidationResult {
   const violations = [
-    ...validateDailyKcal(plan, options.dailyKcalTarget),
-    ...validateIngredientRuns(plan.entries),
+    ...validateDailyKcal(plan, options.dailyKcalTarget, options.energyToleranceRatio ?? ENERGY_TOLERANCE_RATIO),
+    ...validateDailyProtein(plan, options.dailyProteinTarget),
+    ...validateStructuralCompleteness(plan),
     ...validateDistinctDishes(plan, options.minimumDistinctDishes),
   ];
   return { ok: violations.length === 0, violations };
 }
 
-function buildEntries(request: MealPlanRequest, candidates: readonly RecipeDish[]): MealPlanEntry[] {
-  const entries: MealPlanEntry[] = [];
-  const usage = new Map<string, number>();
-  for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
-    for (const mealType of MEAL_TYPES) {
-      entries.push(buildEntry(request, candidates, entries, usage, dayIndex, mealType));
-    }
-  }
-  return entries;
-}
-
-function buildEntry(
+function selectDayCombo(
   request: MealPlanRequest,
-  candidates: readonly RecipeDish[],
   entries: readonly MealPlanEntry[],
   usage: Map<string, number>,
+  breakfastPool: readonly RecipeDish[],
+  mainPool: readonly RecipeDish[],
+  date: string,
   dayIndex: number,
-  mealType: MealType,
-): MealPlanEntry {
-  const targetKcal = targetForSlot(request.dailyKcalTarget, mealType, entries, dayIndex);
-  const dish = selectDish(candidates, entries, usage, mealType, targetKcal, request.dailyKcalTarget, dayIndex);
-  usage.set(dish.slug, (usage.get(dish.slug) ?? 0) + 1);
-  const date = addDays(request.startDate, dayIndex);
-  return { id: `${date}-${mealType}`, date, dayIndex, mealType, targetKcal, dish, nutrition: dish.nutrition, status: "planned" };
+): readonly MealPlanEntry[] {
+  let best: readonly MealPlanEntry[] | undefined;
+  let bestScore = Number.POSITIVE_INFINITY;
+  for (const breakfast of breakfastPool) {
+    for (const lunch of mainPool) {
+      for (const dinner of mainPool) {
+        const combo = [
+          buildEntry(date, dayIndex, "breakfast", breakfast),
+          buildEntry(date, dayIndex, "lunch", lunch),
+          buildEntry(date, dayIndex, "dinner", dinner),
+        ];
+        const candidateScore = comboScore(request, entries, combo, usage);
+        if (candidateScore < bestScore) {
+          best = combo;
+          bestScore = candidateScore;
+        }
+      }
+    }
+  }
+  if (best === undefined) throw new RangeError("No meal-plan combo candidates");
+  return best;
 }
 
-function selectDish(
-  candidates: readonly RecipeDish[],
-  entries: readonly MealPlanEntry[],
-  usage: ReadonlyMap<string, number>,
-  mealType: MealType,
-  targetKcal: number,
-  dailyKcalTarget: number,
-  dayIndex: number,
-): RecipeDish {
-  const pool = candidatePoolForMeal(candidates, entries, mealType);
-  if (pool.length === 0) throw new RangeError(`No candidates for ${mealType}`);
-  const ranked = rankedForPlan(pool, entries, usage, mealType, targetKcal);
-  const feasible = ranked.find((dish) =>
-    canCompleteDayWithinKcal(entries, candidates, dish, dayIndex, mealType, dailyKcalTarget),
-  );
-  if (feasible === undefined) throw new RangeError(`No kcal-feasible candidates for ${mealType}`);
-  return feasible;
-}
-
-function rankedForPlan(
-  pool: readonly RecipeDish[],
-  entries: readonly MealPlanEntry[],
-  usage: ReadonlyMap<string, number>,
-  mealType: MealType,
-  targetKcal: number,
-): readonly RecipeDish[] {
-  const recommendations = recommendRecipes({
-    candidates: pool,
-    target: { kcal: targetKcal },
-    mealType,
-    recentDishSlugs: entries.slice(-4).map((entry) => entry.dish.slug),
-  });
-  return [...recommendations].sort((left, right) => {
-    const usageDelta = (usage.get(left.slug) ?? 0) - (usage.get(right.slug) ?? 0);
-    return usageDelta !== 0 ? usageDelta : right.score - left.score;
-  });
-}
-
-function canCompleteDayWithinKcal(
-  entries: readonly MealPlanEntry[],
-  candidates: readonly RecipeDish[],
-  dish: RecipeDish,
-  dayIndex: number,
-  mealType: MealType,
-  dailyKcalTarget: number,
-): boolean {
-  const trialEntries = [...entries, provisionalEntry(dayIndex, mealType, dish)];
-  const remainingMealTypes = MEAL_TYPES.slice(MEAL_TYPES.indexOf(mealType) + 1);
-  return canCompleteRemainingDay(trialEntries, candidates, dayIndex, remainingMealTypes, dailyKcalTarget);
-}
-
-function canCompleteRemainingDay(
-  entries: readonly MealPlanEntry[],
-  candidates: readonly RecipeDish[],
-  dayIndex: number,
-  remainingMealTypes: readonly MealType[],
-  dailyKcalTarget: number,
-): boolean {
-  const [nextMealType, ...restMealTypes] = remainingMealTypes;
-  if (nextMealType === undefined) return isDailyKcalWithinTarget(dayKcal(entries, dayIndex), dailyKcalTarget);
-  return candidatePoolForMeal(candidates, entries, nextMealType).some((dish) =>
-    canCompleteRemainingDay(
-      [...entries, provisionalEntry(dayIndex, nextMealType, dish)],
-      candidates,
-      dayIndex,
-      restMealTypes,
-      dailyKcalTarget,
-    ),
-  );
-}
-
-function candidatePoolForMeal(
-  candidates: readonly RecipeDish[],
-  entries: readonly MealPlanEntry[],
-  mealType: MealType,
-): readonly RecipeDish[] {
-  const eligible = candidates.filter((dish) => matchesMealType(dish, mealType));
-  const safe = eligible.filter((dish) => !wouldExceedIngredientRun(entries, dish));
-  return safe.length > 0 ? safe : eligible;
-}
-
-function provisionalEntry(dayIndex: number, mealType: MealType, dish: RecipeDish): MealPlanEntry {
+function buildEntry(date: string, dayIndex: number, mealType: MealType, dish: RecipeDish): MealPlanEntry {
   return {
-    id: `provisional-${dayIndex}-${mealType}`,
-    date: "",
+    id: `${date}-${mealType}`,
+    date,
     dayIndex,
     mealType,
     targetKcal: dish.nutrition.kcal,
@@ -202,21 +166,49 @@ function provisionalEntry(dayIndex: number, mealType: MealType, dish: RecipeDish
   };
 }
 
-function targetForSlot(
-  dailyTarget: number,
-  mealType: MealType,
-  entries: readonly MealPlanEntry[],
-  dayIndex: number,
+function comboScore(
+  request: MealPlanRequest,
+  existingEntries: readonly MealPlanEntry[],
+  combo: readonly MealPlanEntry[],
+  usage: ReadonlyMap<string, number>,
 ): number {
-  if (mealType !== "dinner") return Math.round(dailyTarget * splitForMeal(mealType));
-  const usedKcal = entries.filter((entry) => entry.dayIndex === dayIndex).reduce((sum, entry) => sum + entry.nutrition.kcal, 0);
-  return Math.max(200, dailyTarget - usedKcal);
+  const trialEntries = [...existingEntries, ...combo];
+  const dayTotals = sumNutrition(combo.map((entry) => entry.nutrition));
+  const energySoftMiss = Math.max(
+    0,
+    Math.abs(dayTotals.kcal - request.dailyKcalTarget) -
+      request.dailyKcalTarget * ENERGY_TOLERANCE_RATIO,
+  ) / request.dailyKcalTarget;
+  const energyMiss = Math.max(
+    0,
+    Math.abs(dayTotals.kcal - request.dailyKcalTarget) -
+      request.dailyKcalTarget * MAX_ENERGY_TOLERANCE_RATIO,
+  ) / request.dailyKcalTarget;
+  const proteinFloor = (request.dailyProteinTarget ?? 0) * PROTEIN_FLOOR_RATIO;
+  const proteinMiss = proteinFloor === 0 ? 0 : Math.max(0, proteinFloor - dayTotals.proteinGrams) / proteinFloor;
+  const duplicateMainPenalty = combo[1]?.dish.slug === combo[2]?.dish.slug ? 4 : 0;
+  const usagePenalty = combo.reduce((sum, entry) => sum + (usage.get(entry.dish.slug) ?? 0), 0) * 0.7;
+  const repeatIngredientPenalty = wouldRepeatIngredients(existingEntries, combo) ? 2 : 0;
+  const trialPlan = buildPlan(request.startDate, trialEntries, []);
+  const softPenalty = scorePlan(
+    trialPlan,
+    {
+      dailyKcalTarget: request.dailyKcalTarget,
+      dailyProteinTarget: request.dailyProteinTarget,
+    },
+    request.preferences,
+  ).penalty;
+  return energyMiss * 2_000 + energySoftMiss * 1_000 + proteinMiss * 1_500 + duplicateMainPenalty + usagePenalty + repeatIngredientPenalty + softPenalty;
 }
 
-function buildPlan(startDate: string, entries: readonly MealPlanEntry[]): WeeklyMealPlan {
+function buildPlan(
+  startDate: string,
+  entries: readonly MealPlanEntry[],
+  hardViolations: readonly HardViolation[],
+): WeeklyMealPlan {
   const days = Array.from({ length: 7 }, (_, dayIndex) => buildDay(addDays(startDate, dayIndex), entries));
   const distinctDishCount = new Set(entries.map((entry) => entry.dish.slug)).size;
-  return { startDate, days, entries, distinctDishCount };
+  return { startDate, days, entries, distinctDishCount, hardViolations };
 }
 
 function buildDay(date: string, entries: readonly MealPlanEntry[]): MealPlanDay {
@@ -224,43 +216,67 @@ function buildDay(date: string, entries: readonly MealPlanEntry[]): MealPlanDay 
   return { date, meals, totals: sumNutrition(meals.map((entry) => entry.nutrition)) };
 }
 
-function validateDailyKcal(plan: WeeklyMealPlan, dailyKcalTarget: number): readonly string[] {
+function hardViolationsForPlan(plan: WeeklyMealPlan, request: MealPlanRequest): readonly HardViolation[] {
+  const energyViolations = plan.days
+    .filter((day) => !isDailyKcalWithinTarget(day.totals.kcal, request.dailyKcalTarget, MAX_ENERGY_TOLERANCE_RATIO))
+    .map((day) => ({
+      type: "energy_band" as const,
+      date: day.date,
+      actual: day.totals.kcal,
+      target: request.dailyKcalTarget,
+      message: `${day.date} kcal ${day.totals.kcal} outside +/-${Math.round(MAX_ENERGY_TOLERANCE_RATIO * 100)}%`,
+    }));
+  const proteinViolations = plan.days
+    .filter((day) => !isDailyProteinWithinFloor(day.totals.proteinGrams, request.dailyProteinTarget))
+    .map((day) => {
+      const target = Math.round((request.dailyProteinTarget ?? 0) * PROTEIN_FLOOR_RATIO);
+      return {
+        type: "protein_floor" as const,
+        date: day.date,
+        actual: day.totals.proteinGrams,
+        target,
+        message: `${day.date} protein ${day.totals.proteinGrams}g below ${target}g floor`,
+      };
+    });
+  return [...energyViolations, ...proteinViolations];
+}
+
+function validateDailyKcal(
+  plan: WeeklyMealPlan,
+  dailyKcalTarget: number,
+  toleranceRatio: number,
+): readonly string[] {
   return plan.days
-    .filter((day) => !isDailyKcalWithinTarget(day.totals.kcal, dailyKcalTarget))
-    .map((day) => `${day.date} kcal ${day.totals.kcal} outside +/-10%`);
+    .filter((day) => !isDailyKcalWithinTarget(day.totals.kcal, dailyKcalTarget, toleranceRatio))
+    .map((day) => `${day.date} kcal ${day.totals.kcal} outside +/-${Math.round(toleranceRatio * 100)}%`);
 }
 
-function assertDailyKcalValid(plan: WeeklyMealPlan, dailyKcalTarget: number): void {
-  const violations = validateDailyKcal(plan, dailyKcalTarget);
-  if (violations.length > 0) {
-    throw new RangeError(`Generated meal plan violates daily kcal target: ${violations.join("; ")}`);
-  }
+function validateDailyProtein(plan: WeeklyMealPlan, dailyProteinTarget: number | undefined): readonly string[] {
+  if (dailyProteinTarget === undefined) return [];
+  const floor = Math.round(dailyProteinTarget * PROTEIN_FLOOR_RATIO);
+  return plan.days
+    .filter((day) => !isDailyProteinWithinFloor(day.totals.proteinGrams, dailyProteinTarget))
+    .map((day) => `${day.date} protein ${day.totals.proteinGrams}g below ${floor}g floor`);
 }
 
-function isDailyKcalWithinTarget(kcal: number, dailyKcalTarget: number): boolean {
-  return Math.abs(kcal - dailyKcalTarget) <= dailyKcalTarget * DAILY_KCAL_TOLERANCE_RATIO;
+function validateStructuralCompleteness(plan: WeeklyMealPlan): readonly string[] {
+  return plan.days.flatMap((day) => {
+    const mealTypes = day.meals.map((meal) => meal.mealType);
+    const complete =
+      day.meals.length === 3 &&
+      mealTypes.filter((mealType) => mealType === "breakfast").length === 1 &&
+      mealTypes.filter((mealType) => mealType === "lunch").length === 1 &&
+      mealTypes.filter((mealType) => mealType === "dinner").length === 1;
+    return complete ? [] : [`${day.date} does not have breakfast,lunch,dinner`];
+  });
 }
 
-function dayKcal(entries: readonly MealPlanEntry[], dayIndex: number): number {
-  return entries
-    .filter((entry) => entry.dayIndex === dayIndex)
-    .reduce((sum, entry) => sum + entry.nutrition.kcal, 0);
+function isDailyKcalWithinTarget(kcal: number, dailyKcalTarget: number, toleranceRatio: number): boolean {
+  return Math.abs(kcal - dailyKcalTarget) <= dailyKcalTarget * toleranceRatio;
 }
 
-function validateIngredientRuns(entries: readonly MealPlanEntry[]): readonly string[] {
-  const violations: string[] = [];
-  for (let index = 2; index < entries.length; index += 1) {
-    const current = entries[index];
-    const previous = entries[index - 1];
-    const beforePrevious = entries[index - 2];
-    if (current === undefined || previous === undefined || beforePrevious === undefined) continue;
-    for (const slug of ingredientSlugs(current.dish)) {
-      if (ingredientSlugs(previous.dish).has(slug) && ingredientSlugs(beforePrevious.dish).has(slug)) {
-        violations.push(`${slug} appears in more than 2 consecutive meals`);
-      }
-    }
-  }
-  return violations;
+function isDailyProteinWithinFloor(proteinGrams: number, dailyProteinTarget: number | undefined): boolean {
+  return dailyProteinTarget === undefined || proteinGrams >= Math.round(dailyProteinTarget * PROTEIN_FLOOR_RATIO);
 }
 
 function validateDistinctDishes(
@@ -271,10 +287,18 @@ function validateDistinctDishes(
   return [`only ${plan.distinctDishCount} distinct dishes planned`];
 }
 
-function wouldExceedIngredientRun(entries: readonly MealPlanEntry[], dish: RecipeDish): boolean {
-  if (entries.length < 2) return false;
-  const previous = entries.slice(-2).map((entry) => ingredientSlugs(entry.dish));
-  return [...ingredientSlugs(dish)].some((slug) => previous.every((slugs) => slugs.has(slug)));
+function wouldRepeatIngredients(existingEntries: readonly MealPlanEntry[], combo: readonly MealPlanEntry[]): boolean {
+  const sequence = [...existingEntries.slice(-2), ...combo];
+  for (let index = 2; index < sequence.length; index += 1) {
+    const current = sequence[index];
+    const previous = sequence[index - 1];
+    const before = sequence[index - 2];
+    if (current === undefined || previous === undefined || before === undefined) continue;
+    for (const slug of ingredientSlugs(current.dish)) {
+      if (ingredientSlugs(previous.dish).has(slug) && ingredientSlugs(before.dish).has(slug)) return true;
+    }
+  }
+  return false;
 }
 
 function collectCandidates(request: MealPlanRequest): readonly RecipeDish[] {
@@ -285,16 +309,23 @@ function filterUsableCandidates(
   candidates: readonly RecipeDish[],
   preferences: RecipePreferences | undefined,
 ): readonly RecipeDish[] {
-  const rejected = preferences?.rejectedSeasonings ?? [];
-  return candidates.filter((dish) => !hasRejectedSeasoning(dish, rejected));
+  const rejectedSeasonings = preferences?.rejectedSeasonings ?? [];
+  const rejectedIngredients = new Set([
+    ...(preferences?.rejectedIngredients ?? []),
+    ...(preferences?.allergens ?? []),
+  ].map(normalizeToken));
+  return candidates.filter((dish) => {
+    if (hasRejectedSeasoning(dish, rejectedSeasonings)) return false;
+    return !dish.ingredients.some((ingredient) => rejectedIngredients.has(normalizeToken(ingredient.slug)));
+  });
 }
 
-function matchesMealType(dish: RecipeDish, mealType: MealType): boolean {
-  return dish.mealTypes === undefined || dish.mealTypes.includes(mealType);
+function matchesBreakfast(dish: RecipeDish): boolean {
+  return dish.mealTypes === undefined || dish.mealTypes.includes("breakfast");
 }
 
-function splitForMeal(mealType: MealType): number {
-  return MEAL_KCAL_SPLIT[mealType];
+function matchesMain(dish: RecipeDish): boolean {
+  return dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner");
 }
 
 function sumNutrition(items: readonly RecipeNutrition[]): RecipeNutrition {
@@ -329,4 +360,8 @@ function addDays(startDate: string, days: number): string {
 function roundTo(value: number, decimals: number): number {
   const factor = 10 ** decimals;
   return Math.round(value * factor) / factor;
+}
+
+function normalizeToken(value: string): string {
+  return value.trim().toLowerCase();
 }
