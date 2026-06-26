@@ -26,6 +26,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
     "start": "tsx src/index.ts",
+    "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:push": "drizzle-kit push",

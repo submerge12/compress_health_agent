@@ -85,6 +85,8 @@ npm run build
 
 The agent exports a typed tool registry for use with any LLM agent framework:
 
+Package subpath exports resolve to `dist`. Run `pnpm build` before consuming this package from another workspace, and use `pnpm run smoke:exports` to verify the built public surface (`.`, `./tools/context`, `./tools/handlers`, `./engine/types`) still resolves.
+
 ```typescript
 import { initToolContext, invokeTool, profile } from "compass-health-agent";
 

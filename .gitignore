@@ -7,3 +7,4 @@ coverage/
 _tmp_*
 .ai/
 .codex-test-tmp/
+*.stackdump
