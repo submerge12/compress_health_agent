@@ -1,15 +1,42 @@
 import { describe, expect, test } from "vitest";
-import { profile, validateAgentProfile } from "../src/agent.js";
-
-const chineseCharacters = /[\u3400-\u9fff]/;
+import {
+  compassHealthProfileSpec,
+  createToolContextFromEnv,
+  profile,
+  type AgentProfileCompatible,
+  validateAgentProfile,
+} from "../src/agent.js";
 
 describe("agent profile", () => {
   test("test_profile_basicMetadata_matchesCompassHealthAgentContract", () => {
     expect(profile.name).toBe("compass-health");
-    expect(profile.systemPrompt.zh).toMatch(chineseCharacters);
-    expect(profile.systemPrompt.en).not.toMatch(chineseCharacters);
-    expect(profile.model.temperature).toBeGreaterThanOrEqual(0);
-    expect(profile.model.temperature).toBeLessThanOrEqual(1);
+    expect(profile).toMatchObject(compassHealthProfileSpec);
+    expect(profile.systemPrompt).toContain("bilingual (Chinese/English) health and nutrition assistant");
+    expect(profile.systemPrompt).toContain("Hard Rules");
+    expect(profile.systemPrompt).toContain("call set_profile");
+    expect(profile.model).toEqual({
+      provider: "deepseek",
+      modelId: "deepseek-v4-pro",
+    });
+    expect(profile).toMatchObject({
+      thinkingLevel: "medium",
+      policy: {
+        defaults: {
+          "read-only": "allow",
+          write: "allow",
+          destructive: "deny",
+          network: "deny",
+        },
+      },
+    });
+    expect(typeof profile.install).toBe("function");
+    expect(profile.install.length).toBe(0);
+    expect(typeof profile.proactiveCheck).toBe("function");
+    expect(profile.proactiveCheck.length).toBe(0);
+    expect(profile.skills).toEqual([]);
+    expect(profile.templates).toEqual([]);
+    expect(typeof createToolContextFromEnv).toBe("function");
+    expect(createToolContextFromEnv.length).toBe(0);
     expect(validateAgentProfile(profile)).toBe(true);
   });
 
@@ -27,6 +54,8 @@ describe("agent profile", () => {
     expect(readOnly).toEqual([
       "daily_summary",
       "nutrition_estimate",
+      "propose_dish",
+      "recall",
       "recipe_recommend",
       "weekly_report",
     ]);
@@ -37,6 +66,8 @@ describe("agent profile", () => {
       "log_water",
       "log_weight",
       "meal_checkin",
+      "remember",
+      "save_dish",
       "set_profile",
       "update_cooking_record",
     ]);
@@ -57,32 +88,68 @@ describe("agent profile", () => {
     ).toThrow("Duplicate tool registration: nutrition_estimate");
   });
 
-  test("test_profile_scheduledTasks_includeMealCheckinsAndMidnightSummary", () => {
+  test("test_profile_scheduledTasks_useProactiveCheckCronTasks", () => {
+    expect(profile.scheduledTasks).toBe(compassHealthProfileSpec.scheduledTasks);
+    expect(compassHealthProfileSpec.scheduledTasks).toHaveLength(4);
     expect(profile.scheduledTasks).toEqual([
       {
-        name: "meal_checkin_breakfast",
-        toolName: "meal_checkin",
-        schedule: "30 8 * * *",
-        description: "Prompt the user to confirm breakfast against the meal plan.",
+        id: "compass-health:meal_checkin_breakfast",
+        agentProfile: "compass-health",
+        taskType: "proactive_check",
+        schedule: { cron: "30 8 * * *" },
       },
       {
-        name: "meal_checkin_lunch",
-        toolName: "meal_checkin",
-        schedule: "30 12 * * *",
-        description: "Prompt the user to confirm lunch against the meal plan.",
+        id: "compass-health:meal_checkin_lunch",
+        agentProfile: "compass-health",
+        taskType: "proactive_check",
+        schedule: { cron: "30 12 * * *" },
       },
       {
-        name: "meal_checkin_dinner",
-        toolName: "meal_checkin",
-        schedule: "30 18 * * *",
-        description: "Prompt the user to confirm dinner against the meal plan.",
+        id: "compass-health:meal_checkin_dinner",
+        agentProfile: "compass-health",
+        taskType: "proactive_check",
+        schedule: { cron: "30 18 * * *" },
       },
       {
-        name: "midnight_daily_summary",
-        toolName: "daily_summary",
-        schedule: "0 0 * * *",
-        description: "Send the previous day's nutrition summary at local midnight.",
+        id: "compass-health:midnight_daily_summary",
+        agentProfile: "compass-health",
+        taskType: "proactive_check",
+        schedule: { cron: "0 0 * * *" },
       },
     ]);
+  });
+
+  test("test_validateAgentProfile_duplicateScheduledTaskIds_throwHelpfulError", () => {
+    const firstTask = profile.scheduledTasks[0];
+    if (!firstTask) {
+      throw new Error("Expected profile to register at least one scheduled task.");
+    }
+
+    expect(() =>
+      validateAgentProfile({
+        ...profile,
+        scheduledTasks: [...profile.scheduledTasks, firstTask],
+      }),
+    ).toThrow("Duplicate scheduled task id: compass-health:meal_checkin_breakfast");
+  });
+
+  test("test_validateAgentProfile_rejectsUnsupportedScheduledTaskTypes", () => {
+    const firstTask = profile.scheduledTasks[0];
+    if (!firstTask) {
+      throw new Error("Expected profile to register at least one scheduled task.");
+    }
+
+    expect(() =>
+      validateAgentProfile({
+        ...profile,
+        scheduledTasks: [
+          {
+            ...firstTask,
+            id: "compass-health:unsupported",
+            taskType: "meal_checkin",
+          },
+        ],
+      } as unknown as AgentProfileCompatible),
+    ).toThrow("Scheduled task must use taskType proactive_check: compass-health:unsupported");
   });
 });

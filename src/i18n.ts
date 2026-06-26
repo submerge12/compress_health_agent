@@ -3,6 +3,10 @@ export type Language = "zh" | "en";
 export type TemplateKey =
   | "checkinPrompt"
   | "dailySummary"
+  | "proactiveDailySummary"
+  | "proactiveMealCheckin"
+  | "proactiveMissingPlan"
+  | "proactiveThawReminder"
   | "weeklySummary"
   | "recommendation"
   | "errorGeneric"
@@ -29,6 +33,26 @@ export const templates: TemplateCatalog = {
       `今日摄入 ${value(params, "kcal")}/${value(params, "targetKcal")} 千卡，蛋白质 ${value(params, "proteinGrams")} 克，钠 ${value(params, "sodiumMg")} 毫克。`,
     en: (params) =>
       `Today you logged ${value(params, "kcal")} of ${value(params, "targetKcal")} kcal, ${value(params, "proteinGrams")} g protein, and ${value(params, "sodiumMg")} mg sodium.`,
+  },
+  proactiveDailySummary: {
+    zh: (params) =>
+      `每日总结（${value(params, "date")}）：已摄入 ${value(params, "kcal")} 千卡（目标 ${value(params, "targetKcal")}），剩余 ${value(params, "remainingKcal")} 千卡。饮水 ${value(params, "waterMl")}/${value(params, "targetWaterMl")} ml，运动 ${value(params, "exerciseMinutes")}/${value(params, "targetExerciseMinutes")} 分钟，消耗 ${value(params, "kcalBurned")} 千卡。`,
+    en: (params) =>
+      `Daily summary for ${value(params, "date")}: ${value(params, "kcal")} kcal eaten (target ${value(params, "targetKcal")}), ${value(params, "remainingKcal")} kcal remaining. Water: ${value(params, "waterMl")}/${value(params, "targetWaterMl")}ml. Exercise: ${value(params, "exerciseMinutes")}/${value(params, "targetExerciseMinutes")} min, ${value(params, "kcalBurned")} kcal burned.`,
+  },
+  proactiveMealCheckin: {
+    zh: (params) =>
+      `餐食确认：计划的${value(params, "mealType")}是${value(params, "dishName")}（${value(params, "kcal")} 千卡，蛋白质 ${value(params, "proteinGrams")}g）。你是按计划吃了、替换了，还是跳过了？`,
+    en: (params) =>
+      `Meal check-in: your planned ${value(params, "mealType")} is ${value(params, "dishName")} (${value(params, "kcal")} kcal, ${value(params, "proteinGrams")}g protein). Did you follow the plan, substitute, or skip?`,
+  },
+  proactiveMissingPlan: {
+    zh: (params) => `没有找到 ${value(params, "date")} 的计划${value(params, "mealType")}。`,
+    en: (params) => `No planned ${value(params, "mealType")} for ${value(params, "date")}.`,
+  },
+  proactiveThawReminder: {
+    zh: (params) => `🧊 解冻提醒：${value(params, "items")}。请提前把冷冻食材取出解冻。`,
+    en: (params) => `🧊 Thaw reminder: ${value(params, "items")} - take the meat out of the freezer to thaw in advance.`,
   },
   weeklySummary: {
     zh: (params) =>

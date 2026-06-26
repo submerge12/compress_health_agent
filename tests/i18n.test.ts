@@ -41,6 +41,39 @@ describe("i18n templates", () => {
     expect(en).toBe("Today you logged 0 of 1800 kcal, 0 g protein, and 0 mg sodium.");
   });
 
+  test("test_renderTemplate_proactiveTemplates_returnLocalizedOutput", () => {
+    const zh = renderTemplate("zh", "proactiveMealCheckin", {
+      mealType: "午餐",
+      dishName: "虾仁西兰花",
+      kcal: 520,
+      proteinGrams: 35,
+    });
+    const en = renderTemplate("en", "proactiveMealCheckin", {
+      mealType: "lunch",
+      dishName: "shrimp with broccoli",
+      kcal: 520,
+      proteinGrams: 35,
+    });
+
+    expect(zh).toMatch(chineseCharacters);
+    expect(zh).not.toMatch(/\bMeal check-in\b/);
+    expect(en).toBe("Meal check-in: your planned lunch is shrimp with broccoli (520 kcal, 35g protein). Did you follow the plan, substitute, or skip?");
+    expect(en).not.toMatch(chineseCharacters);
+  });
+
+  test("test_renderTemplate_proactiveThawReminder_keepsIceEmojiInTemplate", () => {
+    const zh = renderTemplate("zh", "proactiveThawReminder", {
+      items: "明天虾仁",
+    });
+    const en = renderTemplate("en", "proactiveThawReminder", {
+      items: "tomorrow shrimp",
+    });
+
+    expect(zh).toMatch(/^🧊 /u);
+    expect(zh).toMatch(chineseCharacters);
+    expect(en).toBe("🧊 Thaw reminder: tomorrow shrimp - take the meat out of the freezer to thaw in advance.");
+  });
+
   test("test_renderTemplate_unknownTemplate_throwsHelpfulError", () => {
     expect(() =>
       renderTemplate("zh", "missingTemplate" as never, {}),

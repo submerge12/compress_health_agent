@@ -61,11 +61,12 @@ export const presetDishes: readonly RecipeDish[] = [
     method: "pan_searing",
   },
 
-  // ── Lunch (~660–720 kcal) ──
+  // ── Main meals — eligible for both lunch and dinner (no lunch/dinner distinction) ──
+  // (heavier mains, ~660–720 kcal)
   {
     slug: "scallion_beef_rice",
     name: "葱爆牛肉糙米饭配蒜蓉西兰花",
-    mealTypes: ["lunch"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 700, proteinGrams: 38, carbsGrams: 72, fatGrams: 26, sodiumMg: 680 },
     ingredients: [
       { slug: "beef_tenderloin", grams: 150 },
@@ -80,7 +81,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "braised_chicken_thigh_rice",
     name: "酱鸡腿卤蛋香菇糙米饭",
-    mealTypes: ["lunch"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 720, proteinGrams: 42, carbsGrams: 68, fatGrams: 28, sodiumMg: 780 },
     ingredients: [
       { slug: "chicken_thigh", grams: 150 },
@@ -95,7 +96,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "chicken_shrimp_salad_soup",
     name: "鸡丝虾仁沙拉配紫菜汤",
-    mealTypes: ["lunch"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 690, proteinGrams: 52, carbsGrams: 58, fatGrams: 22, sodiumMg: 720 },
     ingredients: [
       { slug: "chicken_breast", grams: 150 },
@@ -112,7 +113,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "braised_hairtail_rice",
     name: "红烧带鱼糙米饭配香菇小白菜",
-    mealTypes: ["lunch"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 660, proteinGrams: 36, carbsGrams: 70, fatGrams: 24, sodiumMg: 750 },
     ingredients: [
       { slug: "hairtail", grams: 150 },
@@ -127,7 +128,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "onion_beef_rice",
     name: "洋葱炒牛肉糙米饭配菠菜汤",
-    mealTypes: ["lunch"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 710, proteinGrams: 40, carbsGrams: 68, fatGrams: 28, sodiumMg: 700 },
     ingredients: [
       { slug: "beef_tenderloin", grams: 150 },
@@ -140,11 +141,11 @@ export const presetDishes: readonly RecipeDish[] = [
     method: "stir_fry",
   },
 
-  // ── Dinner (~580–650 kcal) ──
+  // ── Main meals (continued) — lighter mains, ~580–650 kcal ──
   {
     slug: "steamed_bream_rice",
     name: "清蒸鲷鱼糙米饭配蒜蓉西兰花",
-    mealTypes: ["dinner"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 600, proteinGrams: 44, carbsGrams: 60, fatGrams: 18, sodiumMg: 520 },
     ingredients: [
       { slug: "sea_bream", grams: 200 },
@@ -158,7 +159,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "broccoli_shrimp_rice",
     name: "西兰花炒虾仁糙米饭",
-    mealTypes: ["dinner"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 580, proteinGrams: 36, carbsGrams: 62, fatGrams: 16, sodiumMg: 560 },
     ingredients: [
       { slug: "shrimp_jiweixia", grams: 120 },
@@ -172,7 +173,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "garlic_noodle_napa_shrimp_rice",
     name: "蒜蓉粉丝娃娃菜虾配糙米饭",
-    mealTypes: ["dinner"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 620, proteinGrams: 30, carbsGrams: 74, fatGrams: 18, sodiumMg: 640 },
     ingredients: [
       { slug: "shrimp_jiweixia", grams: 80 },
@@ -187,7 +188,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "chicken_carrot_rice",
     name: "胡萝卜炒鸡丁糙米饭配香菇小白菜",
-    mealTypes: ["dinner"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 640, proteinGrams: 36, carbsGrams: 66, fatGrams: 22, sodiumMg: 600 },
     ingredients: [
       { slug: "chicken_breast", grams: 130 },
@@ -203,7 +204,7 @@ export const presetDishes: readonly RecipeDish[] = [
   {
     slug: "pan_seared_bream_rice",
     name: "香煎鲷鱼配柠檬糙米饭配菠菜汤",
-    mealTypes: ["dinner"],
+    mealTypes: ["lunch", "dinner"],
     nutrition: { kcal: 630, proteinGrams: 44, carbsGrams: 58, fatGrams: 20, sodiumMg: 480 },
     ingredients: [
       { slug: "sea_bream", grams: 200 },
