@@ -76,6 +76,45 @@ describe("buildProcurementList", () => {
       },
     ]);
   });
+
+  test("does not let an uncataloged staple inherit the dish bucket", () => {
+    const plan = planWith([
+      {
+        ...entry(0, dish("beef_bowl", [{ slug: "beef_tenderloin", grams: 100 }])),
+        staple: { slug: "brown_rice", grams: 100 },
+      },
+    ]);
+
+    const procurement = buildProcurementList(plan);
+
+    expect(procurement.items.find((item) => item.slug === "brown_rice")).toMatchObject({
+      buckets: [],
+      keyFood: false,
+    });
+  });
+
+  test("aggregates side ingredients separately from main dish ingredients", () => {
+    const plan = planWith([
+      {
+        ...entry(0, dish("beef_bowl", [{ slug: "beef_tenderloin", grams: 100 }])),
+        side: {
+          ...dish("broccoli_side", [{ slug: "broccoli", grams: 80 }]),
+          role: "side",
+          sideKind: "vegetable",
+          buckets: ["vegetable"],
+        },
+      },
+    ]);
+
+    const procurement = buildProcurementList(plan, catalog);
+
+    expect(procurement.items.find((item) => item.slug === "broccoli")).toMatchObject({
+      totalGrams: 80,
+      bufferedGrams: 100,
+      buckets: ["vegetable"],
+      dishCount: 1,
+    });
+  });
 });
 
 function dish(slug: string, ingredients: RecipeDish["ingredients"]): RecipeDish {

@@ -5,12 +5,22 @@ import {
   type RecipeNutrition,
   type RecipePreferences,
 } from "./recipe-engine.js";
+import {
+  DEFAULT_STAPLE,
+  addNutrition,
+  composeMealNutrition,
+  dishNutrition,
+  solveStaplePortionsForDay,
+  type Staple,
+  type StaplePortion,
+} from "./meal-composition.js";
 import { scorePlan, type MealPlanScore } from "./meal-plan-scoring.js";
 import {
   ENERGY_TOLERANCE_RATIO,
   MAX_ENERGY_TOLERANCE_RATIO,
   PROTEIN_FLOOR_RATIO,
 } from "./scoring-weights.js";
+import type { MealCatalog } from "../tools/nutrition-estimate.js";
 
 export type { MealType };
 
@@ -18,6 +28,8 @@ export interface MealPlanRequest {
   startDate: string;
   dailyKcalTarget: number;
   dailyProteinTarget?: number;
+  catalog?: MealCatalog;
+  staple?: Staple;
   presetDishes?: readonly RecipeDish[];
   userDishes?: readonly RecipeDish[];
   candidates?: readonly RecipeDish[];
@@ -31,6 +43,8 @@ export interface MealPlanEntry {
   mealType: MealType;
   targetKcal: number;
   dish: RecipeDish;
+  side?: RecipeDish;
+  staple?: StaplePortion;
   nutrition: RecipeNutrition;
   status: "planned" | "followed" | "substituted" | "skipped";
 }
@@ -79,17 +93,32 @@ export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan
 
   const breakfastPool = candidates.filter(matchesBreakfast);
   const mainPool = candidates.filter(matchesMain);
+  const sidePool = candidates.filter(matchesSide);
   if (breakfastPool.length === 0) throw new RangeError("No breakfast candidates");
   if (mainPool.length === 0) throw new RangeError("No main meal candidates");
 
   const entries: MealPlanEntry[] = [];
-  const usage = new Map<string, number>();
+  const mainUsage = new Map<string, number>();
+  const sideUsage = new Map<string, number>();
   for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
     const date = addDays(request.startDate, dayIndex);
-    const dayEntries = selectDayCombo(request, entries, usage, breakfastPool, mainPool, date, dayIndex);
+    const dayEntries = selectDayCombo(
+      request,
+      entries,
+      mainUsage,
+      sideUsage,
+      breakfastPool,
+      mainPool,
+      sidePool,
+      date,
+      dayIndex,
+    );
     for (const entry of dayEntries) {
       entries.push(entry);
-      usage.set(entry.dish.slug, (usage.get(entry.dish.slug) ?? 0) + 1);
+      mainUsage.set(entry.dish.slug, (mainUsage.get(entry.dish.slug) ?? 0) + 1);
+      if (entry.side !== undefined) {
+        sideUsage.set(entry.side.slug, (sideUsage.get(entry.side.slug) ?? 0) + 1);
+      }
     }
   }
 
@@ -125,9 +154,11 @@ export function validateWeeklyMealPlan(
 function selectDayCombo(
   request: MealPlanRequest,
   entries: readonly MealPlanEntry[],
-  usage: Map<string, number>,
+  mainUsage: Map<string, number>,
+  sideUsage: Map<string, number>,
   breakfastPool: readonly RecipeDish[],
   mainPool: readonly RecipeDish[],
+  sidePool: readonly RecipeDish[],
   date: string,
   dayIndex: number,
 ): readonly MealPlanEntry[] {
@@ -136,15 +167,15 @@ function selectDayCombo(
   for (const breakfast of breakfastPool) {
     for (const lunch of mainPool) {
       for (const dinner of mainPool) {
-        const combo = [
-          buildEntry(date, dayIndex, "breakfast", breakfast),
-          buildEntry(date, dayIndex, "lunch", lunch),
-          buildEntry(date, dayIndex, "dinner", dinner),
-        ];
-        const candidateScore = comboScore(request, entries, combo, usage);
-        if (candidateScore < bestScore) {
-          best = combo;
-          bestScore = candidateScore;
+        for (const lunchSide of sideOptionsFor(lunch, sidePool)) {
+          for (const dinnerSide of sideOptionsFor(dinner, sidePool)) {
+            const combo = buildDayEntries(request, date, dayIndex, breakfast, lunch, dinner, lunchSide, dinnerSide);
+            const candidateScore = comboScore(request, entries, combo, mainUsage, sideUsage);
+            if (candidateScore < bestScore) {
+              best = combo;
+              bestScore = candidateScore;
+            }
+          }
         }
       }
     }
@@ -153,24 +184,88 @@ function selectDayCombo(
   return best;
 }
 
-function buildEntry(date: string, dayIndex: number, mealType: MealType, dish: RecipeDish): MealPlanEntry {
+function buildDayEntries(
+  request: MealPlanRequest,
+  date: string,
+  dayIndex: number,
+  breakfast: RecipeDish,
+  lunch: RecipeDish,
+  dinner: RecipeDish,
+  lunchSide?: RecipeDish,
+  dinnerSide?: RecipeDish,
+): readonly MealPlanEntry[] {
+  if (request.catalog === undefined) {
+    const lunchNutrition = addOptionalSideNutrition(lunch.nutrition, lunchSide);
+    const dinnerNutrition = addOptionalSideNutrition(dinner.nutrition, dinnerSide);
+    return [
+      buildEntry(date, dayIndex, "breakfast", breakfast, breakfast.nutrition),
+      buildEntry(date, dayIndex, "lunch", lunch, lunchNutrition, undefined, lunchSide),
+      buildEntry(date, dayIndex, "dinner", dinner, dinnerNutrition, undefined, dinnerSide),
+    ];
+  }
+
+  const breakfastNutrition = nutritionForDish(breakfast, request.catalog);
+  const lunchNutrition = composeMealNutrition({ dish: lunch, side: lunchSide }, request.catalog);
+  const dinnerNutrition = composeMealNutrition({ dish: dinner, side: dinnerSide }, request.catalog);
+  const fixedNutrition = sumNutrition([breakfastNutrition, lunchNutrition, dinnerNutrition]);
+  const stapleSolve = solveStaplePortionsForDay({
+    dailyKcalTarget: request.dailyKcalTarget,
+    fixedNutrition,
+    mainMealCount: 2,
+    staple: request.staple ?? DEFAULT_STAPLE,
+    catalog: request.catalog,
+    energyToleranceRatio: ENERGY_TOLERANCE_RATIO,
+  });
+  const [lunchStaple, dinnerStaple] = stapleSolve.portions;
+  const lunchComposedNutrition = composeMealNutrition(
+    { dish: lunch, side: lunchSide, staple: lunchStaple },
+    request.catalog,
+  );
+  const dinnerComposedNutrition = composeMealNutrition(
+    { dish: dinner, side: dinnerSide, staple: dinnerStaple },
+    request.catalog,
+  );
+
+  return [
+    buildEntry(date, dayIndex, "breakfast", breakfast, breakfastNutrition),
+    buildEntry(date, dayIndex, "lunch", lunch, lunchComposedNutrition, lunchStaple, lunchSide),
+    buildEntry(date, dayIndex, "dinner", dinner, dinnerComposedNutrition, dinnerStaple, dinnerSide),
+  ];
+}
+
+function buildEntry(
+  date: string,
+  dayIndex: number,
+  mealType: MealType,
+  dish: RecipeDish,
+  nutrition: RecipeNutrition,
+  staple?: StaplePortion,
+  side?: RecipeDish,
+): MealPlanEntry {
   return {
     id: `${date}-${mealType}`,
     date,
     dayIndex,
     mealType,
-    targetKcal: dish.nutrition.kcal,
+    targetKcal: nutrition.kcal,
     dish,
-    nutrition: dish.nutrition,
+    ...(side === undefined ? {} : { side }),
+    ...(staple === undefined ? {} : { staple }),
+    nutrition,
     status: "planned",
   };
+}
+
+function nutritionForDish(dish: RecipeDish, catalog: MealCatalog): RecipeNutrition {
+  return dishNutrition(dish, catalog);
 }
 
 function comboScore(
   request: MealPlanRequest,
   existingEntries: readonly MealPlanEntry[],
   combo: readonly MealPlanEntry[],
-  usage: ReadonlyMap<string, number>,
+  mainUsage: ReadonlyMap<string, number>,
+  sideUsage: ReadonlyMap<string, number>,
 ): number {
   const trialEntries = [...existingEntries, ...combo];
   const dayTotals = sumNutrition(combo.map((entry) => entry.nutrition));
@@ -187,7 +282,13 @@ function comboScore(
   const proteinFloor = (request.dailyProteinTarget ?? 0) * PROTEIN_FLOOR_RATIO;
   const proteinMiss = proteinFloor === 0 ? 0 : Math.max(0, proteinFloor - dayTotals.proteinGrams) / proteinFloor;
   const duplicateMainPenalty = combo[1]?.dish.slug === combo[2]?.dish.slug ? 4 : 0;
-  const usagePenalty = combo.reduce((sum, entry) => sum + (usage.get(entry.dish.slug) ?? 0), 0) * 0.7;
+  const duplicateSidePenalty =
+    combo[1]?.side !== undefined && combo[1].side?.slug === combo[2]?.side?.slug ? 1 : 0;
+  const usagePenalty = combo.reduce((sum, entry) => sum + (mainUsage.get(entry.dish.slug) ?? 0), 0) * 0.7;
+  const sideUsagePenalty = combo.reduce(
+    (sum, entry) => sum + (entry.side === undefined ? 0 : sideUsage.get(entry.side.slug) ?? 0),
+    0,
+  ) * 0.25;
   const repeatIngredientPenalty = wouldRepeatIngredients(existingEntries, combo) ? 2 : 0;
   const trialPlan = buildPlan(request.startDate, trialEntries, []);
   const softPenalty = scorePlan(
@@ -198,7 +299,7 @@ function comboScore(
     },
     request.preferences,
   ).penalty;
-  return energyMiss * 2_000 + energySoftMiss * 1_000 + proteinMiss * 1_500 + duplicateMainPenalty + usagePenalty + repeatIngredientPenalty + softPenalty;
+  return energyMiss * 2_000 + energySoftMiss * 1_000 + proteinMiss * 1_500 + duplicateMainPenalty + duplicateSidePenalty + usagePenalty + sideUsagePenalty + repeatIngredientPenalty + softPenalty;
 }
 
 function buildPlan(
@@ -321,11 +422,37 @@ function filterUsableCandidates(
 }
 
 function matchesBreakfast(dish: RecipeDish): boolean {
-  return dish.mealTypes === undefined || dish.mealTypes.includes("breakfast");
+  return dish.role !== "side" && (dish.mealTypes === undefined || dish.mealTypes.includes("breakfast"));
 }
 
 function matchesMain(dish: RecipeDish): boolean {
-  return dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner");
+  return dish.role !== "side" && (
+    dish.mealTypes === undefined ||
+    dish.mealTypes.includes("lunch") ||
+    dish.mealTypes.includes("dinner")
+  );
+}
+
+function matchesSide(dish: RecipeDish): boolean {
+  return dish.role === "side" && (
+    dish.mealTypes === undefined ||
+    dish.mealTypes.includes("lunch") ||
+    dish.mealTypes.includes("dinner")
+  );
+}
+
+function sideOptionsFor(main: RecipeDish, sidePool: readonly RecipeDish[]): readonly (RecipeDish | undefined)[] {
+  if (isSelfContainedMain(main) || sidePool.length === 0) return [undefined];
+  return sidePool;
+}
+
+function isSelfContainedMain(dish: RecipeDish): boolean {
+  return dish.selfContained !== false;
+}
+
+function addOptionalSideNutrition(nutrition: RecipeNutrition, side: RecipeDish | undefined): RecipeNutrition {
+  if (side === undefined) return nutrition;
+  return addNutrition(nutrition, side.nutrition);
 }
 
 function sumNutrition(items: readonly RecipeNutrition[]): RecipeNutrition {

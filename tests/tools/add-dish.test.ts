@@ -43,6 +43,37 @@ const catalog: MealCatalog = {
       fatGramsPer100g: 0.1,
       sodiumMgPer100g: 4,
     },
+    {
+      slug: "broccoli",
+      name: "Broccoli",
+      nameZh: "西兰花",
+      aliases: ["broccoli", "西兰花"],
+      executionBuckets: ["vegetable"],
+      roles: [],
+      weeklyFloor: 0,
+      defaultGrams: null,
+      defaultUnit: null,
+      kcalPer100g: 35,
+      proteinGramsPer100g: 2.4,
+      carbsGramsPer100g: 7.2,
+      fatGramsPer100g: 0.4,
+      sodiumMgPer100g: 41,
+    },
+    {
+      slug: "brown_rice",
+      name: "Brown rice",
+      aliases: ["rice"],
+      executionBuckets: ["staple"],
+      roles: [],
+      weeklyFloor: 0,
+      defaultGrams: null,
+      defaultUnit: null,
+      kcalPer100g: 348,
+      proteinGramsPer100g: 7.7,
+      carbsGramsPer100g: 75,
+      fatGramsPer100g: 2.7,
+      sodiumMgPer100g: 1,
+    },
   ],
   naturalUnits: [],
 };
@@ -115,6 +146,68 @@ describe("add dish core", () => {
         ingredients: [{ slug: "beef_tenderloin", grams: 0 }],
       }, catalog),
     ).toThrow(RangeError);
+  });
+
+  test("validateResolvedDish rejects main dishes that bundle staple ingredients", () => {
+    const resolved = proposeDish({
+      draft: {
+        ...draft,
+        ingredients: [
+          ...draft.ingredients,
+          { slug: "brown_rice", grams: 100 },
+        ],
+      },
+    }, { catalog, seasoningRecords: seasonings });
+
+    expect(() => validateResolvedDish(resolved, catalog)).toThrow("main dishes must not include staple ingredients");
+  });
+
+  test("side dishes resolve and persist role metadata", () => {
+    const resolved = proposeDish({
+      draft: {
+        name: "Garlic broccoli",
+        mealCategory: "main",
+        role: "side",
+        sideKind: "vegetable",
+        ingredients: [{ slug: "broccoli", grams: 100 }],
+        seasonings: ["light_soy_sauce"],
+        method: "stir_fry",
+        source: "user_nl",
+      },
+    }, { catalog, seasoningRecords: seasonings });
+
+    expect(resolved).toMatchObject({
+      slug: "garlic_broccoli",
+      role: "side",
+      sideKind: "vegetable",
+      selfContained: false,
+      nutrition: {
+        kcal: 35,
+        proteinGrams: 2.4,
+      },
+    });
+
+    expect(userDishRowFromResolvedDish("user-id", resolved, catalog)).toMatchObject({
+      role: "side",
+      sideKind: "vegetable",
+      selfContained: false,
+    });
+  });
+
+  test("validateResolvedDish rejects protein ingredients in side dishes", () => {
+    const resolved = proposeDish({
+      draft: {
+        name: "Beef side",
+        mealCategory: "main",
+        role: "side",
+        sideKind: "vegetable",
+        ingredients: [{ slug: "beef_tenderloin", grams: 100 }],
+        seasonings: [],
+        source: "user_nl",
+      },
+    }, { catalog, seasoningRecords: seasonings });
+
+    expect(() => validateResolvedDish(resolved, catalog)).toThrow("side dishes must only include vegetable or soup ingredients");
   });
 
   test("userDishRowFromResolvedDish ignores caller supplied nutrition and uses resolved values", () => {

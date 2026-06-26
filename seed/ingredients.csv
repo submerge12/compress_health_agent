@@ -1,4 +1,8 @@
 slug,name_zh,name_en,category_en,edible_percent,energy_kcal,energy_kj,water_g,protein_g,fat_g,carbohydrate_g,dietary_fiber_g,cholesterol_mg,ash_g,vitamin_a_ug_re,thiamin_mg,riboflavin_mg,niacin_mg,vitamin_c_mg,vitamin_e_mg,alpha_vitamin_e_mg,calcium_mg,phosphorus_mg,potassium_mg,sodium_mg,magnesium_mg,iron_mg,zinc_mg,selenium_ug,copper_mg,manganese_mg,carotene_ug,retinol_ug,sodium_source,basis
+oats,燕麦片,Rolled oats,grain,100.0,379.0,1586.0,10.8,13.2,6.5,67.7,10.1,0.0,1.8,0.0,0.46,0.16,0.96,0.0,0.42,0.0,52.0,410.0,362.0,6.0,138.0,4.3,3.6,28.9,0.39,3.63,0.0,0.0,usda,per_100g
+scallion,葱,Scallion,vegetable,100.0,32.0,134.0,89.8,1.8,0.2,7.3,2.6,0.0,0.9,50.0,0.06,0.08,0.5,18.8,0.55,0.0,72.0,37.0,276.0,16.0,20.0,1.5,0.39,0.6,0.08,0.16,598.0,0.0,usda,per_100g
+onion,洋葱,Onion,vegetable,100.0,40.0,167.0,89.1,1.1,0.1,9.3,1.7,0.0,0.4,0.0,0.05,0.03,0.12,7.4,0.02,0.0,23.0,29.0,146.0,4.0,10.0,0.2,0.17,0.5,0.04,0.13,0.0,0.0,usda,per_100g
+soy_milk,豆浆,Soy milk,legume,100.0,33.0,138.0,93.0,3.0,1.6,1.8,0.6,0.0,0.6,0.0,0.03,0.02,0.3,0.0,0.1,0.0,25.0,49.0,118.0,3.0,25.0,0.6,0.3,2.0,0.12,0.2,0.0,0.0,label,per_100g
 brown_rice,糙米,Brown rice,grain,100.0,348.0,1475.0,13.4,7.7,2.7,75.0,3.4,0.0,1.2,0.0,0.38,0.04,0.0,0.0,1.32,0.0,10.0,304.0,230.0,5.4,123.0,1.8,1.79,0.0,0.24,3.04,0.0,0.0,cfct6,per_100g_edible_portion
 steamed_bun,馒头（代表值）,Steamed bun (representative),grain,100.0,223.0,934.0,43.9,7.0,1.1,47.0,1.3,0.0,1.0,0.0,0.04,0.05,0.0,0.0,0.65,0.35,38.0,107.0,138.0,165.1,30.0,1.8,0.71,8.45,0.1,0.78,0.0,0.0,juhe,per_100g_edible_portion
 quinoa_ciabatta,三色藜麦恰巴塔,Three-color quinoa ciabatta,bread,100.0,249.0,1041.0,,9.6,0.8,49.9,,,,,,,,,,,,,,428.0,,,,,,,,,label,per_100g

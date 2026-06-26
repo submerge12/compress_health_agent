@@ -2,6 +2,10 @@ export type MealType = "breakfast" | "lunch" | "dinner";
 
 export type RecipeSource = "preset" | "cooking_record" | "user";
 
+export type DishRole = "main" | "side";
+
+export type SideKind = "vegetable" | "soup";
+
 export interface RecipeNutrition {
   kcal: number;
   proteinGrams: number;
@@ -23,6 +27,9 @@ export interface RecipeDish {
   ingredients: readonly RecipeIngredient[];
   seasonings: readonly string[];
   source: RecipeSource;
+  role?: DishRole;
+  sideKind?: SideKind;
+  selfContained?: boolean;
   method?: string;
   notes?: string;
   lastServedAt?: string | null;
@@ -73,6 +80,7 @@ export function recommendRecipes(request: RecipeRecommendationRequest): RankedRe
   validateRecommendationRequest(request);
   const context = buildScoreContext(request);
   return request.candidates
+    .filter((dish) => dish.role !== "side")
     .filter((dish) => matchesMealType(dish, request.mealType))
     .filter((dish) => !hasRejectedSeasoning(dish, context.preferences.rejectedSeasonings ?? []))
     .map((dish) => rankDish(dish, request.target.kcal, context))

@@ -43,7 +43,31 @@ export function buildProcurementList(
   const items = new Map<string, { grams: number; dishes: Set<string>; buckets: Set<string>; roles: Set<string> }>();
 
   for (const entry of plan.entries) {
-    for (const ingredient of entry.dish.ingredients) {
+    const components = [
+      ...entry.dish.ingredients.map((ingredient) => ({
+        ingredient,
+        componentSlug: entry.dish.slug,
+        buckets: entry.dish.buckets ?? [],
+        roles: entry.dish.roles ?? [],
+      })),
+      ...(entry.side?.ingredients ?? []).map((ingredient) => ({
+        ingredient,
+        componentSlug: entry.side!.slug,
+        buckets: entry.side!.buckets ?? [],
+        roles: entry.side!.roles ?? [],
+      })),
+      ...(entry.staple === undefined
+        ? []
+        : [{
+            ingredient: entry.staple,
+            componentSlug: entry.dish.slug,
+            buckets: [],
+            roles: [],
+          }]),
+    ];
+
+    for (const component of components) {
+      const ingredient = component.ingredient;
       const existing = items.get(ingredient.slug) ?? {
         grams: 0,
         dishes: new Set<string>(),
@@ -51,11 +75,11 @@ export function buildProcurementList(
         roles: new Set<string>(),
       };
       existing.grams += ingredient.grams;
-      existing.dishes.add(entry.dish.slug);
+      existing.dishes.add(component.componentSlug);
 
       const food = catalogBySlug.get(ingredient.slug);
-      const buckets = food?.executionBuckets ?? entry.dish.buckets ?? [];
-      const roles = food?.roles ?? entry.dish.roles ?? [];
+      const buckets = food?.executionBuckets ?? component.buckets;
+      const roles = food?.roles ?? component.roles;
       for (const bucket of buckets) existing.buckets.add(bucket);
       for (const role of roles) existing.roles.add(role);
       items.set(ingredient.slug, existing);

@@ -25,6 +25,7 @@ function userDishToDish(row: UserDishRow): RecipeDish {
     grams: Number(item.grams ?? 100),
   }));
   const seasonings = (row.seasoningsJson ?? []).map((item) => String(item.slug ?? item));
+  const role = row.role ?? "main";
   return {
     slug: row.slug,
     name: row.name,
@@ -39,6 +40,9 @@ function userDishToDish(row: UserDishRow): RecipeDish {
     ingredients,
     seasonings,
     source: "user",
+    role,
+    ...(row.sideKind === null || row.sideKind === undefined ? {} : { sideKind: row.sideKind }),
+    ...(role === "main" ? { selfContained: row.selfContained ?? true } : {}),
     method: row.method ?? undefined,
   };
 }

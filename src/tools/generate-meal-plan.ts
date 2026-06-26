@@ -74,8 +74,12 @@ function formatWeeklyOverview(plan: WeeklyMealPlan): string {
 
 function formatDayOverview(date: string, index: number, entries: readonly MealPlanEntry[]): string {
   const lines = entries.map(
-    (entry) =>
-      `${entry.mealType}: ${entry.dish.name} (${entry.nutrition.kcal} kcal, ${entry.nutrition.proteinGrams}g protein)`,
+    (entry) => {
+      const dishName = entry.side === undefined
+        ? entry.dish.name
+        : `${entry.dish.name} + ${entry.side.name}`;
+      return `${entry.mealType}: ${dishName} (${entry.nutrition.kcal} kcal, ${entry.nutrition.proteinGrams}g protein)`;
+    },
   );
   return [`Day ${index + 1} - ${date}`, ...lines].join("\n");
 }

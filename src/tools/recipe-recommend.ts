@@ -21,7 +21,7 @@ export interface RecipeRecommendResult {
 
 export function recipeRecommend(input: RecipeRecommendInput): RecipeRecommendResult {
   validateRecipeRecommendInput(input);
-  const candidates = input.candidates.filter((dish) => dish.nutrition.kcal <= input.maxKcal);
+  const candidates = input.candidates.filter((dish) => dish.role !== "side" && dish.nutrition.kcal <= input.maxKcal);
   if (candidates.length === 0) return { options: [], summary: "No matching recipes under the kcal limit." };
   const options = recommendRecipes({
     candidates,

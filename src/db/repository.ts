@@ -110,6 +110,8 @@ export interface CookingRecordRow {
 }
 
 export type UserDishMealCategory = "breakfast" | "main";
+export type UserDishRole = "main" | "side";
+export type UserDishSideKind = "vegetable" | "soup";
 
 export interface UserDishRow {
   id: string;
@@ -117,6 +119,9 @@ export interface UserDishRow {
   slug: string;
   name: string;
   mealCategory: UserDishMealCategory;
+  role: UserDishRole;
+  sideKind: UserDishSideKind | null;
+  selfContained: boolean;
   ingredientsJson: Record<string, unknown>[];
   seasoningsJson: Record<string, unknown>[];
   method: string | null;
@@ -386,6 +391,9 @@ export function createRepository(db: Db) {
         slug: data.slug,
         name: data.name,
         mealCategory: data.mealCategory,
+        role: data.role ?? "main",
+        sideKind: data.sideKind ?? null,
+        selfContained: data.selfContained ?? true,
         ingredientsJson: data.ingredientsJson,
         seasoningsJson: data.seasoningsJson,
         method: data.method,

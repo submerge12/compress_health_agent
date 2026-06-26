@@ -23,6 +23,9 @@ CREATE TABLE IF NOT EXISTS "user_dishes" (
   "slug" text NOT NULL,
   "name" text NOT NULL,
   "meal_category" text NOT NULL,
+  "role" text DEFAULT 'main' NOT NULL,
+  "side_kind" text,
+  "self_contained" boolean DEFAULT true NOT NULL,
   "ingredients_json" jsonb DEFAULT '[]'::jsonb NOT NULL,
   "seasonings_json" jsonb DEFAULT '[]'::jsonb NOT NULL,
   "method" text,
@@ -38,6 +41,11 @@ CREATE TABLE IF NOT EXISTS "user_dishes" (
 
 CREATE UNIQUE INDEX IF NOT EXISTS "user_dishes_user_slug_unique"
   ON "user_dishes" ("user_id", "slug");
+
+ALTER TABLE "user_dishes"
+  ADD COLUMN IF NOT EXISTS "role" text DEFAULT 'main' NOT NULL,
+  ADD COLUMN IF NOT EXISTS "side_kind" text,
+  ADD COLUMN IF NOT EXISTS "self_contained" boolean DEFAULT true NOT NULL;
 
 CREATE TABLE IF NOT EXISTS "memory_records" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,

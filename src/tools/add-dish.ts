@@ -1,6 +1,8 @@
 import { aggregateNutrition } from "../engine/nutrition.js";
 import type { NutritionEntry, NutritionRecord } from "../engine/types.js";
 import { dishBucketsRoles } from "../engine/classification.js";
+import { STAPLES } from "../engine/meal-composition.js";
+import type { DishRole, SideKind } from "../engine/recipe-engine.js";
 import type { UserDishRow, UserDishMealCategory } from "../db/repository.js";
 import type { MealCatalog } from "./nutrition-estimate.js";
 import { resolveFoodSlug, resolveSeasoningSlug, slugifyDishName } from "./slug-resolver.js";
@@ -16,6 +18,9 @@ export interface DishDraftIngredient {
 export interface DishDraft {
   name: string;
   mealCategory: UserDishMealCategory;
+  role?: DishRole;
+  sideKind?: SideKind;
+  selfContained?: boolean;
   ingredients: DishDraftIngredient[];
   seasonings: string[];
   method?: string;
@@ -26,6 +31,9 @@ export interface DishDraft {
 export interface ResolvedDish {
   name: string;
   mealCategory: UserDishMealCategory;
+  role: DishRole;
+  sideKind?: SideKind;
+  selfContained: boolean;
   ingredients: NutritionEntry[];
   seasonings: string[];
   method?: string;
@@ -54,8 +62,13 @@ export interface AddDishDeps {
   seasoningRecords: readonly NutritionRecord[];
 }
 
+const STAPLE_SLUGS = new Set(STAPLES.map((staple) => staple.slug));
+
 export function proposeDish(input: ProposeDishInput, deps: AddDishDeps): ResolvedDish {
   const draft = draftFromInput(input);
+  const role = requireDishRole(draft.role ?? "main");
+  const sideKind = role === "side" ? requireSideKind(draft.sideKind) : undefined;
+  const selfContained = role === "side" ? false : draft.selfContained ?? true;
   const unresolved: string[] = [];
   const ingredients: NutritionEntry[] = [];
 
@@ -85,6 +98,9 @@ export function proposeDish(input: ProposeDishInput, deps: AddDishDeps): Resolve
       ingredients,
       seasonings,
       source: draft.source === "preset" ? "preset" : "user",
+      role,
+      ...(sideKind === undefined ? {} : { sideKind }),
+      selfContained,
       method: draft.method,
       notes: draft.notes,
     },
@@ -94,6 +110,9 @@ export function proposeDish(input: ProposeDishInput, deps: AddDishDeps): Resolve
   return {
     name: requireText(draft.name, "name"),
     mealCategory: requireMealCategory(draft.mealCategory),
+    role,
+    ...(sideKind === undefined ? {} : { sideKind }),
+    selfContained,
     ingredients,
     seasonings,
     ...(draft.method !== undefined ? { method: draft.method } : {}),
@@ -110,12 +129,27 @@ export function proposeDish(input: ProposeDishInput, deps: AddDishDeps): Resolve
 export function validateResolvedDish(dish: ResolvedDish, catalog: MealCatalog): void {
   requireText(dish.name, "name");
   requireMealCategory(dish.mealCategory);
+  const role = requireDishRole(dish.role);
+  if (role === "side") requireSideKind(dish.sideKind);
+  if (role === "side" && dish.mealCategory !== "main") {
+    throw new RangeError("side dishes must use main mealCategory");
+  }
+  if (role === "main" && dish.sideKind !== undefined) {
+    throw new RangeError("main dishes must not include sideKind");
+  }
   if (dish.ingredients.length === 0) throw new RangeError("dish must include at least one ingredient");
   if (dish.unresolved.length > 0) throw new RangeError("dish has unresolved ingredients");
-  const catalogSlugs = new Set(catalog.foods.map((food) => food.slug));
+  const catalogBySlug = new Map(catalog.foods.map((food) => [food.slug, food]));
   for (const ingredient of dish.ingredients) {
-    if (!catalogSlugs.has(ingredient.slug)) {
+    const food = catalogBySlug.get(ingredient.slug);
+    if (food === undefined) {
       throw new RangeError(`unknown ingredient slug: ${ingredient.slug}`);
+    }
+    if (dish.mealCategory === "main" && STAPLE_SLUGS.has(ingredient.slug)) {
+      throw new RangeError("main dishes must not include staple ingredients");
+    }
+    if (role === "side" && !isAllowedSideIngredient(food)) {
+      throw new RangeError("side dishes must only include vegetable or soup ingredients");
     }
     assertPositiveNumber(ingredient.grams, "ingredient grams");
   }
@@ -136,6 +170,9 @@ export function userDishRowFromResolvedDish(
     slug: dish.slug,
     name: dish.name,
     mealCategory: dish.mealCategory,
+    role: dish.role,
+    sideKind: dish.sideKind ?? null,
+    selfContained: dish.selfContained,
     ingredientsJson: dish.ingredients.map((ingredient) => ({ ...ingredient })),
     seasoningsJson: dish.seasonings.map((slug) => ({ slug })),
     method: dish.method ?? null,
@@ -201,6 +238,31 @@ function requireMealCategory(value: unknown): UserDishMealCategory {
     throw new RangeError("mealCategory must be breakfast or main");
   }
   return value;
+}
+
+function requireDishRole(value: unknown): DishRole {
+  if (value !== "main" && value !== "side") {
+    throw new RangeError("role must be main or side");
+  }
+  return value;
+}
+
+function requireSideKind(value: unknown): SideKind {
+  if (value !== "vegetable" && value !== "soup") {
+    throw new RangeError("sideKind must be vegetable or soup");
+  }
+  return value;
+}
+
+function isAllowedSideIngredient(food: MealCatalog["foods"][number]): boolean {
+  const category = food.category?.toLowerCase();
+  const buckets = new Set((food.executionBuckets ?? []).map((bucket) => bucket.toLowerCase()));
+  return (
+    category === "vegetable" ||
+    category === "mushroom" ||
+    category === "seaweed" ||
+    buckets.has("vegetable")
+  );
 }
 
 function requireText(value: unknown, name: string): string {

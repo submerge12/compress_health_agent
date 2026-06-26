@@ -410,8 +410,15 @@ export async function handleGenerateMealPlan(
       dishName: entry.dish.name,
       recipeSlug: entry.dish.slug,
       status: "planned",
-      ingredientsJson: (entry.dish.ingredients ?? []).map((i) => ({ slug: i.slug, grams: i.grams })),
-      seasoningsJson: (entry.dish.seasonings ?? []).map((s) => ({ slug: s })),
+      ingredientsJson: [
+        ...(entry.dish.ingredients ?? []),
+        ...(entry.side?.ingredients ?? []),
+        ...(entry.staple === undefined ? [] : [entry.staple]),
+      ].map((i) => ({ slug: i.slug, grams: i.grams })),
+      seasoningsJson: [
+        ...(entry.dish.seasonings ?? []),
+        ...(entry.side?.seasonings ?? []),
+      ].map((s) => ({ slug: s })),
       caloriesKcal: entry.nutrition.kcal,
       proteinGrams: entry.nutrition.proteinGrams,
       carbsGrams: entry.nutrition.carbsGrams,

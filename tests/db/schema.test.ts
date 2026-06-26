@@ -76,6 +76,12 @@ describe("database schema", () => {
     }
   });
 
+  test("test_user_dishes_exposes_side_composition_columns", () => {
+    expect(schema.userDishes).toHaveProperty("role");
+    expect(schema.userDishes).toHaveProperty("sideKind");
+    expect(schema.userDishes).toHaveProperty("selfContained");
+  });
+
   test("test_connection_module_imports_without_requiring_a_live_query", async () => {
     const connection = await import("../../src/db/connection.js");
 

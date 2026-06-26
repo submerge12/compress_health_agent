@@ -15,6 +15,9 @@ function userDish(overrides: Partial<UserDishRow>): UserDishRow {
     ingredientsJson: [{ slug: "beef_tenderloin", grams: 150 }],
     seasoningsJson: [{ slug: "light_soy_sauce" }],
     method: "stir_fry",
+    role: "main",
+    sideKind: null,
+    selfContained: true,
     caloriesKcal: 680,
     proteinGrams: 42,
     carbsGrams: 62,
@@ -45,10 +48,10 @@ function makeContext(userDishes: UserDishRow[]): ToolContext {
 }
 
 describe("loadCandidateDishes", () => {
-  test("returns exactly the 14 curated presets when user_dishes is empty", async () => {
+  test("returns exactly the curated presets when user_dishes is empty", async () => {
     const candidates = await loadCandidateDishes(makeContext([]));
 
-    expect(candidates).toHaveLength(14);
+    expect(candidates).toHaveLength(presetDishes.length);
     expect(candidates.map((dish) => dish.slug)).toEqual(presetDishes.map((dish) => dish.slug));
     expect(candidates[0]).toMatchObject(presetDishes[0]!);
     expect(candidates[0]).toMatchObject({ buckets: [], roles: [], weeklyFloors: {} });
@@ -73,6 +76,31 @@ describe("loadCandidateDishes", () => {
     });
     expect(candidates.find((dish) => dish.slug === "user_oat_bowl")).toMatchObject({
       mealTypes: ["breakfast"],
+      source: "user",
+    });
+  });
+
+  test("maps user side dishes to side candidates", async () => {
+    const candidates = await loadCandidateDishes(makeContext([
+      userDish({
+        slug: "user_broccoli_side",
+        name: "User broccoli side",
+        role: "side",
+        sideKind: "vegetable",
+        selfContained: false,
+        ingredientsJson: [{ slug: "broccoli", grams: 100 }],
+        caloriesKcal: 35,
+        proteinGrams: 2.4,
+        carbsGrams: 7.2,
+        fatGrams: 0.4,
+        sodiumMg: 41,
+      }),
+    ]));
+
+    expect(candidates.find((dish) => dish.slug === "user_broccoli_side")).toMatchObject({
+      mealTypes: ["lunch", "dinner"],
+      role: "side",
+      sideKind: "vegetable",
       source: "user",
     });
   });
