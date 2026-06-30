@@ -94,6 +94,20 @@ describe("recommendRecipes", () => {
     expect(recommendations.every((item) => !item.seasonings.includes("light_soy_sauce"))).toBe(true);
   });
 
+  it("test_recommend_recipes_rejected_ingredient_filters_candidates", () => {
+    const recommendations = recommendRecipes(
+      makeRequest({
+        recentDishSlugs: [],
+        preferences: { rejectedIngredients: ["mushroom"] },
+      }),
+    );
+
+    expect(recommendations.map((item) => item.slug)).not.toContain("tofu_mushroom_bowl");
+    expect(
+      recommendations.every((item) => !item.ingredients.some((ing) => ing.slug === "mushroom")),
+    ).toBe(true);
+  });
+
   it("test_recommend_recipes_invalid_target_throws_range_error", () => {
     expect(() => recommendRecipes(makeRequest({ target: { kcal: 0, proteinGrams: 30 } }))).toThrow(
       RangeError,

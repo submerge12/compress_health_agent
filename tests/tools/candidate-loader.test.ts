@@ -1,9 +1,10 @@
 import { describe, expect, test } from "vitest";
 
 import { presetDishes } from "../../src/data/preset-dishes.js";
-import type { UserDishRow } from "../../src/db/repository.js";
+import type { MemoryKind, MemoryRecordRow, UserDishRow } from "../../src/db/repository.js";
+import type { FoodCatalogRecord } from "../../src/tools/nutrition-estimate.js";
 import type { ToolContext } from "../../src/tools/context.js";
-import { loadCandidateDishes } from "../../src/tools/candidate-loader.js";
+import { loadCandidateDishes, loadUserPreferences } from "../../src/tools/candidate-loader.js";
 
 function userDish(overrides: Partial<UserDishRow>): UserDishRow {
   return {
@@ -115,5 +116,92 @@ describe("loadCandidateDishes", () => {
     expect(candidates.map((dish) => dish.slug)).not.toContain("zero_kcal");
     expect(candidates.filter((dish) => dish.slug === presetDishes[0]!.slug)).toHaveLength(1);
     expect(candidates.map((dish) => dish.slug)).toContain("valid_extra");
+  });
+});
+
+function food(slug: string, aliases: string[] = []): FoodCatalogRecord {
+  return {
+    slug,
+    name: slug,
+    executionBuckets: [],
+    roles: [],
+    weeklyFloor: 0,
+    aliases,
+    defaultGrams: null,
+    defaultUnit: null,
+    kcalPer100g: 100,
+    proteinGramsPer100g: 10,
+    carbsGramsPer100g: 10,
+    fatGramsPer100g: 5,
+    sodiumMgPer100g: 50,
+  };
+}
+
+function dislike(subject: string): MemoryRecordRow {
+  return {
+    id: `mem-${subject}`,
+    userId: "user-id",
+    kind: "dislike" as MemoryKind,
+    subject,
+    content: `dislikes ${subject}`,
+    contentNorm: subject,
+    sourceText: null,
+    confidence: 1,
+    status: "active",
+    supersededBy: null,
+    validFrom: new Date(),
+    validTo: null,
+    lastConfirmedAt: null,
+    timesReferenced: 0,
+  };
+}
+
+function makePreferenceContext(opts: {
+  memories: MemoryRecordRow[];
+  tableRejected?: string[];
+}): ToolContext {
+  return {
+    userId: "user-id",
+    locale: "zh",
+    catalog: { foods: [food("mushroom", ["蘑菇"]), food("beef")], naturalUnits: [] },
+    seasoningRecords: [],
+    seasoningCatalog: [{ slug: "light_soy_sauce", name: "生抽" }],
+    repo: {
+      listActiveMemories: async (userId: string, kinds?: readonly MemoryKind[]) => {
+        expect(userId).toBe("user-id");
+        expect(kinds).toEqual(["dislike"]);
+        return opts.memories;
+      },
+      listRejectedSeasoningSlugs: async () => opts.tableRejected ?? [],
+    } as unknown as ToolContext["repo"],
+    close: async () => undefined,
+  };
+}
+
+describe("loadUserPreferences", () => {
+  test("resolves disliked foods to rejected ingredients and seasonings to rejected seasonings", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      memories: [dislike("mushroom"), dislike("生抽")],
+    }));
+
+    expect(prefs.rejectedIngredients).toContain("mushroom");
+    expect(prefs.rejectedSeasonings).toContain("light_soy_sauce");
+  });
+
+  test("unions table-stored rejected seasonings and ignores unresolvable dislikes", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      memories: [dislike("a_food_not_in_any_catalog")],
+      tableRejected: ["chili_oil"],
+    }));
+
+    expect(prefs.rejectedSeasonings).toContain("chili_oil");
+    expect(prefs.rejectedIngredients).toEqual([]);
+  });
+
+  test("returns empty preferences when there are no dislikes", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({ memories: [] }));
+
+    expect(prefs.rejectedSeasonings).toEqual([]);
+    expect(prefs.rejectedIngredients).toEqual([]);
   });
 });

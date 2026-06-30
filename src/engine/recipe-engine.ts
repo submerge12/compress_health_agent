@@ -83,6 +83,7 @@ export function recommendRecipes(request: RecipeRecommendationRequest): RankedRe
     .filter((dish) => dish.role !== "side")
     .filter((dish) => matchesMealType(dish, request.mealType))
     .filter((dish) => !hasRejectedSeasoning(dish, context.preferences.rejectedSeasonings ?? []))
+    .filter((dish) => !hasRejectedIngredient(dish, context.preferences.rejectedIngredients ?? []))
     .map((dish) => rankDish(dish, request.target.kcal, context))
     .sort(compareRankedOptions)
     .slice(0, request.limit ?? request.candidates.length);
@@ -94,6 +95,14 @@ export function hasRejectedSeasoning(
 ): boolean {
   const rejected = new Set(rejectedSeasonings.map(normalizeToken));
   return dish.seasonings.some((seasoning) => rejected.has(normalizeToken(seasoning)));
+}
+
+export function hasRejectedIngredient(
+  dish: RecipeDish,
+  rejectedIngredients: readonly string[],
+): boolean {
+  const rejected = new Set(rejectedIngredients.map(normalizeToken));
+  return dish.ingredients.some((ingredient) => rejected.has(normalizeToken(ingredient.slug)));
 }
 
 function validateRecommendationRequest(request: RecipeRecommendationRequest): void {

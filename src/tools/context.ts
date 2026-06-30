@@ -5,6 +5,7 @@ import * as schema from "../db/schema.js";
 import { createRepository, type Repository } from "../db/repository.js";
 import { loadMealCatalog, loadSeasoningRecords } from "../db/catalog.js";
 import type { MealCatalog } from "./nutrition-estimate.js";
+import type { SeasoningLike } from "./slug-resolver.js";
 import type { NutritionRecord } from "../engine/types.js";
 
 export interface ToolContext {
@@ -13,6 +14,8 @@ export interface ToolContext {
   repo: Repository;
   catalog: MealCatalog;
   seasoningRecords: NutritionRecord[];
+  /** Seasoning slugs + display names, for resolving free-text preferences to slugs. */
+  seasoningCatalog?: readonly SeasoningLike[];
   close: () => Promise<void>;
 }
 
@@ -55,6 +58,7 @@ export async function initToolContext(options: InitContextOptions): Promise<Tool
     repo,
     catalog,
     seasoningRecords,
+    seasoningCatalog: seasoningRows.map((s) => ({ slug: s.slug, name: s.name })),
     close: () => pool.end({ timeout: 5 }).then(() => undefined),
   };
 }

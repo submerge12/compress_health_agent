@@ -1,4 +1,4 @@
-import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
+import { and, eq, gte, lte, desc, inArray, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "./schema.js";
@@ -442,32 +442,21 @@ export function createRepository(db: Db) {
       return rows.map((r) => r.slug);
     },
 
-    async setSeasoningPreference(userId: string, seasoningSlug: string, avoid: boolean): Promise<void> {
-      const [seasoning] = await db.select({ id: schema.seasonings.id })
-        .from(schema.seasonings)
-        .where(eq(schema.seasonings.slug, seasoningSlug))
-        .limit(1);
-      if (!seasoning) return;
-
-      const existing = await db.select().from(schema.userSeasoningPreferences)
-        .where(and(
-          eq(schema.userSeasoningPreferences.userId, userId),
-          eq(schema.userSeasoningPreferences.seasoningId, seasoning.id),
-        ))
-        .limit(1);
-
-      if (existing[0]) {
-        await db.update(schema.userSeasoningPreferences)
-          .set({ avoid, preference: avoid ? "rejected" : "neutral", updatedAt: new Date() })
-          .where(eq(schema.userSeasoningPreferences.id, existing[0].id));
-      } else {
-        await db.insert(schema.userSeasoningPreferences).values({
-          userId,
-          seasoningId: seasoning.id,
-          avoid,
-          preference: avoid ? "rejected" : "neutral",
-        });
+    async listActiveMemories(
+      userId: string,
+      kinds?: readonly MemoryKind[],
+    ): Promise<MemoryRecordRow[]> {
+      const filters = [
+        eq(schema.memoryRecords.userId, userId),
+        eq(schema.memoryRecords.status, "active"),
+      ];
+      if (kinds !== undefined && kinds.length > 0) {
+        filters.push(inArray(schema.memoryRecords.kind, [...kinds]));
       }
+      const rows = await db.select().from(schema.memoryRecords)
+        .where(and(...filters))
+        .orderBy(desc(schema.memoryRecords.updatedAt));
+      return rows as unknown as MemoryRecordRow[];
     },
 
     // 鈹€鈹€ Memory Records 鈹€鈹€
