@@ -31,9 +31,9 @@ export interface DishDraft {
 export interface ResolvedDish {
   name: string;
   mealCategory: UserDishMealCategory;
-  role: DishRole;
+  role?: DishRole;
   sideKind?: SideKind;
-  selfContained: boolean;
+  selfContained?: boolean;
   ingredients: NutritionEntry[];
   seasonings: string[];
   method?: string;
@@ -129,13 +129,17 @@ export function proposeDish(input: ProposeDishInput, deps: AddDishDeps): Resolve
 export function validateResolvedDish(dish: ResolvedDish, catalog: MealCatalog): void {
   requireText(dish.name, "name");
   requireMealCategory(dish.mealCategory);
-  const role = requireDishRole(dish.role);
+  const role = resolvedDishRole(dish);
+  const selfContained = resolvedDishSelfContained(dish, role);
   if (role === "side") requireSideKind(dish.sideKind);
   if (role === "side" && dish.mealCategory !== "main") {
     throw new RangeError("side dishes must use main mealCategory");
   }
   if (role === "main" && dish.sideKind !== undefined) {
     throw new RangeError("main dishes must not include sideKind");
+  }
+  if (role === "side" && selfContained) {
+    throw new RangeError("side dishes must not be self-contained mains");
   }
   if (dish.ingredients.length === 0) throw new RangeError("dish must include at least one ingredient");
   if (dish.unresolved.length > 0) throw new RangeError("dish has unresolved ingredients");
@@ -170,9 +174,9 @@ export function userDishRowFromResolvedDish(
     slug: dish.slug,
     name: dish.name,
     mealCategory: dish.mealCategory,
-    role: dish.role,
+    role: resolvedDishRole(dish),
     sideKind: dish.sideKind ?? null,
-    selfContained: dish.selfContained,
+    selfContained: resolvedDishSelfContained(dish, resolvedDishRole(dish)),
     ingredientsJson: dish.ingredients.map((ingredient) => ({ ...ingredient })),
     seasoningsJson: dish.seasonings.map((slug) => ({ slug })),
     method: dish.method ?? null,
@@ -252,6 +256,18 @@ function requireSideKind(value: unknown): SideKind {
     throw new RangeError("sideKind must be vegetable or soup");
   }
   return value;
+}
+
+function resolvedDishRole(dish: Pick<ResolvedDish, "role">): DishRole {
+  return dish.role === undefined ? "main" : requireDishRole(dish.role);
+}
+
+function resolvedDishSelfContained(
+  dish: Pick<ResolvedDish, "selfContained">,
+  role: DishRole,
+): boolean {
+  if (role === "side") return dish.selfContained ?? false;
+  return dish.selfContained ?? true;
 }
 
 function isAllowedSideIngredient(food: MealCatalog["foods"][number]): boolean {

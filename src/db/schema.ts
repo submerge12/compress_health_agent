@@ -277,6 +277,7 @@ export const memoryRecords = pgTable("memory_records", {
   kind: text("kind").notNull(),
   subject: text("subject").notNull(),
   content: text("content").notNull(),
+  contentNorm: text("content_norm").notNull().default(""),
   sourceText: text("source_text"),
   confidence: doublePrecision("confidence").notNull().default(1),
   status: text("status").notNull().default("active"),
@@ -289,4 +290,5 @@ export const memoryRecords = pgTable("memory_records", {
 }, (t) => [
   index("memory_records_user_status_idx").on(t.userId, t.status),
   index("memory_records_user_kind_subject_idx").on(t.userId, t.kind, t.subject),
+  index("memory_records_content_norm_trgm_idx").using("gin", t.contentNorm.op("gin_trgm_ops")),
 ]);

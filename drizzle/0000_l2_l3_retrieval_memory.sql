@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS "memory_records" (
   "kind" text NOT NULL,
   "subject" text NOT NULL,
   "content" text NOT NULL,
+  "content_norm" text DEFAULT '' NOT NULL,
   "source_text" text,
   "confidence" double precision DEFAULT 1 NOT NULL,
   "status" text DEFAULT 'active' NOT NULL,
@@ -71,8 +72,5 @@ CREATE INDEX IF NOT EXISTS "memory_records_user_status_idx"
 CREATE INDEX IF NOT EXISTS "memory_records_user_kind_subject_idx"
   ON "memory_records" ("user_id", "kind", "subject");
 
-CREATE INDEX IF NOT EXISTS "memory_records_content_trgm_idx"
-  ON "memory_records" USING gin ("content" gin_trgm_ops);
-
-CREATE INDEX IF NOT EXISTS "memory_records_subject_trgm_idx"
-  ON "memory_records" USING gin ("subject" gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS "memory_records_content_norm_trgm_idx"
+  ON "memory_records" USING gin ("content_norm" gin_trgm_ops);

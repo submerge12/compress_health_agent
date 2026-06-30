@@ -80,6 +80,31 @@ describe("pi-harness import surface", () => {
     }
   });
 
+  test("save_dish input type accepts legacy schema-shaped main payloads", () => {
+    const legacyMainPayload = {
+      name: "Onion beef",
+      mealCategory: "main",
+      ingredients: [{ slug: "beef_tenderloin", grams: 200 }],
+      seasonings: [],
+      source: "user_nl",
+      slug: "onion_beef",
+      nutrition: {
+        kcal: 214,
+        proteinGrams: 44.4,
+        carbsGrams: 4.8,
+        fatGrams: 1.8,
+        sodiumMg: 150,
+      },
+      buckets: ["red_meat"],
+      roles: ["b12", "iron", "zinc"],
+      unresolved: [],
+    } satisfies Parameters<typeof handlers.handleSaveDish>[1];
+
+    expect(legacyMainPayload).not.toHaveProperty("role");
+    expect(legacyMainPayload).not.toHaveProperty("selfContained");
+    expect(legacyMainPayload).not.toHaveProperty("sideKind");
+  });
+
   test("MealPlanEntryRow exposes fields pi-harness proactive checks read", () => {
     expect(mealPlanEntryRowGuard).toMatchObject({
       mealType: expect.any(String),

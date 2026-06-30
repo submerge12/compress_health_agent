@@ -11,6 +11,7 @@ function memory(overrides: Partial<MemoryRecordRow>): MemoryRecordRow {
     kind: "preference",
     subject: "cilantro",
     content: "User does not eat cilantro.",
+    contentNorm: "userdoesnoteatcilantro",
     sourceText: null,
     confidence: 1,
     status: "active",

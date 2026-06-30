@@ -82,6 +82,10 @@ describe("database schema", () => {
     expect(schema.userDishes).toHaveProperty("selfContained");
   });
 
+  test("test_memory_records_exposes_pg_trgm_normalized_column", () => {
+    expect(schema.memoryRecords).toHaveProperty("contentNorm");
+  });
+
   test("test_connection_module_imports_without_requiring_a_live_query", async () => {
     const connection = await import("../../src/db/connection.js");
 

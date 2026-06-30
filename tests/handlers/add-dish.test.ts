@@ -26,6 +26,22 @@ function makeContext() {
           fatGramsPer100g: 0.9,
           sodiumMgPer100g: 75,
         },
+        {
+          slug: "broccoli",
+          name: "Broccoli",
+          aliases: ["broccoli"],
+          category: "vegetable",
+          executionBuckets: ["vegetable"],
+          roles: [],
+          weeklyFloor: 0,
+          defaultGrams: null,
+          defaultUnit: null,
+          kcalPer100g: 35,
+          proteinGramsPer100g: 2.4,
+          carbsGramsPer100g: 7.2,
+          fatGramsPer100g: 0.4,
+          sodiumMgPer100g: 41,
+        },
       ],
       naturalUnits: [],
     },
@@ -86,5 +102,56 @@ describe("add-dish handlers", () => {
       proteinGrams: 44.4,
     });
     expect(result.dish).toMatchObject({ id: "dish-id", slug: "onion_beef" });
+  });
+
+  test("handleSaveDish accepts a pi-harness-shaped main payload without role fields", async () => {
+    const { ctx, saved } = makeContext();
+    const resolved = await handleProposeDish(ctx, {
+      draft: {
+        name: "Onion beef",
+        mealCategory: "main",
+        ingredients: [{ name: "beef", grams: 200 }],
+        seasonings: [],
+        source: "user_nl",
+      },
+    });
+    const { role: _role, selfContained: _selfContained, sideKind: _sideKind, ...schemaPayload } = resolved;
+
+    const result = await handleSaveDish(ctx, schemaPayload);
+
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      userId: "user-id",
+      slug: "onion_beef",
+      role: "main",
+      sideKind: null,
+      selfContained: true,
+    });
+    expect(result.dish).toMatchObject({ id: "dish-id", slug: "onion_beef" });
+  });
+
+  test("handleSaveDish persists side role metadata when present", async () => {
+    const { ctx, saved } = makeContext();
+    const resolved = await handleProposeDish(ctx, {
+      draft: {
+        name: "Broccoli side",
+        mealCategory: "main",
+        role: "side",
+        sideKind: "vegetable",
+        ingredients: [{ name: "broccoli", grams: 100 }],
+        seasonings: [],
+        source: "user_nl",
+      },
+    });
+
+    await handleSaveDish(ctx, resolved);
+
+    expect(saved).toHaveLength(1);
+    expect(saved[0]).toMatchObject({
+      slug: "broccoli_side",
+      role: "side",
+      sideKind: "vegetable",
+      selfContained: false,
+    });
   });
 });

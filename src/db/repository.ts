@@ -1,9 +1,10 @@
-import { and, eq, gte, lte, desc, inArray } from "drizzle-orm";
+import { and, eq, gte, lte, desc, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "./schema.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
+const MEMORY_TRGM_THRESHOLD = "0.08";
 
 export interface UserRow {
   id: string;
@@ -142,6 +143,7 @@ export interface MemoryRecordRow {
   kind: MemoryKind;
   subject: string;
   content: string;
+  contentNorm: string;
   sourceText: string | null;
   confidence: number;
   status: MemoryStatus;
@@ -472,6 +474,7 @@ export function createRepository(db: Db) {
     async upsertMemory(input: UpsertMemoryInput): Promise<MemoryRecordRow> {
       const subject = input.subject.trim();
       const content = input.content.trim();
+      const contentNorm = normalizeMemoryText(content);
       const now = new Date();
       const [existing] = await db.select().from(schema.memoryRecords)
         .where(and(
@@ -485,6 +488,7 @@ export function createRepository(db: Db) {
       if (existing && existing.content === content) {
         const [updated] = await db.update(schema.memoryRecords)
           .set({
+            contentNorm,
             lastConfirmedAt: now,
             timesReferenced: existing.timesReferenced + 1,
             updatedAt: now,
@@ -499,6 +503,7 @@ export function createRepository(db: Db) {
         kind: input.kind,
         subject,
         content,
+        contentNorm,
         sourceText: input.sourceText ?? null,
         confidence: input.confidence ?? 1,
         status: "active",
@@ -527,28 +532,84 @@ export function createRepository(db: Db) {
       options: RecallMemoryOptions = {},
     ): Promise<MemoryRecordRow[]> {
       const limit = Math.max(1, Math.min(options.limit ?? 5, 20));
-      const conditions = [
-        eq(schema.memoryRecords.userId, userId),
-        eq(schema.memoryRecords.status, "active"),
-      ];
-      if (options.kinds !== undefined && options.kinds.length > 0) {
-        conditions.push(inArray(schema.memoryRecords.kind, [...options.kinds]));
-      }
+      const normalizedQuery = normalizeMemoryText(query);
+      if (!normalizedQuery) return [];
+      const normalizedQueryPattern = `%${normalizedQuery}%`;
 
-      const rows = await db.select().from(schema.memoryRecords)
-        .where(and(...conditions))
-        .orderBy(desc(schema.memoryRecords.lastConfirmedAt), desc(schema.memoryRecords.updatedAt))
-        .limit(Math.max(limit * 4, limit));
-
-      const scored = (rows as unknown as MemoryRecordRow[])
-        .map((row) => ({ row, score: memoryRecallScore(row, query) }))
-        .filter((candidate) => candidate.score > 0)
-        .sort((left, right) => right.score - left.score);
+      const kindFilter = options.kinds !== undefined && options.kinds.length > 0
+        ? sql`AND "kind" IN (${sql.join(options.kinds.map((kind) => sql`${kind}`), sql`, `)})`
+        : sql``;
+      const rows = await db.transaction(async (tx) => {
+        await tx.execute(sql`
+          SELECT
+            set_config('pg_trgm.similarity_threshold', ${MEMORY_TRGM_THRESHOLD}, true)
+        `);
+        return tx.execute(sql<MemoryRecordRow>`
+          WITH ranked AS (
+            SELECT
+              "id",
+              "user_id" AS "userId",
+              "kind",
+              "subject",
+              "content",
+              "content_norm" AS "contentNorm",
+              "source_text" AS "sourceText",
+              "confidence",
+              "status",
+              "superseded_by" AS "supersededBy",
+              "valid_from" AS "validFrom",
+              "valid_to" AS "validTo",
+              "last_confirmed_at" AS "lastConfirmedAt",
+              "times_referenced" AS "timesReferenced",
+              "updated_at" AS "updatedAt",
+              GREATEST(
+                word_similarity(${normalizedQuery}, "content_norm"),
+                word_similarity("content_norm", ${normalizedQuery}),
+                similarity(${normalizedQuery}, "content_norm"),
+                CASE WHEN "content_norm" LIKE ${normalizedQueryPattern} THEN 1 ELSE 0 END
+              ) AS "lexicalScore",
+              1 / (
+                1 + GREATEST(
+                  0,
+                  EXTRACT(EPOCH FROM (now() - COALESCE("last_confirmed_at", "valid_from"))) / 86400
+                ) / 90
+              ) AS "recencyBoost"
+            FROM ${schema.memoryRecords}
+            WHERE
+              "user_id" = ${userId}
+              AND "status" = 'active'
+              ${kindFilter}
+              AND "content_norm" <> ''
+              AND (
+                "content_norm" % ${normalizedQuery}
+                OR "content_norm" LIKE ${normalizedQueryPattern}
+              )
+          )
+          SELECT
+            "id",
+            "userId",
+            "kind",
+            "subject",
+            "content",
+            "contentNorm",
+            "sourceText",
+            "confidence",
+            "status",
+            "supersededBy",
+            "validFrom",
+            "validTo",
+            "lastConfirmedAt",
+            "timesReferenced"
+          FROM ranked
+          ORDER BY "lexicalScore" * (1 + "recencyBoost" * 0.1) DESC, "updatedAt" DESC
+          LIMIT ${Math.max(limit * 4, limit)}
+        `);
+      });
 
       const bySubject = new Map<string, MemoryRecordRow>();
-      for (const candidate of scored) {
-        if (!bySubject.has(candidate.row.subject)) {
-          bySubject.set(candidate.row.subject, candidate.row);
+      for (const row of rows as unknown as MemoryRecordRow[]) {
+        if (!bySubject.has(row.subject)) {
+          bySubject.set(row.subject, row);
         }
         if (bySubject.size >= limit) break;
       }
@@ -581,44 +642,6 @@ export function createRepository(db: Db) {
 
 export type Repository = ReturnType<typeof createRepository>;
 
-function memoryRecallScore(row: MemoryRecordRow, query: string): number {
-  const lexical = Math.max(
-    textSimilarity(row.subject, query),
-    textSimilarity(row.content, query),
-  );
-  if (lexical <= 0) return 0;
-
-  const confirmedAt = row.lastConfirmedAt?.getTime() ?? row.validFrom.getTime();
-  const ageDays = Math.max(0, (Date.now() - confirmedAt) / 86_400_000);
-  const recencyBoost = 1 / (1 + ageDays / 90);
-  return lexical * (1 + recencyBoost * 0.1);
-}
-
-function textSimilarity(left: string, right: string): number {
-  const normalizedLeft = normalizeMemoryText(left);
-  const normalizedRight = normalizeMemoryText(right);
-  if (!normalizedLeft || !normalizedRight) return 0;
-  if (normalizedLeft.includes(normalizedRight) || normalizedRight.includes(normalizedLeft)) return 1;
-
-  const leftSet = ngrams(normalizedLeft);
-  const rightSet = ngrams(normalizedRight);
-  let intersection = 0;
-  for (const gram of leftSet) {
-    if (rightSet.has(gram)) intersection += 1;
-  }
-  const union = new Set([...leftSet, ...rightSet]).size;
-  return union === 0 ? 0 : intersection / union;
-}
-
 function normalizeMemoryText(value: string): string {
   return value.normalize("NFKC").toLocaleLowerCase().replace(/[\p{P}\p{S}\s_]+/gu, "");
-}
-
-function ngrams(value: string): Set<string> {
-  if (value.length <= 3) return new Set([value]);
-  const grams = new Set<string>();
-  for (let index = 0; index <= value.length - 3; index += 1) {
-    grams.add(value.slice(index, index + 3));
-  }
-  return grams;
 }

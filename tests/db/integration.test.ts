@@ -237,4 +237,65 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     const afterRetract = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 5 });
     expect(afterRetract).toEqual([]);
   });
+
+  it("recalls short Chinese queries through pg_trgm across the full memory table", async () => {
+    const oldRelevant = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "pgtrgm-cilantro",
+      content: "不吃香菜",
+      sourceText: "不吃香菜",
+      confidence: 1,
+    });
+    const oldDate = new Date("2020-01-01T00:00:00.000Z");
+    await db.update(schema.memoryRecords)
+      .set({ validFrom: oldDate, lastConfirmedAt: oldDate, updatedAt: oldDate })
+      .where(eq(schema.memoryRecords.id, oldRelevant.id));
+
+    for (let i = 0; i < 30; i += 1) {
+      await repo.upsertMemory({
+        userId,
+        kind: "dislike",
+        subject: `pgtrgm-noise-${i}`,
+        content: `最近的不相关记忆 ${i} 喜欢米饭`,
+        confidence: 1,
+      });
+    }
+
+    const recalled = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 3 });
+
+    expect(recalled[0]).toEqual(expect.objectContaining({
+      id: oldRelevant.id,
+      subject: "pgtrgm-cilantro",
+      contentNorm: "不吃香菜",
+    }));
+
+    const explain = await pool.begin(async (tx) => {
+      await tx.unsafe("SET LOCAL pg_trgm.similarity_threshold = 0.08");
+      await tx.unsafe("SET LOCAL enable_seqscan = off");
+      return tx.unsafe("EXPLAIN SELECT id FROM memory_records WHERE content_norm % '香菜'");
+    });
+
+    const plan = explain.map((row) => row["QUERY PLAN"]).join("\n");
+    expect(plan).toMatch(/Bitmap Index Scan|Index Scan/);
+    expect(plan).toContain("memory_records_content_norm_trgm_idx");
+  });
+
+  it("recalls a fuzzy non-substring Chinese query via trigram similarity", async () => {
+    await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "pgtrgm-fuzzy-cilantro",
+      content: "我不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+
+    const query = "不吃香莱";
+    expect("我不吃香菜").not.toContain(query);
+
+    const recalled = await repo.recallMemories(userId, query, { kinds: ["dislike"], limit: 3 });
+
+    expect(recalled.some((memory) => memory.subject === "pgtrgm-fuzzy-cilantro")).toBe(true);
+  });
 });
