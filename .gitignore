@@ -8,3 +8,8 @@ _tmp_*
 .ai/
 .codex-test-tmp/
 *.stackdump
+
+# Local agent tooling (Claude Code config, skills)
+.agents/
+.claude/
+skills-lock.json
