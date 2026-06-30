@@ -127,6 +127,25 @@ export async function handleSetProfile(ctx: ToolContext, input: SetProfileInput)
   return { profile, plan };
 }
 
+// ── 0b. Get Profile (read-only) ──
+
+export interface GetProfileResult {
+  profile: BmrProfileRow | null;
+}
+
+/**
+ * Read the user's saved physical profile and computed targets. Returns
+ * { profile: null } when the user has no profile yet, so the agent can tell a
+ * returning user (skip onboarding) from a new one.
+ */
+export async function handleGetProfile(
+  ctx: ToolContext,
+  _input: Record<string, unknown>,
+): Promise<GetProfileResult> {
+  const profile = await ctx.repo.getLatestBmrProfile(ctx.userId);
+  return { profile: profile ?? null };
+}
+
 // ── 1. Nutrition Estimate (read-only) ──
 
 export async function handleNutritionEstimate(

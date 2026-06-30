@@ -53,6 +53,7 @@ describe("agent profile", () => {
 
     expect(readOnly).toEqual([
       "daily_summary",
+      "get_profile",
       "nutrition_estimate",
       "propose_dish",
       "recall",
@@ -85,7 +86,7 @@ describe("agent profile", () => {
         ...profile,
         tools: [...profile.tools, firstTool],
       }),
-    ).toThrow("Duplicate tool registration: nutrition_estimate");
+    ).toThrow(`Duplicate tool registration: ${firstTool.name}`);
   });
 
   test("test_profile_scheduledTasks_useProactiveCheckCronTasks", () => {

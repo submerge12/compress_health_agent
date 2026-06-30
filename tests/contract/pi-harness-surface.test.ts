@@ -7,6 +7,7 @@ import * as handlers from "../../src/tools/handlers.js";
 
 const piHarnessHandlers = [
   "handleSetProfile",
+  "handleGetProfile",
   "handleLogMeal",
   "handleLogWater",
   "handleLogExercise",

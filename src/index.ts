@@ -24,6 +24,8 @@ function cast<T>(input: Record<string, unknown>): T {
 const toolRegistry: Record<string, ToolHandler> = {
   set_profile: (ctx, input) =>
     handlers.handleSetProfile(ctx, cast(input)),
+  get_profile: (ctx, input) =>
+    handlers.handleGetProfile(ctx, cast(input)),
   nutrition_estimate: (ctx, input) =>
     handlers.handleNutritionEstimate(ctx, cast(input)),
   log_meal: (ctx, input) =>

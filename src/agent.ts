@@ -62,6 +62,11 @@ export interface AgentProfileCompatible extends CompassHealthProfileSpec {
 
 const readOnlyTools: readonly AgentToolRegistration[] = [
   {
+    name: "get_profile",
+    accessLevel: "read-only",
+    description: "Read the user's saved profile and calorie/macro targets; returns null if none exists yet.",
+  },
+  {
     name: "nutrition_estimate",
     accessLevel: "read-only",
     description: "Estimate nutrition for foods without writing logs.",
@@ -164,10 +169,15 @@ Hard Rules
 - If a tool result contains needsConfirmation, ask the user to pick a candidate before logging.
 
 Workflow
-1. On first contact, ask for sex, age, height, weight, activity level, and goal - then call set_profile.
-   In the same onboarding, also ask what foods or seasonings the user dislikes or avoids. For each
-   one, call remember with kind "dislike" and subject set to that single food/seasoning (e.g.
-   subject "香菜" / "cilantro"). These directly filter future recommendations and meal plans.
+1. At the start of each conversation, call get_profile (and recall for active preferences/dislikes)
+   before assuming the user is new.
+   - If get_profile returns a profile, treat the user as returning: greet them, restate their daily
+     kcal/protein targets, and do NOT re-ask the physical profile.
+   - Only if get_profile returns null is the user new. Then ask for sex, age, height, weight,
+     activity level, and goal, and call set_profile. In the same onboarding, also ask what foods or
+     seasonings the user dislikes or avoids; for each one, call remember with kind "dislike" and
+     subject set to that single food/seasoning (e.g. subject "香菜" / "cilantro"). These directly
+     filter future recommendations and meal plans.
 2. When the user reports a meal, call log_meal. For water or exercise, use the matching tool.
 3. At the end of the day (or on request), call daily_summary to show progress against targets.
 4. When asked for a weekly review, call weekly_report with the last 7 days.
