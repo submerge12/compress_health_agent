@@ -80,6 +80,23 @@ describe("add-dish handlers", () => {
     });
   });
 
+  test("handleProposeDish tolerates a draft with no seasonings", async () => {
+    const { ctx, saved } = makeContext();
+
+    const result = await handleProposeDish(ctx, {
+      draft: {
+        name: "Plain beef",
+        mealCategory: "main",
+        ingredients: [{ name: "beef", grams: 180 }],
+        source: "user_nl",
+        // seasonings intentionally omitted
+      },
+    });
+
+    expect(saved).toEqual([]);
+    expect(result).toMatchObject({ slug: "plain_beef", seasonings: [] });
+  });
+
   test("handleSaveDish persists an approved resolved dish", async () => {
     const { ctx, saved } = makeContext();
     const resolved = await handleProposeDish(ctx, {

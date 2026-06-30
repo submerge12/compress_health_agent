@@ -22,7 +22,7 @@ export interface DishDraft {
   sideKind?: SideKind;
   selfContained?: boolean;
   ingredients: DishDraftIngredient[];
-  seasonings: string[];
+  seasonings?: string[];
   method?: string;
   source: DishSource;
   notes?: string;
@@ -218,10 +218,10 @@ function parseNaturalLanguage(text: string): DishDraft {
 }
 
 function resolveSeasonings(
-  values: readonly string[],
+  values: readonly string[] | undefined,
   seasonings: readonly NutritionRecord[],
 ): string[] {
-  return values
+  return (values ?? [])
     .map((value) => resolveSeasoningSlug(value, seasonings).slug ?? value)
     .filter((value, index, array) => array.indexOf(value) === index);
 }
