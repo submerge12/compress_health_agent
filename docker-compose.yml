@@ -10,6 +10,7 @@ services:
       POSTGRES_DB: compass_health
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/001-compass-health.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U compass -d compass_health"]
       interval: 5s

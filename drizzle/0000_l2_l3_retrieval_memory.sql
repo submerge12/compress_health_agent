@@ -1,6 +1,7 @@
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE SCHEMA IF NOT EXISTS "compass_health";
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 
-CREATE TABLE IF NOT EXISTS "food_aliases" (
+CREATE TABLE IF NOT EXISTS "compass_health"."food_aliases" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
   "slug" text NOT NULL,
   "alias" text NOT NULL,
@@ -10,16 +11,16 @@ CREATE TABLE IF NOT EXISTS "food_aliases" (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS "food_aliases_slug_alias_unique"
-  ON "food_aliases" ("slug", "alias");
+  ON "compass_health"."food_aliases" ("slug", "alias");
 
-ALTER TABLE "food_items"
+ALTER TABLE "compass_health"."food_items"
   ADD COLUMN IF NOT EXISTS "execution_buckets" jsonb DEFAULT '[]'::jsonb NOT NULL,
   ADD COLUMN IF NOT EXISTS "roles" jsonb DEFAULT '[]'::jsonb NOT NULL,
   ADD COLUMN IF NOT EXISTS "weekly_floor" integer DEFAULT 0 NOT NULL;
 
-CREATE TABLE IF NOT EXISTS "user_dishes" (
+CREATE TABLE IF NOT EXISTS "compass_health"."user_dishes" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-  "user_id" uuid NOT NULL REFERENCES "users"("id") ON DELETE cascade,
+  "user_id" uuid NOT NULL REFERENCES "compass_health"."users"("id") ON DELETE cascade,
   "slug" text NOT NULL,
   "name" text NOT NULL,
   "meal_category" text NOT NULL,
@@ -40,16 +41,16 @@ CREATE TABLE IF NOT EXISTS "user_dishes" (
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS "user_dishes_user_slug_unique"
-  ON "user_dishes" ("user_id", "slug");
+  ON "compass_health"."user_dishes" ("user_id", "slug");
 
-ALTER TABLE "user_dishes"
+ALTER TABLE "compass_health"."user_dishes"
   ADD COLUMN IF NOT EXISTS "role" text DEFAULT 'main' NOT NULL,
   ADD COLUMN IF NOT EXISTS "side_kind" text,
   ADD COLUMN IF NOT EXISTS "self_contained" boolean DEFAULT true NOT NULL;
 
-CREATE TABLE IF NOT EXISTS "memory_records" (
+CREATE TABLE IF NOT EXISTS "compass_health"."memory_records" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
-  "user_id" uuid NOT NULL REFERENCES "users"("id") ON DELETE cascade,
+  "user_id" uuid NOT NULL REFERENCES "compass_health"."users"("id") ON DELETE cascade,
   "kind" text NOT NULL,
   "subject" text NOT NULL,
   "content" text NOT NULL,
@@ -67,10 +68,10 @@ CREATE TABLE IF NOT EXISTS "memory_records" (
 );
 
 CREATE INDEX IF NOT EXISTS "memory_records_user_status_idx"
-  ON "memory_records" ("user_id", "status");
+  ON "compass_health"."memory_records" ("user_id", "status");
 
 CREATE INDEX IF NOT EXISTS "memory_records_user_kind_subject_idx"
-  ON "memory_records" ("user_id", "kind", "subject");
+  ON "compass_health"."memory_records" ("user_id", "kind", "subject");
 
 CREATE INDEX IF NOT EXISTS "memory_records_content_norm_trgm_idx"
-  ON "memory_records" USING gin ("content_norm" gin_trgm_ops);
+  ON "compass_health"."memory_records" USING gin ("content_norm" gin_trgm_ops);

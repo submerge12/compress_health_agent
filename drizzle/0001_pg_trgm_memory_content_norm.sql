@@ -1,13 +1,14 @@
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE SCHEMA IF NOT EXISTS "compass_health";
+CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
 
-ALTER TABLE "memory_records"
+ALTER TABLE "compass_health"."memory_records"
   ADD COLUMN IF NOT EXISTS "content_norm" text DEFAULT '' NOT NULL;
 
 -- Best-effort SQL backfill for existing rows. Runtime writes use the app's
 -- NFKC-aware normalizeMemoryText implementation before inserting content_norm.
-UPDATE "memory_records"
+UPDATE "compass_health"."memory_records"
 SET "content_norm" = lower(regexp_replace("content", '[[:punct:][:space:]_]+', '', 'g'))
 WHERE "content_norm" = '';
 
 CREATE INDEX IF NOT EXISTS "memory_records_content_norm_trgm_idx"
-  ON "memory_records" USING gin ("content_norm" gin_trgm_ops);
+  ON "compass_health"."memory_records" USING gin ("content_norm" gin_trgm_ops);

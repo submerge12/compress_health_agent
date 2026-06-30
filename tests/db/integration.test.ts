@@ -47,6 +47,22 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     expect(user!.locale).toBe("zh");
   });
 
+  it("creates agent-owned tables in the compass_health schema", async () => {
+    const rows = await pool.unsafe<{ table_schema: string; table_name: string }[]>(`
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE table_schema IN ('compass_health', 'public')
+        AND table_name IN ('users', 'memory_records', 'food_items')
+      ORDER BY table_schema, table_name
+    `);
+
+    expect(rows).toEqual(expect.arrayContaining([
+      { table_schema: "compass_health", table_name: "food_items" },
+      { table_schema: "compass_health", table_name: "memory_records" },
+      { table_schema: "compass_health", table_name: "users" },
+    ]));
+  });
+
   it("findOrCreateUser returns same user on repeat", async () => {
     const again = await repo.findOrCreateUser("test-integration-user");
     expect(again.id).toBe(userId);
@@ -273,7 +289,7 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     const explain = await pool.begin(async (tx) => {
       await tx.unsafe("SET LOCAL pg_trgm.similarity_threshold = 0.08");
       await tx.unsafe("SET LOCAL enable_seqscan = off");
-      return tx.unsafe("EXPLAIN SELECT id FROM memory_records WHERE content_norm % '香菜'");
+      return tx.unsafe("EXPLAIN SELECT id FROM compass_health.memory_records WHERE content_norm % '香菜'");
     });
 
     const plan = explain.map((row) => row["QUERY PLAN"]).join("\n");

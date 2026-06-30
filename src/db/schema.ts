@@ -6,7 +6,7 @@ import {
   index,
   integer,
   jsonb,
-  pgTable,
+  pgSchema,
   text,
   timestamp,
   unique,
@@ -41,7 +41,9 @@ const nutritionColumns = () => ({
 
 const emptyArrayJson = sql`'[]'::jsonb`;
 
-export const users = pgTable("users", {
+export const compass = pgSchema("compass_health");
+
+export const users = compass.table("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   externalId: text("external_id").notNull().unique(),
   email: text("email").unique(),
@@ -56,7 +58,7 @@ const userId = () =>
     .notNull()
     .references(() => users.id, { onDelete: "cascade" });
 
-export const bmrProfiles = pgTable("bmr_profiles", {
+export const bmrProfiles = compass.table("bmr_profiles", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   sex: text("sex").notNull(),
@@ -75,7 +77,7 @@ export const bmrProfiles = pgTable("bmr_profiles", {
   ...timestamps()
 });
 
-export const dailyActivityPlans = pgTable("daily_activity_plans", {
+export const dailyActivityPlans = compass.table("daily_activity_plans", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   planDate: date("plan_date").notNull(),
@@ -89,7 +91,7 @@ export const dailyActivityPlans = pgTable("daily_activity_plans", {
   ...timestamps()
 });
 
-export const dietLogs = pgTable("diet_logs", {
+export const dietLogs = compass.table("diet_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -103,7 +105,7 @@ export const dietLogs = pgTable("diet_logs", {
   ...timestamps()
 });
 
-export const waterLogs = pgTable("water_logs", {
+export const waterLogs = compass.table("water_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -113,7 +115,7 @@ export const waterLogs = pgTable("water_logs", {
   ...timestamps()
 });
 
-export const exerciseLogs = pgTable("exercise_logs", {
+export const exerciseLogs = compass.table("exercise_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -126,7 +128,7 @@ export const exerciseLogs = pgTable("exercise_logs", {
   ...timestamps()
 });
 
-export const physicalConditions = pgTable("physical_conditions", {
+export const physicalConditions = compass.table("physical_conditions", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   measuredAt: timestamp("measured_at", { withTimezone: true }).notNull().defaultNow(),
@@ -139,7 +141,7 @@ export const physicalConditions = pgTable("physical_conditions", {
   ...timestamps()
 });
 
-export const mealPlanEntries = pgTable("meal_plan_entries", {
+export const mealPlanEntries = compass.table("meal_plan_entries", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   planDate: date("plan_date").notNull(),
@@ -153,7 +155,7 @@ export const mealPlanEntries = pgTable("meal_plan_entries", {
   ...timestamps()
 });
 
-export const foodItems = pgTable("food_items", {
+export const foodItems = compass.table("food_items", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
@@ -167,7 +169,7 @@ export const foodItems = pgTable("food_items", {
   ...timestamps()
 });
 
-export const foodAliases = pgTable("food_aliases", {
+export const foodAliases = compass.table("food_aliases", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull(),
   alias: text("alias").notNull(),
@@ -177,7 +179,7 @@ export const foodAliases = pgTable("food_aliases", {
   unique().on(t.slug, t.alias),
 ]);
 
-export const seasonings = pgTable("seasonings", {
+export const seasonings = compass.table("seasonings", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
@@ -192,7 +194,7 @@ export const seasonings = pgTable("seasonings", {
   ...timestamps()
 });
 
-export const naturalUnits = pgTable("natural_units", {
+export const naturalUnits = compass.table("natural_units", {
   id: uuid("id").primaryKey().defaultRandom(),
   foodItemId: uuid("food_item_id").references(() => foodItems.id, { onDelete: "cascade" }),
   foodSlug: text("food_slug").notNull(),
@@ -205,7 +207,7 @@ export const naturalUnits = pgTable("natural_units", {
   unique().on(t.foodSlug, t.unitName),
 ]);
 
-export const cookingRecords = pgTable("cooking_records", {
+export const cookingRecords = compass.table("cooking_records", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   dishName: text("dish_name").notNull(),
@@ -220,7 +222,7 @@ export const cookingRecords = pgTable("cooking_records", {
   ...timestamps()
 });
 
-export const userDishes = pgTable("user_dishes", {
+export const userDishes = compass.table("user_dishes", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   slug: text("slug").notNull(),
@@ -243,7 +245,7 @@ export const userDishes = pgTable("user_dishes", {
   unique().on(t.userId, t.slug),
 ]);
 
-export const mealCompositions = pgTable("meal_compositions", {
+export const mealCompositions = compass.table("meal_compositions", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   mealPlanEntryId: uuid("meal_plan_entry_id").references(() => mealPlanEntries.id, { onDelete: "cascade" }),
@@ -258,7 +260,7 @@ export const mealCompositions = pgTable("meal_compositions", {
   ...timestamps()
 });
 
-export const userSeasoningPreferences = pgTable("user_seasoning_preferences", {
+export const userSeasoningPreferences = compass.table("user_seasoning_preferences", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   seasoningId: uuid("seasoning_id")
@@ -271,7 +273,7 @@ export const userSeasoningPreferences = pgTable("user_seasoning_preferences", {
   ...timestamps()
 });
 
-export const memoryRecords = pgTable("memory_records", {
+export const memoryRecords = compass.table("memory_records", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   kind: text("kind").notNull(),

@@ -1,4 +1,4 @@
-import { getTableName } from "drizzle-orm";
+import { getTableName, getTableUniqueName } from "drizzle-orm";
 import { describe, expect, test } from "vitest";
 
 import * as schema from "../../src/db/schema.js";
@@ -53,7 +53,12 @@ describe("database schema", () => {
     for (const [exportName, tableName] of requiredTables) {
       expect(schema[exportName]).toBeDefined();
       expect(getTableName(schema[exportName])).toBe(tableName);
+      expect(getTableUniqueName(schema[exportName])).toBe(`compass_health.${tableName}`);
     }
+  });
+
+  test("test_schema_exports_compass_health_schema_namespace", () => {
+    expect(schema.compass).toBeDefined();
   });
 
   test("test_schema_exposes_nutrition_columns_for_downstream_engines", () => {
