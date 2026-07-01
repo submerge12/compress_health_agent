@@ -13,3 +13,6 @@ _tmp_*
 .agents/
 .claude/
 skills-lock.json
+
+# pi-harness local session data (created when running the CLI)
+.pi-harness/
