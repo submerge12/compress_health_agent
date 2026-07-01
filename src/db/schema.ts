@@ -164,6 +164,12 @@ export const foodItems = compass.table("food_items", {
   executionBuckets: jsonb("execution_buckets").$type<string[]>().notNull().default(emptyArrayJson),
   roles: jsonb("roles").$type<string[]>().notNull().default(emptyArrayJson),
   weeklyFloor: integer("weekly_floor").notNull().default(0),
+  allergenTags: jsonb("allergen_tags").$type<string[]>().notNull().default(emptyArrayJson),
+  weightType: text("weight_type").notNull().default("raw"),
+  frequencyHint: text("frequency_hint"),
+  cookingDifficulty: text("cooking_difficulty"),
+  availability: text("availability"),
+  specialHandlingTags: jsonb("special_handling_tags").$type<string[]>().notNull().default(emptyArrayJson),
   source: text("source").notNull().default("csv"),
   ...nutritionColumns(),
   ...timestamps()

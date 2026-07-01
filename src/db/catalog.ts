@@ -2,7 +2,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "./schema.js";
 import type { FoodCatalogRecord, MealCatalog } from "../tools/nutrition-estimate.js";
-import type { NaturalUnitRecord } from "../engine/types.js";
+import type { NaturalUnitRecord, NutritionWeightType } from "../engine/types.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -27,6 +27,12 @@ export async function loadMealCatalog(db: Db): Promise<MealCatalog> {
     executionBuckets: row.executionBuckets,
     roles: row.roles,
     weeklyFloor: row.weeklyFloor,
+    allergenTags: row.allergenTags,
+    weightType: requireWeightType(row.weightType),
+    frequencyHint: row.frequencyHint,
+    cookingDifficulty: row.cookingDifficulty,
+    availability: row.availability,
+    specialHandlingTags: row.specialHandlingTags,
     aliases: uniqueLabels([
       row.name,
       row.nameZh,
@@ -54,6 +60,13 @@ export async function loadMealCatalog(db: Db): Promise<MealCatalog> {
 
 function uniqueLabels(values: readonly (string | null | undefined)[]): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value?.trim())))];
+}
+
+function requireWeightType(value: string): NutritionWeightType {
+  if (value === "raw" || value === "cooked" || value === "dry") {
+    return value;
+  }
+  throw new RangeError(`food_items.weight_type must be raw, cooked, or dry: ${value}`);
 }
 
 export async function loadSeasoningRecords(db: Db) {

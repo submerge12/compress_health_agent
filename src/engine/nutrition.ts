@@ -7,11 +7,12 @@ import type {
 } from "./types.js";
 
 export function aggregateNutrition(input: NutritionAggregateInput): NutritionAggregate {
-  const foodTotals = aggregateEntries(input.foods, input.foodRecords, "food");
+  const foodTotals = aggregateEntries(input.foods, input.foodRecords, "food", input.requireWeightType ?? false);
   const seasoningTotals = aggregateEntries(
     input.seasonings ?? [],
     input.seasoningRecords ?? [],
     "seasoning",
+    false,
   );
   const roundedSeasonings = roundTotals(seasoningTotals);
   return {
@@ -26,11 +27,12 @@ function aggregateEntries(
   entries: readonly NutritionEntry[],
   records: readonly NutritionRecord[],
   label: string,
+  requireWeightType: boolean,
 ): NutrientTotals {
   const totals = emptyTotals();
   for (const entry of entries) {
     validateEntry(entry);
-    addScaledNutrition(totals, findRecord(entry.slug, records, label), entry.grams);
+    addScaledNutrition(totals, findRecord(entry.slug, records, label, requireWeightType), entry.grams);
   }
   return totals;
 }
@@ -98,12 +100,13 @@ function findRecord(
   slug: string,
   records: readonly NutritionRecord[],
   label: string,
+  requireWeightType: boolean,
 ): NutritionRecord {
   const record = records.find((item) => item.slug === slug);
   if (record === undefined) {
     throw new RangeError(`Unknown ${label} nutrition record: ${slug}`);
   }
-  validateRecord(record, label);
+  validateRecord(record, label, requireWeightType);
   return record;
 }
 
@@ -114,12 +117,19 @@ function validateEntry(entry: NutritionEntry): void {
   assertNonNegativeFinite(entry.grams, "grams");
 }
 
-function validateRecord(record: NutritionRecord, label: string): void {
+function validateRecord(record: NutritionRecord, label: string, requireWeightType: boolean): void {
+  if (requireWeightType && !isWeightType(record.weightType)) {
+    throw new RangeError(`${label} ${record.slug} weightType must be raw, cooked, or dry`);
+  }
   assertNonNegativeFinite(record.kcalPer100g, `${label} kcalPer100g`);
   assertNonNegativeFinite(record.proteinGramsPer100g, `${label} proteinGramsPer100g`);
   assertNonNegativeFinite(record.carbsGramsPer100g, `${label} carbsGramsPer100g`);
   assertNonNegativeFinite(record.fatGramsPer100g, `${label} fatGramsPer100g`);
   assertNonNegativeFinite(record.sodiumMgPer100g, `${label} sodiumMgPer100g`);
+}
+
+function isWeightType(value: unknown): value is NutritionRecord["weightType"] {
+  return value === "raw" || value === "cooked" || value === "dry";
 }
 
 function assertNonNegativeFinite(value: number, name: string): void {

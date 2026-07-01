@@ -108,6 +108,87 @@ describe("recommendRecipes", () => {
     ).toBe(true);
   });
 
+  it("test_recommend_recipes_exact_dislike_does_not_expand_to_allergen_group", () => {
+    const recommendations = recommendRecipes(
+      makeRequest({
+        candidates: [
+          {
+            slug: "tofu_bowl",
+            name: "Tofu bowl",
+            mealTypes: ["lunch"],
+            nutrition: { kcal: 500, proteinGrams: 32, carbsGrams: 40, fatGrams: 16, sodiumMg: 520 },
+            ingredients: [{ slug: "tofu", grams: 220 }],
+            seasonings: ["ginger"],
+            source: "preset",
+          },
+          {
+            slug: "soy_sauce_chicken",
+            name: "Soy sauce chicken",
+            mealTypes: ["lunch"],
+            nutrition: { kcal: 500, proteinGrams: 32, carbsGrams: 40, fatGrams: 16, sodiumMg: 520 },
+            ingredients: [{ slug: "chicken_breast", grams: 150 }],
+            seasonings: ["light_soy_sauce"],
+            source: "preset",
+          },
+        ],
+        recentDishSlugs: [],
+        preferences: { rejectedIngredients: ["tofu"] },
+      }),
+    );
+
+    expect(recommendations.map((item) => item.slug)).toEqual(["soy_sauce_chicken"]);
+  });
+
+  it("test_recommend_recipes_allergen_group_filters_ingredient_and_hidden_seasoning_sources", () => {
+    const recommendations = recommendRecipes(
+      makeRequest({
+        candidates: [
+          {
+            slug: "shrimp_salad",
+            name: "Shrimp salad",
+            mealTypes: ["lunch"],
+            nutrition: { kcal: 500, proteinGrams: 32, carbsGrams: 40, fatGrams: 16, sodiumMg: 520 },
+            ingredients: [{ slug: "shrimp_jiweixia", grams: 120 }],
+            seasonings: ["aged_vinegar"],
+            source: "preset",
+          },
+          {
+            slug: "oyster_beef",
+            name: "Oyster sauce beef",
+            mealTypes: ["lunch"],
+            nutrition: { kcal: 500, proteinGrams: 32, carbsGrams: 40, fatGrams: 16, sodiumMg: 520 },
+            ingredients: [{ slug: "beef_tenderloin", grams: 150 }],
+            seasonings: ["oyster_sauce"],
+            source: "preset",
+          },
+          {
+            slug: "ginger_chicken",
+            name: "Ginger chicken",
+            mealTypes: ["lunch"],
+            nutrition: { kcal: 500, proteinGrams: 32, carbsGrams: 40, fatGrams: 16, sodiumMg: 520 },
+            ingredients: [{ slug: "chicken_breast", grams: 150 }],
+            seasonings: ["ginger"],
+            source: "preset",
+          },
+        ],
+        recentDishSlugs: [],
+        preferences: { allergens: ["seafood"] },
+      }),
+    );
+
+    expect(recommendations.map((item) => item.slug)).toEqual(["ginger_chicken"]);
+  });
+
+  it("test_recommend_recipes_preferred_seasoning_boosts_flavor_match", () => {
+    const recommendations = recommendRecipes(
+      makeRequest({
+        preferences: { preferredSeasonings: ["light_soy_sauce"] },
+      }),
+    );
+
+    expect(recommendations[0]?.slug).toBe("tofu_mushroom_bowl");
+  });
+
   it("test_recommend_recipes_invalid_target_throws_range_error", () => {
     expect(() => recommendRecipes(makeRequest({ target: { kcal: 0, proteinGrams: 30 } }))).toThrow(
       RangeError,

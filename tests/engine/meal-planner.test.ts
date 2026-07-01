@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   generateWeeklyMealPlan,
+  MealPlanInfeasibleError,
   validateWeeklyMealPlan,
   type MealType,
 } from "../../src/engine/meal-planner.js";
@@ -115,7 +116,7 @@ describe("generateWeeklyMealPlan", () => {
     expect(plan.days.map((day) => day.totals.kcal)).toEqual([1800, 1800, 1800, 1800, 1800, 1800, 1800]);
   });
 
-  it("test_generate_weekly_meal_plan_no_usable_candidates_throws_range_error", () => {
+  it("test_generate_weekly_meal_plan_no_usable_candidates_blocks_with_explanation", () => {
     expect(() =>
       generateWeeklyMealPlan({
         startDate: "2026-06-16",
@@ -123,7 +124,23 @@ describe("generateWeeklyMealPlan", () => {
         presetDishes: [dish("soy_only_bowl", "lunch", 600, 30, "tofu")],
         preferences: { rejectedSeasonings: ["light_soy_sauce"] },
       }),
-    ).toThrow(RangeError);
+    ).toThrow(MealPlanInfeasibleError);
+
+    try {
+      generateWeeklyMealPlan({
+        startDate: "2026-06-16",
+        dailyKcalTarget: 1800,
+        presetDishes: [dish("soy_only_bowl", "lunch", 600, 30, "tofu")],
+        preferences: { rejectedSeasonings: ["light_soy_sauce"] },
+      });
+    } catch (error) {
+      expect(error).toBeInstanceOf(MealPlanInfeasibleError);
+      expect((error as MealPlanInfeasibleError).result.violations).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "safety_filter", target: 1 }),
+        ]),
+      );
+    }
   });
 });
 

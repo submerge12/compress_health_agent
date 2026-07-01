@@ -1,3 +1,9 @@
+import {
+  allergenTagsForFood,
+  allergenTagsForSeasoning,
+  expandedAllergenTags,
+} from "./food-taxonomy.js";
+
 export type MealType = "breakfast" | "lunch" | "dinner";
 
 export type RecipeSource = "preset" | "cooking_record" | "user";
@@ -36,6 +42,11 @@ export interface RecipeDish {
   buckets?: readonly string[];
   roles?: readonly string[];
   weeklyFloors?: Readonly<Record<string, number>>;
+  allergenTags?: readonly string[];
+  specialHandlingTags?: readonly string[];
+  frequencyHints?: Readonly<Record<string, string>>;
+  cookingDifficulties?: readonly string[];
+  availabilityTags?: readonly string[];
 }
 
 export interface RecipePreferences {
@@ -43,6 +54,7 @@ export interface RecipePreferences {
   rejectedIngredients?: readonly string[];
   allergens?: readonly string[];
   preferredIngredients?: readonly string[];
+  preferredSeasonings?: readonly string[];
   preferredMethods?: readonly string[];
 }
 
@@ -83,7 +95,11 @@ export function recommendRecipes(request: RecipeRecommendationRequest): RankedRe
     .filter((dish) => dish.role !== "side")
     .filter((dish) => matchesMealType(dish, request.mealType))
     .filter((dish) => !hasRejectedSeasoning(dish, context.preferences.rejectedSeasonings ?? []))
-    .filter((dish) => !hasRejectedIngredient(dish, context.preferences.rejectedIngredients ?? []))
+    .filter((dish) => !hasRejectedIngredient(
+      dish,
+      context.preferences.rejectedIngredients ?? [],
+      context.preferences.allergens ?? [],
+    ))
     .map((dish) => rankDish(dish, request.target.kcal, context))
     .sort(compareRankedOptions)
     .slice(0, request.limit ?? request.candidates.length);
@@ -100,9 +116,16 @@ export function hasRejectedSeasoning(
 export function hasRejectedIngredient(
   dish: RecipeDish,
   rejectedIngredients: readonly string[],
+  allergens: readonly string[] = [],
 ): boolean {
-  const rejected = new Set(rejectedIngredients.map(normalizeToken));
-  return dish.ingredients.some((ingredient) => rejected.has(normalizeToken(ingredient.slug)));
+  const rejectedExact = new Set(rejectedIngredients.map(normalizeToken));
+  const rejectedAllergenTags = expandedAllergenTags(allergens);
+  return dish.ingredients.some((ingredient) =>
+    rejectedExact.has(normalizeToken(ingredient.slug))
+  ) ||
+    dish.ingredients.some((ingredient) => hasAnyTag(allergenTagsForFood(ingredient.slug, undefined), rejectedAllergenTags)) ||
+    hasAnyTag(dish.allergenTags ?? [], rejectedAllergenTags) ||
+    dish.seasonings.some((seasoning) => hasAnyTag(allergenTagsForSeasoning(seasoning), rejectedAllergenTags));
 }
 
 function validateRecommendationRequest(request: RecipeRecommendationRequest): void {
@@ -187,8 +210,9 @@ function scorePreferenceBonus(dish: RecipeDish, preferences: RecipePreferences):
     dish.ingredients.map((ingredient) => ingredient.slug),
     preferences.preferredIngredients ?? [],
   );
+  const seasoningBonus = countMatches(dish.seasonings, preferences.preferredSeasonings ?? []);
   const methodBonus = dish.method === undefined ? 0 : countMatches([dish.method], preferences.preferredMethods ?? []);
-  return ingredientBonus * 2 + methodBonus * 2;
+  return ingredientBonus * 2 + seasoningBonus * 2 + methodBonus * 2;
 }
 
 function explainScore(recencyPenalty: number, varietyBonus: number): readonly string[] {
@@ -210,6 +234,10 @@ function compareRankedOptions(left: RankedRecipeOption, right: RankedRecipeOptio
 function countMatches(values: readonly string[], preferredValues: readonly string[]): number {
   const preferred = new Set(preferredValues.map(normalizeToken));
   return values.filter((value) => preferred.has(normalizeToken(value))).length;
+}
+
+function hasAnyTag(values: readonly string[], rejectedTags: ReadonlySet<string>): boolean {
+  return values.some((value) => rejectedTags.has(normalizeToken(value)));
 }
 
 function daysBetween(startDate: string, endDate: string): number {

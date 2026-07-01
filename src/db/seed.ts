@@ -1,9 +1,17 @@
 import { readFile } from "node:fs/promises";
 
+import { sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as dbSchema from "./schema.js";
 import { foodItems, naturalUnits, seasonings } from "./schema.js";
+import {
+  allergenTagsForFood,
+  frequencyHintForFood,
+  inferWeightType,
+  specialHandlingTagsForFood,
+  type FoodWeightType,
+} from "../engine/food-taxonomy.js";
 
 export type CsvRow = Record<string, string>;
 
@@ -36,6 +44,12 @@ export interface FoodItemSeed extends NutritionSeed {
   executionBuckets: string[];
   roles: string[];
   weeklyFloor: number;
+  allergenTags: string[];
+  weightType: FoodWeightType;
+  frequencyHint?: string;
+  cookingDifficulty?: string;
+  availability?: string;
+  specialHandlingTags: string[];
   source: string;
 }
 
@@ -204,6 +218,16 @@ function listValue(row: CsvRow, aliases: string[]): string[] | undefined {
     .filter(Boolean);
 }
 
+function weightTypeValue(row: CsvRow, aliases: string[], fallback: FoodWeightType): FoodWeightType {
+  const value = optionalText(row, aliases);
+  if (value === undefined) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized !== "raw" && normalized !== "cooked" && normalized !== "dry") {
+    throw new Error(`CSV value for ${aliases[0] ?? "weight_type"} must be raw, cooked, or dry`);
+  }
+  return normalized;
+}
+
 function nutritionFromRow(row: CsvRow): NutritionSeed {
   return {
     caloriesKcal: numberValue(row, ["energy_kcal", "calories_kcal", "kcal"], 0),
@@ -240,6 +264,13 @@ function toFoodItemSeed(row: CsvRow): FoodItemSeed {
     executionBuckets: listValue(row, ["execution_buckets", "buckets"]) ?? defaults.executionBuckets,
     roles: listValue(row, ["roles", "execution_roles"]) ?? defaults.roles,
     weeklyFloor: numberValue(row, ["weekly_floor"], defaults.weeklyFloor),
+    allergenTags: listValue(row, ["allergen_tags", "allergens"]) ?? allergenTagsForFood(slug, category),
+    weightType: weightTypeValue(row, ["weight_type", "weightType"], inferWeightType(slug, category)),
+    frequencyHint: optionalText(row, ["frequency_hint", "frequency"]) ?? frequencyHintForFood(slug),
+    cookingDifficulty: optionalText(row, ["cooking_difficulty", "difficulty"]),
+    availability: optionalText(row, ["availability"]),
+    specialHandlingTags: listValue(row, ["special_handling_tags", "special_tags"]) ??
+      specialHandlingTagsForFood(slug, category),
     source: optionalText(row, ["source", "basis"]) ?? "csv",
     ...nutritionFromRow(row)
   };
@@ -249,6 +280,15 @@ function defaultFoodClassification(
   slug: string,
   category: string | undefined,
 ): Pick<FoodItemSeed, "executionBuckets" | "roles" | "weeklyFloor"> {
+  if (slug === "dried_shrimp") {
+    return { executionBuckets: ["seasoning"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "konjac") {
+    return { executionBuckets: ["filler"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "chicken_liver") {
+    return { executionBuckets: ["organ_meat"], roles: ["iron", "b12", "vitamin_a"], weeklyFloor: 0 };
+  }
   if (["beef_tenderloin", "pork_lean"].includes(slug)) {
     return { executionBuckets: ["red_meat"], roles: ["iron", "zinc", "b12"], weeklyFloor: 2 };
   }
@@ -261,8 +301,11 @@ function defaultFoodClassification(
   if (["shrimp_jiweixia"].includes(slug)) {
     return { executionBuckets: ["shellfish"], roles: ["zinc", "b12"], weeklyFloor: 1 };
   }
-  if (slug === "tofu" || category === "legume") {
+  if (slug === "tofu" || slug === "soy_milk") {
     return { executionBuckets: ["soy_product"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "legume") {
+    return { executionBuckets: ["legume"], roles: [], weeklyFloor: 0 };
   }
   if (slug === "egg" || category === "egg") {
     return { executionBuckets: ["egg"], roles: ["b12"], weeklyFloor: 0 };
@@ -273,7 +316,7 @@ function defaultFoodClassification(
   if (category === "vegetable" || category === "mushroom" || category === "seaweed") {
     return { executionBuckets: ["vegetable"], roles: [], weeklyFloor: 0 };
   }
-  if (category === "grain" || category === "bread" || category === "tuber") {
+  if (category === "grain" || category === "bread" || category === "tuber" || category === "starch") {
     return { executionBuckets: ["staple"], roles: [], weeklyFloor: 0 };
   }
   return { executionBuckets: [], roles: [], weeklyFloor: 0 };
@@ -375,7 +418,43 @@ async function insertFoodItems(database: SeedDatabase, rows: FoodItemSeed[]): Pr
     return;
   }
 
-  await database.insert(foodItems).values(rows).onConflictDoNothing();
+  await database.insert(foodItems).values(rows).onConflictDoUpdate({
+    target: foodItems.slug,
+    set: {
+      name: sql.raw("excluded.name"),
+      nameZh: sql.raw("excluded.name_zh"),
+      category: sql.raw("excluded.category"),
+      executionBuckets: sql.raw("excluded.execution_buckets"),
+      roles: sql.raw("excluded.roles"),
+      weeklyFloor: sql.raw("excluded.weekly_floor"),
+      allergenTags: sql.raw("excluded.allergen_tags"),
+      weightType: sql.raw("excluded.weight_type"),
+      frequencyHint: sql.raw("excluded.frequency_hint"),
+      cookingDifficulty: sql.raw("excluded.cooking_difficulty"),
+      availability: sql.raw("excluded.availability"),
+      specialHandlingTags: sql.raw("excluded.special_handling_tags"),
+      source: sql.raw("excluded.source"),
+      caloriesKcal: sql.raw("excluded.calories_kcal"),
+      proteinGrams: sql.raw("excluded.protein_grams"),
+      carbsGrams: sql.raw("excluded.carbs_grams"),
+      fatGrams: sql.raw("excluded.fat_grams"),
+      fiberGrams: sql.raw("excluded.fiber_grams"),
+      sugarGrams: sql.raw("excluded.sugar_grams"),
+      sodiumMg: sql.raw("excluded.sodium_mg"),
+      potassiumMg: sql.raw("excluded.potassium_mg"),
+      calciumMg: sql.raw("excluded.calcium_mg"),
+      ironMg: sql.raw("excluded.iron_mg"),
+      magnesiumMg: sql.raw("excluded.magnesium_mg"),
+      zincMg: sql.raw("excluded.zinc_mg"),
+      vitaminAMcg: sql.raw("excluded.vitamin_a_mcg"),
+      vitaminCMg: sql.raw("excluded.vitamin_c_mg"),
+      vitaminDMcg: sql.raw("excluded.vitamin_d_mcg"),
+      vitaminB12Mcg: sql.raw("excluded.vitamin_b12_mcg"),
+      folateMcg: sql.raw("excluded.folate_mcg"),
+      cholesterolMg: sql.raw("excluded.cholesterol_mg"),
+      updatedAt: sql`now()`,
+    },
+  });
 }
 
 async function insertSeasonings(database: SeedDatabase, rows: SeasoningSeed[]): Promise<void> {

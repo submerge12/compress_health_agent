@@ -144,6 +144,28 @@ edits above.
 
 ---
 
+## Phase 3 food-safety/data-model follow-up
+
+The compass-health-agent repo now includes an in-repo Phase 3 migration:
+`drizzle/0002_food_safety_basis.sql`.
+
+This does **not** require a `tools.ts` edit as long as the design stays on the low-burden path:
+allergy groups continue to use free-text `remember(kind: "dislike")`, weight basis is inferred from
+catalog data and surfaced as warnings, and dish metadata is derived from ingredients instead of being
+set through new tool parameters.
+
+The remaining pi-harness-side work is operational only:
+
+1. Apply the compass-health schema migration in the pi-harness environment.
+2. Re-seed/reference-refresh so existing `food_items` rows receive `allergen_tags`, `weight_type`,
+   `frequency_hint`, and `special_handling_tags`.
+3. Rebuild the compass-health-agent package consumed by pi-harness.
+
+Do not add a new `remember` kind, `weight_basis` tool parameter, or extra settable dish fields unless
+the tool surface is intentionally expanded in a separate pi-harness change.
+
+---
+
 ## Execution checklist (the pi-harness session)
 
 1. `cd compass-health-agent && pnpm build` — publish current `dist`.

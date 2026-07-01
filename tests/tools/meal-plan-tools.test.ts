@@ -120,6 +120,10 @@ describe("meal plan tools", () => {
       },
     });
 
+    expect(result.status).toBe("planned");
+    if (result.status !== "planned") {
+      throw new Error("Expected meal plan generation to succeed.");
+    }
     expect(result.plan.entries).toHaveLength(21);
     expect(result.storedCount).toBe(21);
     expect(storedEntries).toHaveLength(21);
@@ -128,12 +132,77 @@ describe("meal plan tools", () => {
     expect(result.overview).toContain("kcal");
   });
 
+  it("test_generate_meal_plan_returns_blocked_result_without_storing_infeasible_plan", () => {
+    const storedEntries: unknown[] = [];
+    const result = generateMealPlan({
+      startDate: "2026-06-16",
+      dailyKcalTarget: 1800,
+      dailyProteinTarget: 180,
+      presetDishes: [
+        makeDish("low_protein_breakfast", "breakfast", 450, "oats"),
+        makeDish("low_protein_lunch", "lunch", 675, "rice"),
+        makeDish("low_protein_dinner", "dinner", 675, "noodles"),
+      ].map((dish) => ({
+        ...dish,
+        nutrition: { ...dish.nutrition, proteinGrams: 10 },
+      })),
+      store: {
+        insertMealPlanEntries(entries: readonly MealPlanEntry[]) {
+          storedEntries.push(...entries);
+          return entries;
+        },
+      },
+    });
+
+    expect(result.status).toBe("blocked");
+    if (result.status !== "blocked") {
+      throw new Error("Expected meal plan generation to be blocked.");
+    }
+    expect(result.plan.entries).toEqual([]);
+    expect(storedEntries).toEqual([]);
+    expect(result.storedCount).toBe(0);
+    expect(result.cannotSatisfy.violations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "protein_floor" }),
+      ]),
+    );
+    expect(result.cannotSatisfy.suggestions.join(" ")).toContain("lean protein");
+  });
+
+  it("test_generate_meal_plan_returns_blocked_result_when_safety_filter_removes_all_candidates", () => {
+    const result = generateMealPlan({
+      startDate: "2026-06-16",
+      dailyKcalTarget: 1800,
+      presetDishes: [makeDish("soy_tofu_only", "lunch", 650, "tofu")],
+      preferences: { rejectedSeasonings: ["light_soy_sauce"] },
+      store: {
+        insertMealPlanEntries() {
+          throw new Error("blocked plans must not be stored");
+        },
+      },
+    });
+
+    expect(result.status).toBe("blocked");
+    if (result.status !== "blocked") {
+      throw new Error("Expected meal plan generation to be blocked.");
+    }
+    expect(result.plan.entries).toEqual([]);
+    expect(result.cannotSatisfy.violations).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "safety_filter" }),
+      ]),
+    );
+  });
+
   it("test_meal_checkin_followed_substituted_and_skipped_apply_expected_logs", () => {
     const planResult = generateMealPlan({
       startDate: "2026-06-16",
       dailyKcalTarget: 1800,
       presetDishes: toolDishes,
     });
+    if (planResult.status !== "planned") {
+      throw new Error("Expected meal plan generation to succeed.");
+    }
     const dietLogs: unknown[] = [];
     const planUpdates: unknown[] = [];
     const store = {

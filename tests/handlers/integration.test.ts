@@ -93,6 +93,12 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
     expect(log.caloriesKcal).toBeGreaterThan(400);
     expect(log.proteinGrams).toBeGreaterThan(40);
     expect(log.description).toContain("chicken breast");
+    expect(log.basisWarnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        slug: "brown_rice",
+        expectedWeightType: "dry",
+      }),
+    ]));
   });
 
   // ── Log Water ──
@@ -201,11 +207,53 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
 
   // ── invokeTool dispatch ──
 
+  it("checks in a substituted meal with basis warning and actual ingredients", async () => {
+    await ctx.repo.insertMealPlanEntry({
+      userId: ctx.userId,
+      planDate: TEST_DATE,
+      mealType: "lunch",
+      dishName: "planned chicken",
+      recipeSlug: "planned_chicken",
+      status: "planned",
+      ingredientsJson: [{ slug: "chicken_breast", grams: 200 }],
+      seasoningsJson: [],
+      caloriesKcal: 330,
+      proteinGrams: 62,
+      carbsGrams: 0,
+      fatGrams: 7.2,
+      sodiumMg: 148,
+    });
+
+    const result = await handlers.handleMealCheckin(ctx, {
+      date: TEST_DATE,
+      mealType: "lunch",
+      status: "substituted",
+      actualDescription: "brown rice 80g",
+    });
+
+    expect(result.status).toBe("substituted");
+    expect(result.dietLogId).toBeDefined();
+    expect(result.basisWarnings).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        slug: "brown_rice",
+        expectedWeightType: "dry",
+      }),
+    ]));
+
+    const logs = await ctx.repo.listDietLogs(ctx.userId, TEST_DATE);
+    const substituted = logs.find((log) => log.id === result.dietLogId);
+    expect(substituted).toMatchObject({
+      description: "brown rice 80g",
+      source: "substituted",
+      ingredientsJson: [{ slug: "brown_rice", grams: 80 }],
+    });
+  });
+
   it("dispatches through invokeTool registry", async () => {
     const result = await invokeTool(ctx, "daily_summary", { date: TEST_DATE });
     const summary = result as handlers.DailySummaryResult;
     expect(summary.date).toBe(TEST_DATE);
-    expect(summary.mealCount).toBe(2);
+    expect(summary.mealCount).toBe(3);
   });
 
   it("invokeTool rejects unknown tools", async () => {
@@ -239,6 +287,9 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
   it("generates a 7-day meal plan using preset dishes and BMR target", async () => {
     const result = await handlers.handleSmartGenerateMealPlan(ctx, {});
 
+    if (result.status !== "planned") {
+      throw new Error("Expected smart meal plan generation to succeed.");
+    }
     expect(result.plan.entries).toHaveLength(21);
     expect(result.plan.days).toHaveLength(7);
     expect(result.storedCount).toBe(21);
@@ -250,16 +301,19 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
       expect(day.totals.kcal).toBeGreaterThan(1500);
       expect(day.totals.kcal).toBeLessThan(2100);
     }
-  });
+  }, 30000);
 
   it("generates meal plan with explicit startDate", async () => {
     const result = await handlers.handleSmartGenerateMealPlan(ctx, {
       startDate: "2026-07-01",
     });
 
+    if (result.status !== "planned") {
+      throw new Error("Expected smart meal plan generation to succeed.");
+    }
     expect(result.plan.startDate).toBe("2026-07-01");
     expect(result.plan.entries).toHaveLength(21);
-  });
+  }, 30000);
 
   it("dispatches generate_meal_plan through invokeTool registry", async () => {
     const result = await invokeTool(ctx, "recipe_recommend", { mealType: "breakfast" });

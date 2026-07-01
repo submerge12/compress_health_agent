@@ -60,6 +60,62 @@ describe("dishBucketsRoles", () => {
       buckets: ["red_meat", "staple"],
       roles: ["b12", "iron", "zinc"],
       weeklyFloors: { red_meat: 2 },
+      allergenTags: [],
+      specialHandlingTags: [],
+      frequencyHints: {},
+      cookingDifficulties: [],
+      availabilityTags: [],
+    });
+  });
+
+  test("derives allergen and special handling tags from ingredients and hidden seasoning sources", () => {
+    const result = dishBucketsRoles(
+      {
+        ...dish([
+          { slug: "shrimp_jiweixia", grams: 80 },
+          { slug: "konjac", grams: 120 },
+          { slug: "chicken_liver", grams: 60 },
+        ]),
+        seasonings: ["oyster_sauce", "light_soy_sauce"],
+      },
+      {
+        foods: [
+          food({
+            slug: "shrimp_jiweixia",
+            executionBuckets: ["shellfish"],
+            allergenTags: ["seafood", "shellfish", "shrimp"],
+            roles: ["b12"],
+            weeklyFloor: 1,
+          }),
+          food({
+            slug: "konjac",
+            executionBuckets: ["filler"],
+            specialHandlingTags: ["filler", "not_vegetable"],
+            roles: [],
+            weeklyFloor: 0,
+          }),
+          food({
+            slug: "chicken_liver",
+            executionBuckets: ["organ_meat"],
+            roles: ["iron", "b12", "vitamin_a"],
+            weeklyFloor: 0,
+            frequencyHint: "weekly",
+            specialHandlingTags: ["weekly_frequency"],
+          }),
+        ],
+        naturalUnits: [],
+      },
+    );
+
+    expect(result).toEqual({
+      buckets: ["filler", "organ_meat", "shellfish"],
+      roles: ["b12", "iron", "vitamin_a"],
+      weeklyFloors: { shellfish: 1 },
+      allergenTags: ["seafood", "shellfish", "shrimp", "soy"],
+      specialHandlingTags: ["filler", "hidden_allergen", "not_vegetable", "weekly_frequency"],
+      frequencyHints: { chicken_liver: "weekly" },
+      cookingDifficulties: [],
+      availabilityTags: [],
     });
   });
 });

@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   generateWeeklyMealPlan,
+  MealPlanInfeasibleError,
   validateWeeklyMealPlan,
 } from "../../src/engine/meal-planner.js";
 import type { RecipeDish, RecipeNutrition } from "../../src/engine/recipe-engine.js";
@@ -62,23 +63,16 @@ describe("meal planner composition", () => {
     expect(validateWeeklyMealPlan(plan, { dailyKcalTarget: 1500, dailyProteinTarget: 100 }).ok).toBe(true);
   });
 
-  test("reports energy violations when staple bounds cannot close the band", () => {
-    const plan = generateWeeklyMealPlan({
-      startDate: "2026-06-16",
-      dailyKcalTarget: 3000,
-      dailyProteinTarget: 100,
-      presetDishes: [breakfast, chicken, beef],
-      catalog,
-    });
-
-    expect(plan.hardViolations).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ type: "energy_band", date: "2026-06-16" }),
-      ]),
-    );
-    expect(plan.entries.filter((entry) => entry.mealType !== "breakfast").every((entry) =>
-      entry.staple?.grams === 180,
-    )).toBe(true);
+  test("blocks when staple bounds cannot close the energy band", () => {
+    expect(() =>
+      generateWeeklyMealPlan({
+        startDate: "2026-06-16",
+        dailyKcalTarget: 3000,
+        dailyProteinTarget: 100,
+        presetDishes: [breakfast, chicken, beef],
+        catalog,
+      })
+    ).toThrow(MealPlanInfeasibleError);
   });
 
   test("catalog mode fails instead of falling back to stale dish nutrition for unknown ingredients", () => {
@@ -169,13 +163,14 @@ function food(
   carbsGramsPer100g: number,
   fatGramsPer100g: number,
   sodiumMgPer100g: number,
-) {
+): MealCatalog["foods"][number] {
   return {
     slug,
     name: slug,
     aliases: [],
     defaultGrams: 100,
     defaultUnit: "serving",
+    weightType: "raw",
     kcalPer100g,
     proteinGramsPer100g,
     carbsGramsPer100g,

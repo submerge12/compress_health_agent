@@ -132,6 +132,7 @@ function nutritionFromEntries(entries: readonly NutritionEntry[], catalog: MealC
   const aggregate = aggregateNutrition({
     foods: entries,
     foodRecords: catalog.foods,
+    requireWeightType: true,
   });
   return {
     kcal: aggregate.total.kcal,

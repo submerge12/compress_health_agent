@@ -227,7 +227,7 @@ function resolveSeasonings(
 }
 
 function computeDishNutrition(ingredients: readonly NutritionEntry[], catalog: MealCatalog): ResolvedDish["nutrition"] {
-  const aggregate = aggregateNutrition({ foods: ingredients, foodRecords: catalog.foods });
+  const aggregate = aggregateNutrition({ foods: ingredients, foodRecords: catalog.foods, requireWeightType: true });
   return {
     kcal: aggregate.total.kcal,
     proteinGrams: aggregate.total.proteinGrams,

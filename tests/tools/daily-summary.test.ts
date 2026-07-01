@@ -5,9 +5,10 @@ import { logExercise } from "../../src/tools/log-exercise.js";
 import { logMeal } from "../../src/tools/log-meal.js";
 import { logWater } from "../../src/tools/log-water.js";
 import { logWeight } from "../../src/tools/log-weight.js";
+import type { MealCatalog } from "../../src/tools/nutrition-estimate.js";
 import { createInMemoryHealthRepository } from "../../src/tools/store.js";
 
-const catalog = {
+const catalog: MealCatalog = {
   foods: [
     {
       slug: "chicken_breast",
@@ -15,6 +16,7 @@ const catalog = {
       aliases: ["鸡胸肉"],
       defaultGrams: 120,
       defaultUnit: "serving",
+      weightType: "raw",
       kcalPer100g: 165,
       proteinGramsPer100g: 31,
       carbsGramsPer100g: 0,
@@ -27,6 +29,7 @@ const catalog = {
       aliases: ["糙米"],
       defaultGrams: 150,
       defaultUnit: "bowl",
+      weightType: "cooked",
       kcalPer100g: 112,
       proteinGramsPer100g: 2.6,
       carbsGramsPer100g: 23,
@@ -39,6 +42,7 @@ const catalog = {
       aliases: ["西兰花"],
       defaultGrams: 100,
       defaultUnit: "serving",
+      weightType: "raw",
       kcalPer100g: 35,
       proteinGramsPer100g: 2.4,
       carbsGramsPer100g: 7.2,
@@ -51,6 +55,7 @@ const catalog = {
       aliases: ["咸汤"],
       defaultGrams: 500,
       defaultUnit: "bowl",
+      weightType: "cooked",
       kcalPer100g: 60,
       proteinGramsPer100g: 3,
       carbsGramsPer100g: 8,

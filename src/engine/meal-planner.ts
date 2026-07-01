@@ -1,4 +1,5 @@
 import {
+  hasRejectedIngredient,
   hasRejectedSeasoning,
   type MealType,
   type RecipeDish,
@@ -28,6 +29,8 @@ export interface MealPlanRequest {
   startDate: string;
   dailyKcalTarget: number;
   dailyProteinTarget?: number;
+  dailyFatTarget?: number;
+  dailyCarbsTarget?: number;
   catalog?: MealCatalog;
   staple?: Staple;
   presetDishes?: readonly RecipeDish[];
@@ -65,16 +68,33 @@ export interface WeeklyMealPlan {
 }
 
 export interface HardViolation {
-  type: "energy_band" | "protein_floor";
+  type: "safety_filter" | "candidate_pool" | "energy_band" | "protein_floor";
   date: string;
   actual: number;
   target: number;
   message: string;
 }
 
+export interface MealPlanInfeasibleResult {
+  reason: string;
+  violations: readonly HardViolation[];
+  suggestions: readonly string[];
+}
+
+export class MealPlanInfeasibleError extends RangeError {
+  readonly result: MealPlanInfeasibleResult;
+
+  constructor(result: MealPlanInfeasibleResult) {
+    super(result.reason);
+    this.name = "MealPlanInfeasibleError";
+    this.result = result;
+  }
+}
+
 export interface MealPlanValidationOptions {
   dailyKcalTarget: number;
   dailyProteinTarget?: number;
+  dailyFatTarget?: number;
   minimumDistinctDishes?: number;
   energyToleranceRatio?: number;
 }
@@ -88,14 +108,21 @@ const MEAL_TYPES: readonly MealType[] = ["breakfast", "lunch", "dinner"];
 
 export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan {
   validateMealPlanRequest(request);
-  const candidates = filterUsableCandidates(collectCandidates(request), request.preferences);
-  if (candidates.length === 0) throw new RangeError("No usable meal-planning candidates");
+  const rawCandidates = collectCandidates(request);
+  const candidates = filterUsableCandidates(rawCandidates, request.preferences);
+  if (candidates.length === 0) {
+    throw new MealPlanInfeasibleError(noUsableCandidatesResult(request, rawCandidates.length));
+  }
 
   const breakfastPool = candidates.filter(matchesBreakfast);
   const mainPool = candidates.filter(matchesMain);
   const sidePool = candidates.filter(matchesSide);
-  if (breakfastPool.length === 0) throw new RangeError("No breakfast candidates");
-  if (mainPool.length === 0) throw new RangeError("No main meal candidates");
+  if (breakfastPool.length === 0) {
+    throw new MealPlanInfeasibleError(noMealRoleCandidatesResult(request.startDate, "breakfast"));
+  }
+  if (mainPool.length === 0) {
+    throw new MealPlanInfeasibleError(noMealRoleCandidatesResult(request.startDate, "main meal"));
+  }
 
   const entries: MealPlanEntry[] = [];
   const mainUsage = new Map<string, number>();
@@ -124,6 +151,9 @@ export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan
 
   const plan = buildPlan(request.startDate, entries, []);
   const hardViolations = hardViolationsForPlan(plan, request);
+  if (hardViolations.length > 0) {
+    throw new MealPlanInfeasibleError(buildInfeasibleResult(hardViolations));
+  }
   const withViolations = buildPlan(request.startDate, entries, hardViolations);
   return {
     ...withViolations,
@@ -132,6 +162,8 @@ export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan
       {
         dailyKcalTarget: request.dailyKcalTarget,
         dailyProteinTarget: request.dailyProteinTarget,
+        dailyFatTarget: request.dailyFatTarget,
+        dailyCarbsTarget: request.dailyCarbsTarget,
       },
       request.preferences,
     ),
@@ -145,6 +177,7 @@ export function validateWeeklyMealPlan(
   const violations = [
     ...validateDailyKcal(plan, options.dailyKcalTarget, options.energyToleranceRatio ?? ENERGY_TOLERANCE_RATIO),
     ...validateDailyProtein(plan, options.dailyProteinTarget),
+    ...validateDailyFat(plan, options.dailyFatTarget),
     ...validateStructuralCompleteness(plan),
     ...validateDistinctDishes(plan, options.minimumDistinctDishes),
   ];
@@ -296,10 +329,14 @@ function comboScore(
     {
       dailyKcalTarget: request.dailyKcalTarget,
       dailyProteinTarget: request.dailyProteinTarget,
+      dailyFatTarget: request.dailyFatTarget,
+      dailyCarbsTarget: request.dailyCarbsTarget,
     },
     request.preferences,
   ).penalty;
-  return energyMiss * 2_000 + energySoftMiss * 1_000 + proteinMiss * 1_500 + duplicateMainPenalty + duplicateSidePenalty + usagePenalty + sideUsagePenalty + repeatIngredientPenalty + softPenalty;
+  const hardMissCount = Number(energyMiss > 0) + Number(proteinMiss > 0);
+  const hardMissMagnitude = energyMiss + proteinMiss;
+  return hardMissCount * 1_000_000 + hardMissMagnitude * 100_000 + energySoftMiss * 1_000 + duplicateMainPenalty + duplicateSidePenalty + usagePenalty + sideUsagePenalty + repeatIngredientPenalty + softPenalty;
 }
 
 function buildPlan(
@@ -339,7 +376,56 @@ function hardViolationsForPlan(plan: WeeklyMealPlan, request: MealPlanRequest): 
         message: `${day.date} protein ${day.totals.proteinGrams}g below ${target}g floor`,
       };
     });
+  // Fat is a SOFT constraint: it is not a hard violation. It stays as a strong
+  // ranking signal in comboScore, a soft penalty in scorePlan, and an advisory
+  // note via validateDailyFat — but it never blocks plan generation.
   return [...energyViolations, ...proteinViolations];
+}
+
+function buildInfeasibleResult(violations: readonly HardViolation[]): MealPlanInfeasibleResult {
+  const types = new Set(violations.map((violation) => violation.type));
+  const suggestions: string[] = [];
+  if (types.has("energy_band")) {
+    suggestions.push("relax the daily energy target or allow a wider staple portion range");
+  }
+  if (types.has("protein_floor")) {
+    suggestions.push("add a lean protein dish or lower the protein target");
+  }
+  if (types.has("safety_filter")) {
+    suggestions.push("add safe dishes that avoid the strict exclusions; do not relax allergies without medical guidance");
+  }
+  if (types.has("candidate_pool")) {
+    suggestions.push("add meal-planning candidates for the missing meal role");
+  }
+  return {
+    reason: `Cannot generate a meal plan that satisfies hard constraints: ${[...types].join(", ")}`,
+    violations,
+    suggestions,
+  };
+}
+
+function noUsableCandidatesResult(request: MealPlanRequest, rawCandidateCount: number): MealPlanInfeasibleResult {
+  const type = rawCandidateCount === 0 ? "candidate_pool" : "safety_filter";
+  const violation: HardViolation = {
+    type,
+    date: request.startDate,
+    actual: 0,
+    target: 1,
+    message: rawCandidateCount === 0
+      ? "No meal-planning candidates are available"
+      : "All meal-planning candidates were removed by strict exclusions",
+  };
+  return buildInfeasibleResult([violation]);
+}
+
+function noMealRoleCandidatesResult(startDate: string, role: string): MealPlanInfeasibleResult {
+  return buildInfeasibleResult([{
+    type: "candidate_pool",
+    date: startDate,
+    actual: 0,
+    target: 1,
+    message: `No allowed ${role} candidates remain after safety filters`,
+  }]);
 }
 
 function validateDailyKcal(
@@ -360,6 +446,14 @@ function validateDailyProtein(plan: WeeklyMealPlan, dailyProteinTarget: number |
     .map((day) => `${day.date} protein ${day.totals.proteinGrams}g below ${floor}g floor`);
 }
 
+function validateDailyFat(plan: WeeklyMealPlan, dailyFatTarget: number | undefined): readonly string[] {
+  const target = positiveTarget(dailyFatTarget);
+  if (target === undefined) return [];
+  return plan.days
+    .filter((day) => !isDailyFatWithinCeiling(day.totals.fatGrams, target))
+    .map((day) => `${day.date} fat ${day.totals.fatGrams}g above ${target}g ceiling`);
+}
+
 function validateStructuralCompleteness(plan: WeeklyMealPlan): readonly string[] {
   return plan.days.flatMap((day) => {
     const mealTypes = day.meals.map((meal) => meal.mealType);
@@ -378,6 +472,10 @@ function isDailyKcalWithinTarget(kcal: number, dailyKcalTarget: number, toleranc
 
 function isDailyProteinWithinFloor(proteinGrams: number, dailyProteinTarget: number | undefined): boolean {
   return dailyProteinTarget === undefined || proteinGrams >= Math.round(dailyProteinTarget * PROTEIN_FLOOR_RATIO);
+}
+
+function isDailyFatWithinCeiling(fatGrams: number, dailyFatTarget: number): boolean {
+  return fatGrams <= dailyFatTarget;
 }
 
 function validateDistinctDishes(
@@ -406,18 +504,17 @@ function collectCandidates(request: MealPlanRequest): readonly RecipeDish[] {
   return [...(request.candidates ?? []), ...(request.presetDishes ?? []), ...(request.userDishes ?? [])];
 }
 
-function filterUsableCandidates(
+export function filterUsableCandidates(
   candidates: readonly RecipeDish[],
   preferences: RecipePreferences | undefined,
 ): readonly RecipeDish[] {
   const rejectedSeasonings = preferences?.rejectedSeasonings ?? [];
-  const rejectedIngredients = new Set([
+  const rejectedIngredients = [
     ...(preferences?.rejectedIngredients ?? []),
-    ...(preferences?.allergens ?? []),
-  ].map(normalizeToken));
+  ];
   return candidates.filter((dish) => {
     if (hasRejectedSeasoning(dish, rejectedSeasonings)) return false;
-    return !dish.ingredients.some((ingredient) => rejectedIngredients.has(normalizeToken(ingredient.slug)));
+    return !hasRejectedIngredient(dish, rejectedIngredients, preferences?.allergens ?? []);
   });
 }
 
@@ -489,6 +586,6 @@ function roundTo(value: number, decimals: number): number {
   return Math.round(value * factor) / factor;
 }
 
-function normalizeToken(value: string): string {
-  return value.trim().toLowerCase();
+function positiveTarget(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined;
 }

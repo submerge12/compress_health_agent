@@ -46,6 +46,12 @@ const classificationColumns = [
   "executionBuckets",
   "roles",
   "weeklyFloor",
+  "allergenTags",
+  "weightType",
+  "frequencyHint",
+  "cookingDifficulty",
+  "availability",
+  "specialHandlingTags",
 ] as const;
 
 describe("database schema", () => {
@@ -121,6 +127,7 @@ describe("seed csv helpers", () => {
         executionBuckets: ["lean_white_meat"],
         roles: ["b12"],
         weeklyFloor: 0,
+        weightType: "raw",
         caloriesKcal: 165,
         proteinGrams: 31,
         carbsGrams: 0,
@@ -128,6 +135,68 @@ describe("seed csv helpers", () => {
         sodiumMg: 74
       })
     ]);
+  });
+
+  test("test_loadFoodItemsFromCsv_normalizes_phase3_metadata_columns", () => {
+    const csv = [
+      "slug,name,category,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg,allergen_tags,weight_type,frequency_hint,cooking_difficulty,availability,special_handling_tags",
+      "dried_shrimp,Dried shrimp,seafood,253,48,0,2,5100,seafood|shellfish|shrimp,dry,weekly,basic,specialty,seasoning|high_sodium"
+    ].join("\n");
+
+    expect(loadFoodItemsFromCsv(csv)).toEqual([
+      expect.objectContaining({
+        slug: "dried_shrimp",
+        allergenTags: ["seafood", "shellfish", "shrimp"],
+        weightType: "dry",
+        frequencyHint: "weekly",
+        cookingDifficulty: "basic",
+        availability: "specialty",
+        specialHandlingTags: ["seasoning", "high_sodium"],
+      })
+    ]);
+  });
+
+  test("test_loadFoodItemsFromCsv_infers_phase3_metadata_for_known_food_groups", () => {
+    const csv = [
+      "slug,name,category,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "brown_rice,Brown rice,grain,348,7.7,75,2.7,1",
+      "shrimp_jiweixia,Shrimp,seafood,101,18.2,3.9,1.4,172",
+      "konjac,Konjac,starch,7,0.1,3.3,0,2",
+      "dried_shrimp,Dried shrimp,seafood,253,47.6,0,2.3,5100",
+      "chicken_liver,Chicken liver,poultry,121,16.6,0.6,4.8,71",
+      "red_bean,Red bean,legume,324,20,63,1,12"
+    ].join("\n");
+    const bySlug = new Map(loadFoodItemsFromCsv(csv).map((item) => [item.slug, item]));
+
+    expect(bySlug.get("brown_rice")).toMatchObject({
+      executionBuckets: ["staple"],
+      weightType: "dry",
+    });
+    expect(bySlug.get("shrimp_jiweixia")).toMatchObject({
+      allergenTags: ["seafood", "shellfish", "shrimp"],
+      weightType: "raw",
+    });
+    expect(bySlug.get("konjac")).toMatchObject({
+      executionBuckets: ["filler"],
+      specialHandlingTags: ["filler", "not_vegetable"],
+    });
+    expect(bySlug.get("dried_shrimp")).toMatchObject({
+      executionBuckets: ["seasoning"],
+      allergenTags: ["seafood", "shellfish", "shrimp"],
+      specialHandlingTags: ["seasoning", "high_sodium", "seasoning_not_main_protein"],
+      weightType: "dry",
+    });
+    expect(bySlug.get("chicken_liver")).toMatchObject({
+      executionBuckets: ["organ_meat"],
+      roles: ["iron", "b12", "vitamin_a"],
+      frequencyHint: "weekly",
+      weightType: "raw",
+    });
+    expect(bySlug.get("red_bean")).toMatchObject({
+      executionBuckets: ["legume"],
+      weightType: "dry",
+    });
+    expect(bySlug.get("red_bean")?.executionBuckets).not.toContain("soy_product");
   });
 
   test("test_loadSeasoningsFromCsv_normalizes_servings_and_sodium", () => {

@@ -2,6 +2,7 @@ import type { RecipeDish, RecipePreferences } from "../engine/recipe-engine.js";
 import type { UserDishRow } from "../db/repository.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { dishBucketsRoles } from "../engine/classification.js";
+import { allergenGroupsForMemorySubject } from "../engine/food-taxonomy.js";
 import { resolveFoodSlug, resolveSeasoningSlug, type SeasoningLike } from "./slug-resolver.js";
 import type { ToolContext } from "./context.js";
 
@@ -12,14 +13,19 @@ import type { ToolContext } from "./context.js";
  * unioned with any rejected seasonings stored in the seasoning-preference table.
  */
 export async function loadUserPreferences(ctx: ToolContext): Promise<RecipePreferences> {
-  const [dislikes, tableRejectedSeasonings] = await Promise.all([
+  const [dislikes, likes, tableRejectedSeasonings] = await Promise.all([
     ctx.repo.listActiveMemories(ctx.userId, ["dislike"]),
+    ctx.repo.listActiveMemories(ctx.userId, ["preference"]),
     ctx.repo.listRejectedSeasoningSlugs(ctx.userId),
   ]);
 
   const seasoningCatalog: readonly SeasoningLike[] = ctx.seasoningCatalog ?? ctx.seasoningRecords;
   const rejectedSeasonings = new Set<string>(tableRejectedSeasonings);
   const rejectedIngredients = new Set<string>();
+  const allergens = new Set<string>();
+  const preferredIngredients = new Set<string>();
+  const preferredSeasonings = new Set<string>();
+  const preferredMethods = new Set<string>();
 
   for (const memory of dislikes) {
     const subject = memory.subject.trim();
@@ -32,13 +38,61 @@ export async function loadUserPreferences(ctx: ToolContext): Promise<RecipePrefe
     const asSeasoning = resolveSeasoningSlug(subject, seasoningCatalog);
     if (asSeasoning.slug !== undefined) {
       rejectedSeasonings.add(asSeasoning.slug);
+      continue;
+    }
+    for (const group of allergenGroupsForMemorySubject(subject)) {
+      allergens.add(group);
+    }
+  }
+
+  for (const memory of likes) {
+    const subject = memory.subject.trim();
+    if (!subject) continue;
+    const asFood = resolveFoodSlug(subject, ctx.catalog);
+    if (asFood.slug !== undefined) {
+      preferredIngredients.add(asFood.slug);
+      continue;
+    }
+    const asSeasoning = resolveSeasoningSlug(subject, seasoningCatalog);
+    if (asSeasoning.slug !== undefined) {
+      preferredSeasonings.add(asSeasoning.slug);
+      continue;
+    }
+    const method = resolvePreferredMethod(subject);
+    if (method !== undefined) {
+      preferredMethods.add(method);
     }
   }
 
   return {
     rejectedSeasonings: [...rejectedSeasonings],
     rejectedIngredients: [...rejectedIngredients],
+    allergens: [...allergens],
+    preferredIngredients: [...preferredIngredients],
+    preferredSeasonings: [...preferredSeasonings],
+    preferredMethods: [...preferredMethods],
   };
+}
+
+const METHOD_ALIASES = new Map<string, string>([
+  ["stir_fry", "stir_fry"],
+  ["stirfry", "stir_fry"],
+  ["pan_searing", "pan_searing"],
+  ["pan_seared", "pan_searing"],
+  ["searing", "pan_searing"],
+  ["steaming", "steaming"],
+  ["steamed", "steaming"],
+  ["steam", "steaming"],
+  ["boiling", "boiling"],
+  ["boiled", "boiling"],
+  ["braising", "braising"],
+  ["braised", "braising"],
+  ["cold_mixing", "cold_mixing"],
+]);
+
+function resolvePreferredMethod(subject: string): string | undefined {
+  const normalized = subject.trim().toLowerCase().replace(/[-\s]+/g, "_");
+  return METHOD_ALIASES.get(normalized);
 }
 
 export async function loadCandidateDishes(ctx: ToolContext): Promise<RecipeDish[]> {
@@ -96,5 +150,10 @@ function withClassification(dish: RecipeDish, ctx: ToolContext): RecipeDish {
     buckets: classification.buckets,
     roles: classification.roles,
     weeklyFloors: classification.weeklyFloors,
+    allergenTags: classification.allergenTags,
+    specialHandlingTags: classification.specialHandlingTags,
+    frequencyHints: classification.frequencyHints,
+    cookingDifficulties: classification.cookingDifficulties,
+    availabilityTags: classification.availabilityTags,
   };
 }

@@ -33,6 +33,154 @@ describe("buildCoverageReport", () => {
       ]),
     );
   });
+
+  test("surfaces fat ceiling advisory when daily fat target is exceeded", () => {
+    const fatty = dish("fatty_main", 600, 40, 500, [], {}, undefined, { fatGrams: 50 });
+    const plan = planWith([entry(0, "lunch", fatty), entry(1, "lunch", fatty)]);
+
+    const report = buildCoverageReport(plan, { dailyFatTarget: 35 });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "fat_ceiling",
+          key: "fat",
+          actual: 50,
+          target: 35,
+        }),
+      ]),
+    );
+  });
+
+  test("advises when the accepted pool has only staples and no protein sources", () => {
+    const staple = dish("brown_rice_bowl", 500, 8, 120, ["staple"]);
+    const report = buildCoverageReport(planWith([entry(0, "lunch", staple)]), {
+      acceptedCandidates: [staple],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "pool_coverage",
+          key: "protein_sources",
+          actual: 0,
+          target: 1,
+        }),
+      ]),
+    );
+  });
+
+  test("advises when vegetable choices lack leafy, cruciferous, and mushroom variety", () => {
+    const cucumberTomato = dish("cucumber_tomato_side", 40, 2, 40, ["vegetable"], {}, [
+      { slug: "cucumber", grams: 100 },
+      { slug: "tomato", grams: 100 },
+    ]);
+
+    const report = buildCoverageReport(planWith([entry(0, "lunch", cucumberTomato)]), {
+      acceptedCandidates: [cucumberTomato],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "pool_coverage", key: "leafy_vegetables" }),
+        expect.objectContaining({ type: "pool_coverage", key: "cruciferous_vegetables" }),
+        expect.objectContaining({ type: "pool_coverage", key: "mushrooms" }),
+      ]),
+    );
+  });
+
+  test("advises when protein pool has no low-fat option", () => {
+    const fattyProtein = dish("fatty_pork", 700, 35, 240, ["red_meat"], {}, [{ slug: "pork_belly", grams: 180 }], {
+      fatGrams: 45,
+    });
+
+    const report = buildCoverageReport(planWith([entry(0, "lunch", fattyProtein)]), {
+      acceptedCandidates: [fattyProtein],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "pool_balance", key: "low_fat_protein" }),
+      ]),
+    );
+  });
+
+  test("does not count konjac filler as a vegetable coverage source", () => {
+    const konjac = {
+      ...dish("konjac_bowl", 35, 1, 20, ["filler"], {}, [{ slug: "konjac", grams: 150 }]),
+      specialHandlingTags: ["filler", "not_vegetable"],
+    };
+
+    const report = buildCoverageReport(planWith([entry(0, "lunch", konjac)]), {
+      acceptedCandidates: [konjac],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "pool_coverage", key: "vegetable_sources" }),
+      ]),
+    );
+    expect(report.unmet.map((item) => item.key)).not.toContain("leafy_vegetables");
+  });
+
+  test("does not count dried shrimp seasoning as a main protein source", () => {
+    const driedShrimp = {
+      ...dish("dried_shrimp_sauce", 90, 24, 1800, ["seasoning"], {}, [{ slug: "dried_shrimp", grams: 50 }]),
+      specialHandlingTags: ["seasoning", "high_sodium", "seasoning_not_main_protein"],
+    };
+
+    const report = buildCoverageReport(planWith([entry(0, "lunch", driedShrimp)]), {
+      acceptedCandidates: [driedShrimp],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "pool_coverage", key: "protein_sources" }),
+        expect.objectContaining({ type: "pool_balance", key: "high_sodium_special_ingredient" }),
+      ]),
+    );
+  });
+
+  test("advises when weekly-frequency ingredients are planned more than once", () => {
+    const chickenLiver = {
+      ...dish("chicken_liver_stir_fry", 260, 30, 420, ["organ_meat"], {}, [{ slug: "chicken_liver", grams: 120 }]),
+      frequencyHints: { chicken_liver: "weekly" },
+    };
+    const report = buildCoverageReport(planWith([
+      entry(0, "lunch", chickenLiver),
+      entry(1, "dinner", chickenLiver),
+    ]));
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "pool_balance",
+          key: "weekly_frequency_chicken_liver",
+          actual: 2,
+          target: 1,
+        }),
+      ]),
+    );
+  });
+
+  test("advises when accepted candidates depend on advanced cooking or specialty availability", () => {
+    const specialtyDish = {
+      ...dish("specialty_preserved_food", 260, 20, 420, ["protein"]),
+      cookingDifficulties: ["advanced"],
+      availabilityTags: ["specialty"],
+    };
+
+    const report = buildCoverageReport(planWith([entry(0, "lunch", specialtyDish)]), {
+      acceptedCandidates: [specialtyDish],
+    });
+
+    expect(report.unmet).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: "pool_balance", key: "advanced_cooking" }),
+        expect.objectContaining({ type: "pool_balance", key: "specialty_availability" }),
+      ]),
+    );
+  });
 });
 
 function dish(
@@ -42,13 +190,15 @@ function dish(
   sodiumMg: number,
   buckets: string[] = [],
   weeklyFloors: Record<string, number> = {},
+  ingredients: RecipeDish["ingredients"] = [{ slug, grams: 100 }],
+  macros: Partial<RecipeDish["nutrition"]> = {},
 ): RecipeDish {
   return {
     slug,
     name: slug,
     mealTypes: ["breakfast", "lunch", "dinner"],
-    nutrition: { kcal, proteinGrams, carbsGrams: 60, fatGrams: 20, sodiumMg },
-    ingredients: [{ slug, grams: 100 }],
+    nutrition: { kcal, proteinGrams, carbsGrams: 60, fatGrams: 20, sodiumMg, ...macros },
+    ingredients,
     seasonings: [],
     source: "preset",
     buckets,

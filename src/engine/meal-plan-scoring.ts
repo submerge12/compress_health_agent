@@ -12,6 +12,8 @@ import {
 export interface PlanScoringProfile {
   dailyKcalTarget?: number;
   dailyProteinTarget?: number;
+  dailyFatTarget?: number;
+  dailyCarbsTarget?: number;
   weeklyFloors?: Readonly<Record<string, number>>;
 }
 
@@ -42,7 +44,7 @@ export function scorePlan(
     weeklyFloor: weeklyFloorPenalty(plan, profile.weeklyFloors ?? WEEKLY_FLOORS),
     sodium: sodiumPenalty(plan),
     repetition: repetitionPenalty(plan.entries),
-    macro: macroPenalty(plan, profile.dailyKcalTarget ?? 0),
+    macro: macroPenalty(plan, profile),
     diversity: diversityPenalty(plan),
     preferenceBonus: preferenceBonus(plan.entries, preferences),
     recency: recencyPenalty(plan.entries),
@@ -100,13 +102,32 @@ function sodiumPenalty(plan: WeeklyMealPlan): number {
   return average(plan.days.map((day) => Math.max(0, (day.totals.sodiumMg - SODIUM_CAP_MG) / SODIUM_CAP_MG)));
 }
 
-function macroPenalty(plan: WeeklyMealPlan, dailyKcalTarget: number): number {
+function macroPenalty(plan: WeeklyMealPlan, profile: PlanScoringProfile): number {
+  const dailyFatTarget = positiveTarget(profile.dailyFatTarget);
+  const dailyCarbsTarget = positiveTarget(profile.dailyCarbsTarget);
+  if (dailyFatTarget !== undefined || dailyCarbsTarget !== undefined) {
+    return average(plan.days.map((day) => {
+      const fatPenalty = dailyFatTarget === undefined
+        ? 0
+        : Math.max(0, day.totals.fatGrams - dailyFatTarget) / dailyFatTarget;
+      const carbsPenalty = dailyCarbsTarget === undefined
+        ? 0
+        : Math.abs(day.totals.carbsGrams - dailyCarbsTarget) / dailyCarbsTarget;
+      return fatPenalty + carbsPenalty;
+    }));
+  }
+
+  const dailyKcalTarget = profile.dailyKcalTarget ?? 0;
   if (dailyKcalTarget <= 0) return 0;
   return average(plan.days.map((day) => {
     const fatPct = day.totals.fatGrams * 9 / Math.max(1, day.totals.kcal);
     const carbPct = day.totals.carbsGrams * 4 / Math.max(1, day.totals.kcal);
     return Math.abs(fatPct - 0.3) + Math.abs(carbPct - 0.45);
   }));
+}
+
+function positiveTarget(value: number | undefined): number | undefined {
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
 function repetitionPenalty(entries: readonly MealPlanEntry[]): number {
@@ -138,10 +159,12 @@ function diversityPenalty(plan: WeeklyMealPlan): number {
 
 function preferenceBonus(entries: readonly MealPlanEntry[], preferences: RecipePreferences): number {
   const preferredIngredients = new Set((preferences.preferredIngredients ?? []).map(normalize));
+  const preferredSeasonings = new Set((preferences.preferredSeasonings ?? []).map(normalize));
   const preferredMethods = new Set((preferences.preferredMethods ?? []).map(normalize));
   let matches = 0;
   for (const entry of entries) {
     matches += entry.dish.ingredients.filter((ingredient) => preferredIngredients.has(normalize(ingredient.slug))).length;
+    matches += entry.dish.seasonings.filter((seasoning) => preferredSeasonings.has(normalize(seasoning))).length;
     if (entry.dish.method && preferredMethods.has(normalize(entry.dish.method))) matches += 1;
   }
   return Math.min(6, matches) / 6;

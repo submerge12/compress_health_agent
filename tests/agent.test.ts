@@ -120,6 +120,19 @@ describe("agent profile", () => {
     ]);
   });
 
+  test("test_systemPrompt_foodPreferenceInterview_isAllergyFirstWithDefaultBasket", () => {
+    const prompt = profile.systemPrompt;
+    const allergyIndex = prompt.indexOf("Allergies first");
+    const preferenceIndex = prompt.indexOf("Preference basket");
+
+    expect(allergyIndex).toBeGreaterThanOrEqual(0);
+    expect(preferenceIndex).toBeGreaterThan(allergyIndex);
+    expect(prompt).toContain("default basket");
+    expect(prompt).toContain("remove/add");
+    expect(prompt).toContain("seafood doesn't work for me");
+    expect(prompt).toContain("do not force fruit or vegetables");
+  });
+
   test("test_validateAgentProfile_duplicateScheduledTaskIds_throwHelpfulError", () => {
     const firstTask = profile.scheduledTasks[0];
     if (!firstTask) {

@@ -48,6 +48,27 @@ function makeContext(userDishes: UserDishRow[]): ToolContext {
   };
 }
 
+function makeClassifiedContext(userDishes: UserDishRow[]): ToolContext {
+  return {
+    ...makeContext(userDishes),
+    catalog: {
+      foods: [
+        food("shrimp_jiweixia", [], {
+          executionBuckets: ["shellfish"],
+          roles: ["b12"],
+          weeklyFloor: 1,
+          allergenTags: ["seafood", "shellfish", "shrimp"],
+        }),
+        food("konjac", [], {
+          executionBuckets: ["filler"],
+          specialHandlingTags: ["filler", "not_vegetable"],
+        }),
+      ],
+      naturalUnits: [],
+    },
+  };
+}
+
 describe("loadCandidateDishes", () => {
   test("returns exactly the curated presets when user_dishes is empty", async () => {
     const candidates = await loadCandidateDishes(makeContext([]));
@@ -117,9 +138,34 @@ describe("loadCandidateDishes", () => {
     expect(candidates.filter((dish) => dish.slug === presetDishes[0]!.slug)).toHaveLength(1);
     expect(candidates.map((dish) => dish.slug)).toContain("valid_extra");
   });
+
+  test("derives allergen and special handling tags for loaded candidates", async () => {
+    const candidates = await loadCandidateDishes(makeClassifiedContext([
+      userDish({
+        slug: "user_konjac_shrimp",
+        name: "User konjac shrimp",
+        ingredientsJson: [
+          { slug: "shrimp_jiweixia", grams: 80 },
+          { slug: "konjac", grams: 120 },
+        ],
+      }),
+    ]));
+
+    expect(candidates.find((dish) => dish.slug === "user_konjac_shrimp")).toMatchObject({
+      buckets: ["filler", "shellfish"],
+      roles: ["b12"],
+      weeklyFloors: { shellfish: 1 },
+      allergenTags: ["seafood", "shellfish", "shrimp", "soy"],
+      specialHandlingTags: ["filler", "not_vegetable"],
+    });
+  });
 });
 
-function food(slug: string, aliases: string[] = []): FoodCatalogRecord {
+function food(
+  slug: string,
+  aliases: string[] = [],
+  overrides: Partial<FoodCatalogRecord> = {},
+): FoodCatalogRecord {
   return {
     slug,
     name: slug,
@@ -134,6 +180,7 @@ function food(slug: string, aliases: string[] = []): FoodCatalogRecord {
     carbsGramsPer100g: 10,
     fatGramsPer100g: 5,
     sodiumMgPer100g: 50,
+    ...overrides,
   };
 }
 
@@ -156,21 +203,26 @@ function dislike(subject: string): MemoryRecordRow {
   };
 }
 
+function preference(subject: string): MemoryRecordRow {
+  return { ...dislike(subject), id: `pref-${subject}`, kind: "preference" as MemoryKind };
+}
+
 function makePreferenceContext(opts: {
-  memories: MemoryRecordRow[];
+  dislikes?: MemoryRecordRow[];
+  likes?: MemoryRecordRow[];
   tableRejected?: string[];
 }): ToolContext {
   return {
     userId: "user-id",
     locale: "zh",
-    catalog: { foods: [food("mushroom", ["蘑菇"]), food("beef")], naturalUnits: [] },
+    catalog: { foods: [food("mushroom", ["蘑菇"]), food("beef"), food("chicken_breast")], naturalUnits: [] },
     seasoningRecords: [],
     seasoningCatalog: [{ slug: "light_soy_sauce", name: "生抽" }],
     repo: {
       listActiveMemories: async (userId: string, kinds?: readonly MemoryKind[]) => {
         expect(userId).toBe("user-id");
-        expect(kinds).toEqual(["dislike"]);
-        return opts.memories;
+        if (kinds?.includes("preference")) return opts.likes ?? [];
+        return opts.dislikes ?? [];
       },
       listRejectedSeasoningSlugs: async () => opts.tableRejected ?? [],
     } as unknown as ToolContext["repo"],
@@ -181,16 +233,57 @@ function makePreferenceContext(opts: {
 describe("loadUserPreferences", () => {
   test("resolves disliked foods to rejected ingredients and seasonings to rejected seasonings", async () => {
     const prefs = await loadUserPreferences(makePreferenceContext({
-      memories: [dislike("mushroom"), dislike("生抽")],
+      dislikes: [dislike("mushroom"), dislike("生抽")],
     }));
 
     expect(prefs.rejectedIngredients).toContain("mushroom");
     expect(prefs.rejectedSeasonings).toContain("light_soy_sauce");
   });
 
+  test("resolves liked foods to preferred ingredients", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      likes: [preference("chicken_breast")],
+    }));
+
+    expect(prefs.preferredIngredients).toContain("chicken_breast");
+  });
+
+  test("resolves liked cooking methods to preferred methods", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      likes: [preference("stir fry")],
+    }));
+
+    expect(prefs.preferredMethods).toContain("stir_fry");
+  });
+
+  test("resolves liked seasonings to preferred seasonings", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      likes: [preference("light_soy_sauce")],
+    }));
+
+    expect(prefs.preferredSeasonings).toContain("light_soy_sauce");
+  });
+
+  test("resolves disliked allergen groups without adding a new memory kind", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      dislikes: [dislike("seafood"), dislike("lactose intolerance"), dislike("nuts")],
+    }));
+
+    expect(prefs.allergens).toEqual(expect.arrayContaining(["seafood", "dairy", "nuts"]));
+    expect(prefs.rejectedIngredients).toEqual([]);
+  });
+
+  test("does not promote unresolved specific sauce dislikes into allergen groups", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      dislikes: [dislike("soy sauce")],
+    }));
+
+    expect(prefs.allergens).toEqual([]);
+  });
+
   test("unions table-stored rejected seasonings and ignores unresolvable dislikes", async () => {
     const prefs = await loadUserPreferences(makePreferenceContext({
-      memories: [dislike("a_food_not_in_any_catalog")],
+      dislikes: [dislike("a_food_not_in_any_catalog")],
       tableRejected: ["chili_oil"],
     }));
 
@@ -198,10 +291,11 @@ describe("loadUserPreferences", () => {
     expect(prefs.rejectedIngredients).toEqual([]);
   });
 
-  test("returns empty preferences when there are no dislikes", async () => {
-    const prefs = await loadUserPreferences(makePreferenceContext({ memories: [] }));
+  test("returns empty preferences when there are no memories", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({}));
 
     expect(prefs.rejectedSeasonings).toEqual([]);
     expect(prefs.rejectedIngredients).toEqual([]);
+    expect(prefs.preferredIngredients).toEqual([]);
   });
 });

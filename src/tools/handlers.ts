@@ -15,6 +15,7 @@ import {
   parseMealItems,
   type NutritionEstimateInput,
   type NutritionEstimateResult,
+  type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
 import {
   generateWeeklyReport,
@@ -163,7 +164,9 @@ export interface LogMealInput {
   description: string;
 }
 
-export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Promise<DietLogRow> {
+export type LogMealResult = DietLogRow & { basisWarnings?: WeightBasisDiagnostic[] };
+
+export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Promise<LogMealResult> {
   const date = requireIsoDate(input.date);
   const mealType = requireMealType(input.mealType);
   const description = requireText(input.description, "description");
@@ -172,7 +175,7 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
   assertNutritionEstimateResolved(estimate);
   const items = parseMealItems(description, ctx.catalog);
 
-  return ctx.repo.insertDietLog({
+  const row = await ctx.repo.insertDietLog({
     userId: ctx.userId,
     logDate: date,
     mealType,
@@ -186,6 +189,10 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
     fatGrams: estimate.fatGrams,
     sodiumMg: estimate.sodiumMg,
   });
+  return {
+    ...row,
+    ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+  };
 }
 
 // ── 3. Log Water ──
@@ -464,6 +471,7 @@ export interface MealCheckinResult {
   entryId: string;
   status: MealCheckinStatus;
   dietLogId?: string;
+  basisWarnings?: WeightBasisDiagnostic[];
 }
 
 export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInput): Promise<MealCheckinResult> {
@@ -487,11 +495,17 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
   let carbs = entry.carbsGrams;
   let fat = entry.fatGrams;
   let sodium = entry.sodiumMg;
+  let ingredientsJson = entry.ingredientsJson;
+  let seasoningsJson = entry.seasoningsJson;
+  let basisWarnings: WeightBasisDiagnostic[] | undefined;
 
   if (status === "substituted" && input.actualDescription) {
     description = input.actualDescription;
     const estimate = nutritionEstimate({ description }, ctx.catalog);
     assertNutritionEstimateResolved(estimate);
+    ingredientsJson = parseMealItems(description, ctx.catalog).map((item) => ({ slug: item.slug, grams: item.grams }));
+    seasoningsJson = [];
+    basisWarnings = estimate.basisWarnings;
     kcal = estimate.kcal;
     protein = estimate.proteinGrams;
     carbs = estimate.carbsGrams;
@@ -505,8 +519,8 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
     mealType,
     description,
     source: status === "followed" ? "planned" : "substituted",
-    ingredientsJson: entry.ingredientsJson,
-    seasoningsJson: entry.seasoningsJson,
+    ingredientsJson,
+    seasoningsJson,
     caloriesKcal: kcal,
     proteinGrams: protein,
     carbsGrams: carbs,
@@ -514,7 +528,12 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
     sodiumMg: sodium,
   });
 
-  return { entryId: entry.id, status, dietLogId: dietLog.id };
+  return {
+    entryId: entry.id,
+    status,
+    dietLogId: dietLog.id,
+    ...(basisWarnings !== undefined ? { basisWarnings } : {}),
+  };
 }
 
 // ── 10b. Proactive Check (scheduled check-ins and summaries) ──
@@ -705,6 +724,8 @@ export async function handleSmartGenerateMealPlan(
     startDate,
     dailyKcalTarget,
     dailyProteinTarget: bmrProfile?.proteinTargetGrams,
+    dailyFatTarget: bmrProfile?.fatTargetGrams,
+    dailyCarbsTarget: bmrProfile?.carbsTargetGrams,
     presetDishes: candidates,
     preferences,
   });

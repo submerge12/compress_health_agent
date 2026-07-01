@@ -4,6 +4,7 @@ import {
   type MealCatalog,
   parseMealItems,
   nutritionEstimate,
+  type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
 
 export interface LogMealInput {
@@ -12,20 +13,22 @@ export interface LogMealInput {
   description: string;
 }
 
+export type LogMealResult = DietLog & { basisWarnings?: WeightBasisDiagnostic[] };
+
 const MEAL_TYPES = new Set(["breakfast", "lunch", "dinner", "snack"]);
 
 export function logMeal(
   input: LogMealInput,
   repository: HealthRepository,
   catalog: MealCatalog,
-): DietLog {
+): LogMealResult {
   const fields = requireInputObject(input, "input");
   const date = requireIsoDate(fields.date);
   const mealType = requireMealType(fields.mealType);
   const description = requireText(fields.description, "description");
   const estimate = nutritionEstimate({ description }, catalog);
   assertNutritionEstimateResolved(estimate);
-  return repository.insertDietLog({
+  const row = repository.insertDietLog({
     date,
     mealType,
     description,
@@ -37,6 +40,10 @@ export function logMeal(
     sodiumMg: estimate.sodiumMg,
     micronutrients: estimate.micronutrients,
   });
+  return {
+    ...row,
+    ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+  };
 }
 
 function requireMealType(value: unknown): string {

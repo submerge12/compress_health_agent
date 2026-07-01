@@ -4,12 +4,18 @@ import { scorePlan } from "../../src/engine/meal-plan-scoring.js";
 import type { MealPlanEntry, WeeklyMealPlan } from "../../src/engine/meal-planner.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
 
-function dish(slug: string, kcal: number, proteinGrams: number, buckets: string[] = []): RecipeDish {
+function dish(
+  slug: string,
+  kcal: number,
+  proteinGrams: number,
+  buckets: string[] = [],
+  macros: Partial<RecipeDish["nutrition"]> = {},
+): RecipeDish {
   return {
     slug,
     name: slug,
     mealTypes: ["lunch", "dinner"],
-    nutrition: { kcal, proteinGrams, carbsGrams: 60, fatGrams: 20, sodiumMg: 400 },
+    nutrition: { kcal, proteinGrams, carbsGrams: 60, fatGrams: 20, sodiumMg: 400, ...macros },
     ingredients: [{ slug, grams: 100 }],
     seasonings: [],
     source: "preset",
@@ -99,5 +105,31 @@ describe("scorePlan", () => {
       .toBeGreaterThan(0);
     // Default config also flags it (red_meat + shellfish absent).
     expect(scorePlan(fishOnly, { dailyProteinTarget: 80 }).breakdown.weeklyFloor).toBeGreaterThan(0);
+  });
+
+  test("uses personalized fat and carbs gram targets instead of generic macro percentages", () => {
+    const genericSplitButTooFat = dish("generic_split", 600, 40, [], {
+      carbsGrams: 67.5,
+      fatGrams: 20,
+    });
+    const lowFatPersonalizedFit = dish("low_fat_fit", 600, 40, [], {
+      carbsGrams: 60,
+      fatGrams: 10,
+    });
+
+    const genericPlan = plan(Array.from({ length: 21 }, (_, index) =>
+      entry(Math.floor(index / 3), ["breakfast", "lunch", "dinner"][index % 3] as "breakfast" | "lunch" | "dinner", genericSplitButTooFat),
+    ));
+    const personalizedPlan = plan(Array.from({ length: 21 }, (_, index) =>
+      entry(Math.floor(index / 3), ["breakfast", "lunch", "dinner"][index % 3] as "breakfast" | "lunch" | "dinner", lowFatPersonalizedFit),
+    ));
+
+    expect(scorePlan(personalizedPlan, {
+      dailyFatTarget: 35,
+      dailyCarbsTarget: 180,
+    }).breakdown.macro).toBeLessThan(scorePlan(genericPlan, {
+      dailyFatTarget: 35,
+      dailyCarbsTarget: 180,
+    }).breakdown.macro);
   });
 });
