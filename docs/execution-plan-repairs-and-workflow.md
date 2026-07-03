@@ -133,6 +133,51 @@ framework.
 - Suggested review gates for AOH: P1 (safety — leak test), P3 (behavior-loop correctness), P4
   (embedding cost/PII posture already decided under D1).
 
+## Dependency DAG
+
+Hard edge (`──▶`): the downstream task cannot be implemented/verified before the upstream one.
+Soft edge (`┈┈▶`): implementable independently, but loses most of its value without the upstream.
+Everything with no incoming hard edge is a **root** and can start immediately, in parallel.
+
+```
+ROOTS:  W1   W6   R1   R2   R3s   R4   L25/L36(in-flight)   C1   C2
+
+W1 ┈┈▶ W2                    (more check-in data to mine)
+R3s ┈┈▶ W2                   (Chinese substitution descriptions resolve)
+W1 ┈┈▶ W5                    (adherence data makes the report question meaningful)
+
+W2 ──▶ W4                    (locked: interview removed only after behavior loop replaces it)
+C2 ──▶ W4(e2e)               (get_profile must be registered for returning-user flow via pi-harness)
+
+L25 ──▶ W3                   (fallback estimate rides the embedding client)
+
+R2 ──▶ OPS-seed              (re-seed applies refreshed allergen tags)
+R3s ──▶ OPS-seed             (same re-seed loads aliases + dedupe — batch them)
+L25/L36 ──▶ OPS-env          (db:push 0003/0004 + EMBEDDING_* env vars)
+```
+
+Isolated tasks (no edges at all): **W6, R1, R4, C1** — schedule anywhere.
+
+## Task table
+
+| Task | Doc § | Owner |
+|---|---|---|
+| W1 check-in-first logging | `simulation-repair-and-workflow-plan.md` §W1; here §P0 | CHA |
+| W6 one-question proactive checks | same §W6; here §P0 | CHA |
+| R2 allergen tags (taxonomy + seed upsert) | same §R2; here §P1 | CHA (code) |
+| R1 high-protein non-seafood presets | same §R1; here §P2 | CHA |
+| W2 behavior loop (check-in mining) | same §W2; here §P3 | CHA |
+| R3s Chinese aliases + library dedupe | same §R3 items 1–2; here §P4 | CHA (code) |
+| L25/L36 embedding fallbacks | `l25-l36-embedding-fallback-plan.md` §E1/L25/L36 | CHA (code) |
+| W3 never-lose-a-log fallback estimate | `simulation-repair-and-workflow-plan.md` §W3; here §P4 | CHA |
+| R4 plan tuning (lever/lean/tolerance) | same §R4; here §P5 | CHA |
+| W4 slim onboarding | same §W4; here §P5 | CHA |
+| W5 weekly report feeds forward | same §W5; here §P5 | CHA |
+| C1 add-dish role fields in `tools.ts` | `pi-harness-pending-changes.md` §Change 1 | pi-harness |
+| C2 register `get_profile` in `tools.ts` | `pi-harness-pending-changes.md` §Change 2 | pi-harness |
+| OPS-seed re-seed shared DB (after R2+R3s) | here §Ops runbook | pi-harness |
+| OPS-env db:push 0003/0004 + `EMBEDDING_*` (after L25/L36) | here §Ops runbook | pi-harness |
+
 ## Ops runbook (pi-harness environment, once P1/P4 land)
 
 ```bash
