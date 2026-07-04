@@ -314,4 +314,94 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
 
     expect(recalled.some((memory) => memory.subject === "pgtrgm-fuzzy-cilantro")).toBe(true);
   });
+
+  it("hybrid recall returns semantic memories that trigram recall misses", async () => {
+    const vector = (axis: number): number[] => {
+      const values = Array.from({ length: 1024 }, () => 0);
+      values[axis] = 1;
+      return values;
+    };
+    const embeddings = new Map<string, number[]>([
+      ["Avoids capsaicin heat.", vector(0)],
+      ["Prefers plain rice.", vector(1)],
+      ["mild dinner ideas", vector(0)],
+    ]);
+    const semanticRepo = createRepository(db, {
+      embeddingClient: {
+        embed: async (texts) => texts.map((text) => embeddings.get(text) ?? vector(2)),
+      },
+      embeddingModel: "mock-memory-embedding",
+    });
+
+    await semanticRepo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "capsaicin",
+      content: "Avoids capsaicin heat.",
+      confidence: 1,
+    });
+    await semanticRepo.upsertMemory({
+      userId,
+      kind: "preference",
+      subject: "rice",
+      content: "Prefers plain rice.",
+      confidence: 1,
+    });
+
+    const lexicalOnly = await repo.recallMemories(userId, "mild dinner ideas", { limit: 5 });
+    expect(lexicalOnly.some((memory) => memory.subject === "capsaicin")).toBe(false);
+
+    const recalled = await semanticRepo.recallMemories(userId, "mild dinner ideas", { limit: 5 });
+    expect(recalled[0]).toEqual(expect.objectContaining({
+      subject: "capsaicin",
+      content: "Avoids capsaicin heat.",
+    }));
+  });
+
+  it("hybrid recall dedups by subject and keeps the most recent semantic match", async () => {
+    const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
+    const semanticRepo = createRepository(db, {
+      embeddingClient: {
+        embed: async (texts) => texts.map(() => vector),
+      },
+      embeddingModel: "mock-memory-embedding",
+    });
+    const oldMemory = await semanticRepo.upsertMemory({
+      userId,
+      kind: "preference",
+      subject: "spice",
+      content: "Uses light chili oil.",
+      confidence: 1,
+    });
+    const newMemory = await semanticRepo.upsertMemory({
+      userId,
+      kind: "note",
+      subject: "spice",
+      content: "Keeps dinners gentle.",
+      confidence: 1,
+    });
+    await db.update(schema.memoryRecords)
+      .set({
+        validFrom: new Date("2020-01-01T00:00:00.000Z"),
+        lastConfirmedAt: new Date("2020-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2020-01-01T00:00:00.000Z"),
+      })
+      .where(eq(schema.memoryRecords.id, oldMemory.id));
+    await db.update(schema.memoryRecords)
+      .set({
+        validFrom: new Date("2026-07-01T00:00:00.000Z"),
+        lastConfirmedAt: new Date("2026-07-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-01T00:00:00.000Z"),
+      })
+      .where(eq(schema.memoryRecords.id, newMemory.id));
+
+    const recalled = await semanticRepo.recallMemories(userId, "gentle dinner", { limit: 5 });
+    const spiceRows = recalled.filter((memory) => memory.subject === "spice");
+
+    expect(spiceRows).toHaveLength(1);
+    expect(spiceRows[0]).toEqual(expect.objectContaining({
+      id: newMemory.id,
+      content: "Keeps dinners gentle.",
+    }));
+  });
 });

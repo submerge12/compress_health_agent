@@ -280,17 +280,48 @@ describe("logging tools", () => {
     ]);
   });
 
-  test("nutritionEstimate_whenFoodIsUnknown_returnsUnmatchedWithoutWriting", () => {
+  test("nutritionEstimate_whenFoodIsUnknown_returnsFallbackEstimateWithUncertainty", () => {
     const result = nutritionEstimate({ description: "mystery food" }, catalog);
 
     expect(result.items).toEqual([]);
-    expect(result.kcal).toBe(0);
+    expect(result.kcal).toBeGreaterThan(0);
+    expect(result.uncertain).toBe(true);
+    expect(result.fallbackEstimates).toEqual([
+      expect.objectContaining({
+        segment: "mystery food",
+        grams: expect.any(Number),
+        confidence: "low",
+      }),
+    ]);
     expect(result.unmatched).toEqual([
       {
         segment: "mystery food",
         candidates: expect.any(Array),
       },
     ]);
+    expect(() => assertNutritionEstimateResolved(result)).not.toThrow();
+  });
+
+  test("logMeal_whenFoodIsUnknown_stillWritesConservativeFallbackLog", () => {
+    const repository = createInMemoryHealthRepository();
+
+    const row = logMeal(
+      { date: "2026-06-17", mealType: "lunch", description: "mystery food 200g" },
+      repository,
+      catalog,
+    );
+
+    expect(row.kcal).toBeGreaterThan(0);
+    expect(row.items).toEqual([]);
+    expect(row.uncertain).toBe(true);
+    expect(row.fallbackEstimates).toEqual([
+      expect.objectContaining({
+        segment: "mystery food 200g",
+        grams: 200,
+        confidence: "low",
+      }),
+    ]);
+    expect(repository.listDietLogs("2026-06-17")).toHaveLength(1);
   });
 
   test("logWater_whenCupPhraseProvided_logsDefaultCupAmount", () => {

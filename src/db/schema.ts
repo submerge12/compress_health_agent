@@ -10,8 +10,11 @@ import {
   text,
   timestamp,
   unique,
-  uuid
+  uuid,
+  vector
 } from "drizzle-orm/pg-core";
+
+import { getEmbeddingDimensions } from "../embeddings/client.js";
 
 const timestamps = () => ({
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -40,6 +43,7 @@ const nutritionColumns = () => ({
 });
 
 const emptyArrayJson = sql`'[]'::jsonb`;
+const embeddingDimensions = getEmbeddingDimensions();
 
 export const compass = pgSchema("compass_health");
 
@@ -171,6 +175,9 @@ export const foodItems = compass.table("food_items", {
   availability: text("availability"),
   specialHandlingTags: jsonb("special_handling_tags").$type<string[]>().notNull().default(emptyArrayJson),
   source: text("source").notNull().default("csv"),
+  embedding: vector("embedding", { dimensions: embeddingDimensions }),
+  embeddingText: text("embedding_text"),
+  embeddingModel: text("embedding_model"),
   ...nutritionColumns(),
   ...timestamps()
 });
@@ -294,9 +301,12 @@ export const memoryRecords = compass.table("memory_records", {
   validTo: timestamp("valid_to", { withTimezone: true }),
   lastConfirmedAt: timestamp("last_confirmed_at", { withTimezone: true }).defaultNow(),
   timesReferenced: integer("times_referenced").notNull().default(0),
+  embedding: vector("embedding", { dimensions: embeddingDimensions }),
+  embeddingModel: text("embedding_model"),
   ...timestamps()
 }, (t) => [
   index("memory_records_user_status_idx").on(t.userId, t.status),
   index("memory_records_user_kind_subject_idx").on(t.userId, t.kind, t.subject),
   index("memory_records_content_norm_trgm_idx").using("gin", t.contentNorm.op("gin_trgm_ops")),
+  index("memory_records_embedding_hnsw_idx").using("hnsw", t.embedding.op("vector_cosine_ops")),
 ]);

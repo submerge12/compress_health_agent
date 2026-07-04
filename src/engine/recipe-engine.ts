@@ -56,6 +56,8 @@ export interface RecipePreferences {
   preferredIngredients?: readonly string[];
   preferredSeasonings?: readonly string[];
   preferredMethods?: readonly string[];
+  recentDishSlugs?: readonly string[];
+  avoidedDishSlugs?: readonly string[];
 }
 
 export interface RecipeTarget {
@@ -185,8 +187,10 @@ function scoreNutrients(dish: RecipeDish, targetKcal: number, targetProteinGrams
 
 function scoreRecencyPenalty(dish: RecipeDish, context: ScoreContext): number {
   const explicitPenalty = context.recentDishSlugs.has(dish.slug) ? 45 : 0;
+  const avoided = new Set((context.preferences.avoidedDishSlugs ?? []).map(normalizeToken));
+  const avoidedPenalty = avoided.has(normalizeToken(dish.slug)) ? 60 : 0;
   const servedPenalty = scoreLastServedPenalty(dish.lastServedAt, context.asOfDate);
-  return explicitPenalty + servedPenalty;
+  return explicitPenalty + avoidedPenalty + servedPenalty;
 }
 
 function scoreLastServedPenalty(lastServedAt: string | null | undefined, asOfDate?: string): number {

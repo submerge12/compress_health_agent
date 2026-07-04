@@ -1,8 +1,8 @@
 import type { DietLog, HealthRepository } from "./store.js";
 import {
   assertNutritionEstimateResolved,
+  type FallbackEstimateDiagnostic,
   type MealCatalog,
-  parseMealItems,
   nutritionEstimate,
   type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
@@ -13,7 +13,11 @@ export interface LogMealInput {
   description: string;
 }
 
-export type LogMealResult = DietLog & { basisWarnings?: WeightBasisDiagnostic[] };
+export type LogMealResult = DietLog & {
+  basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
+};
 
 const MEAL_TYPES = new Set(["breakfast", "lunch", "dinner", "snack"]);
 
@@ -32,7 +36,7 @@ export function logMeal(
     date,
     mealType,
     description,
-    items: parseMealItems(description, catalog),
+    items: estimate.items,
     kcal: estimate.kcal,
     proteinGrams: estimate.proteinGrams,
     carbsGrams: estimate.carbsGrams,
@@ -43,6 +47,8 @@ export function logMeal(
   return {
     ...row,
     ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+    ...(estimate.fallbackEstimates !== undefined ? { fallbackEstimates: estimate.fallbackEstimates } : {}),
+    ...(estimate.uncertain === true ? { uncertain: true } : {}),
   };
 }
 

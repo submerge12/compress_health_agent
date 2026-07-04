@@ -118,7 +118,14 @@ describe("food matcher L2 retrieval", () => {
     const result = nutritionEstimate({ description: "mystery food" }, catalog);
 
     expect(result.items).toEqual([]);
-    expect(result.kcal).toBe(0);
+    expect(result.kcal).toBeGreaterThan(0);
+    expect(result.uncertain).toBe(true);
+    expect(result.fallbackEstimates).toEqual([
+      expect.objectContaining({
+        segment: "mystery food",
+        confidence: "low",
+      }),
+    ]);
     expect(result.unmatched).toEqual([
       {
         segment: "mystery food",

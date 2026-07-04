@@ -28,10 +28,13 @@ name/slug/alias. Paraphrases, synonyms, EN↔ZH, and typos silently fail (the fo
 - **Matcher in the agent; governance in the harness.** L2/L3 logic lives here; the AOH harness reviews/gates
   outputs when the agent runs through it.
 - **Scope = L2 and L3.** Graph/ontology/auto-distillation deferred (Build Gate).
-- **D1 (embedding source) — OPEN, gates only the semantic steps.** Recommendation: ship lexical now
-  (in-memory trigram for L2, `pg_trgm` for L3 recall), add a **local bilingual model (e.g. bge-m3)** later as
-  the semantic fallback. Avoid an external embedding API — it breaks the profile's `network: deny` and sends
-  food/health text off-box. Keep any `embedding` column **nullable** so adding it later is non-breaking.
+- **D1 (embedding source) — DECIDED 2026-07-01: OpenAI-compatible embedding API; no local model.** Lexical
+  (in-memory trigram for L2, `pg_trgm` for L3 recall) still ships first as the fast/free path; the semantic
+  fallback embeds via an OpenAI-compatible `/v1/embeddings` endpoint. Config (env): `EMBEDDING_BASE_URL`,
+  `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIM`. Note: `network: deny` governs the agent's *tool*
+  surface, not the tool code's own provider calls (same category as the existing DeepSeek/Postgres calls); the
+  real consideration is PII egress of food text, matching the DeepSeek exposure already accepted. Embedding
+  columns are `vector(EMBEDDING_DIM)` (dimension must match the chosen model).
 
 **No-D1 rule:** every step below ships without deciding D1 **except** the two marked **(D1)**.
 
@@ -88,8 +91,9 @@ name/slug/alias. Paraphrases, synonyms, EN↔ZH, and typos silently fail (the fo
   user to pick before logging."
 
 ### L2.5 — Semantic fallback **(D1)**
-- Only when exact/alias/trigram all fall below `LOW`: embed the segment, take nearest catalog item by vector.
-  Deferred until D1 (local bge-m3). Keep `food_items` embeddable but the column nullable.
+- Only when exact/alias/trigram all fall below `LOW`: embed the segment via the OpenAI-compatible API, take the
+  nearest catalog item by vector (cosine). Precompute catalog embeddings **offline at seed/build**; embed only
+  the short user segment at runtime, and only on this fallback path. Store catalog vectors in `vector(EMBEDDING_DIM)`.
 
 ### L2.6 — Eval set
 - **File:** `tests/retrieval/food-match-eval.test.ts` (new) — ~100–200 `{description → expected slug}` bilingual
@@ -164,7 +168,8 @@ Agent-curated store with explicit recency/supersession (the Hermes / Claude-Code
   explicit `recall` tool. Start with the `recall` tool (no dynamic-prompt coupling).
 
 ### L3.6 — Embedding recall **(D1)**
-- Add the nullable `embedding` column + hybrid recall (trgm ∪ vector, dedup, recency). Deferred until D1.
+- Add the `embedding vector(EMBEDDING_DIM)` column + hybrid recall (trgm ∪ vector, dedup, recency); embed memories
+  on write via the OpenAI-compatible API.
 
 ### L3 acceptance
 - Conflict: "我不吃肉" then "我吃了鸡肉" → old record `superseded`, `recall` returns only the new active fact.
@@ -177,8 +182,8 @@ Agent-curated store with explicit recency/supersession (the Hermes / Claude-Code
 
 ## What needs D1 vs ships now
 - **Ship now (no D1):** L2.1–L2.4, L2.6, L3.1–L3.5. This is the majority and closes most of the real gap.
-- **Needs D1 (embedding source):** L2.5 and L3.6 (semantic fallbacks). Recommended D1 = local bge-m3; `embedding`
-  columns nullable.
+- **Semantic fallbacks (D1 = OpenAI-compatible API):** L2.5 and L3.6 — now unblocked. Embed via `/v1/embeddings`;
+  catalog/memory vectors in `vector(EMBEDDING_DIM)` columns; embed queries at runtime on the fallback path only.
 
 ## Execution order & gating
 1. **L2.1 → L2.4** (matcher + alias table + clarify) — verify: `pnpm typecheck && pnpm test && pnpm build`.

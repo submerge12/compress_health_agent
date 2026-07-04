@@ -11,10 +11,13 @@ import { calculateCaloriePlan } from "../engine/calorie.js";
 import type { CalorieProfile, CaloriePlan } from "../engine/types.js";
 import {
   assertNutritionEstimateResolved,
+  FALLBACK_FOOD_SLUG,
   nutritionEstimate,
-  parseMealItems,
+  nutritionEstimateWithSemanticFallback,
+  type FallbackEstimateDiagnostic,
   type NutritionEstimateInput,
   type NutritionEstimateResult,
+  type SemanticNutritionResolutionOptions,
   type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
 import {
@@ -153,7 +156,7 @@ export async function handleNutritionEstimate(
   ctx: ToolContext,
   input: NutritionEstimateInput,
 ): Promise<NutritionEstimateResult> {
-  return nutritionEstimate(input, ctx.catalog);
+  return estimateNutrition(ctx, input);
 }
 
 // ── 2. Log Meal ──
@@ -164,16 +167,19 @@ export interface LogMealInput {
   description: string;
 }
 
-export type LogMealResult = DietLogRow & { basisWarnings?: WeightBasisDiagnostic[] };
+export type LogMealResult = DietLogRow & {
+  basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
+};
 
 export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Promise<LogMealResult> {
   const date = requireIsoDate(input.date);
   const mealType = requireMealType(input.mealType);
   const description = requireText(input.description, "description");
 
-  const estimate = nutritionEstimate({ description }, ctx.catalog);
+  const estimate = await estimateNutrition(ctx, { description });
   assertNutritionEstimateResolved(estimate);
-  const items = parseMealItems(description, ctx.catalog);
 
   const row = await ctx.repo.insertDietLog({
     userId: ctx.userId,
@@ -181,7 +187,7 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
     mealType,
     description,
     source: "agent",
-    ingredientsJson: items.map((i) => ({ slug: i.slug, grams: i.grams })),
+    ingredientsJson: ingredientsJsonFromEstimate(estimate),
     seasoningsJson: [],
     caloriesKcal: estimate.kcal,
     proteinGrams: estimate.proteinGrams,
@@ -192,6 +198,8 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
   return {
     ...row,
     ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+    ...(estimate.fallbackEstimates !== undefined ? { fallbackEstimates: estimate.fallbackEstimates } : {}),
+    ...(estimate.uncertain === true ? { uncertain: true } : {}),
   };
 }
 
@@ -472,6 +480,8 @@ export interface MealCheckinResult {
   status: MealCheckinStatus;
   dietLogId?: string;
   basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
 }
 
 export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInput): Promise<MealCheckinResult> {
@@ -498,14 +508,18 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
   let ingredientsJson = entry.ingredientsJson;
   let seasoningsJson = entry.seasoningsJson;
   let basisWarnings: WeightBasisDiagnostic[] | undefined;
+  let fallbackEstimates: FallbackEstimateDiagnostic[] | undefined;
+  let uncertain: boolean | undefined;
 
   if (status === "substituted" && input.actualDescription) {
     description = input.actualDescription;
-    const estimate = nutritionEstimate({ description }, ctx.catalog);
+    const estimate = await estimateNutrition(ctx, { description });
     assertNutritionEstimateResolved(estimate);
-    ingredientsJson = parseMealItems(description, ctx.catalog).map((item) => ({ slug: item.slug, grams: item.grams }));
+    ingredientsJson = ingredientsJsonFromEstimate(estimate);
     seasoningsJson = [];
     basisWarnings = estimate.basisWarnings;
+    fallbackEstimates = estimate.fallbackEstimates;
+    uncertain = estimate.uncertain;
     kcal = estimate.kcal;
     protein = estimate.proteinGrams;
     carbs = estimate.carbsGrams;
@@ -533,7 +547,41 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
     status,
     dietLogId: dietLog.id,
     ...(basisWarnings !== undefined ? { basisWarnings } : {}),
+    ...(fallbackEstimates !== undefined ? { fallbackEstimates } : {}),
+    ...(uncertain === true ? { uncertain: true } : {}),
   };
+}
+
+function ingredientsJsonFromEstimate(estimate: NutritionEstimateResult): Record<string, unknown>[] {
+  return [
+    ...estimate.items.map((item) => ({ slug: item.slug, grams: item.grams })),
+    ...(estimate.fallbackEstimates ?? []).map((fallback) => ({
+      slug: FALLBACK_FOOD_SLUG,
+      segment: fallback.segment,
+      grams: fallback.grams,
+      estimateSource: "fallback",
+      confidence: fallback.confidence,
+    })),
+  ];
+}
+
+function semanticNutritionOptions(ctx: ToolContext): SemanticNutritionResolutionOptions | undefined {
+  if (ctx.embeddingClient === undefined) return undefined;
+  return {
+    embeddingClient: ctx.embeddingClient,
+    semanticSearch: ctx.repo,
+  };
+}
+
+async function estimateNutrition(
+  ctx: ToolContext,
+  input: NutritionEstimateInput,
+): Promise<NutritionEstimateResult> {
+  const semanticOptions = semanticNutritionOptions(ctx);
+  if (semanticOptions === undefined) {
+    return nutritionEstimate(input, ctx.catalog);
+  }
+  return nutritionEstimateWithSemanticFallback(input, ctx.catalog, semanticOptions);
 }
 
 // ── 10b. Proactive Check (scheduled check-ins and summaries) ──
@@ -650,12 +698,6 @@ export async function handleProactiveCheck(
     kcal: planned.caloriesKcal,
     proteinGrams: planned.proteinGrams,
   });
-  const message = thawItems.length === 0
-    ? checkinMessage
-    : `${checkinMessage}\n\n${renderTemplate(locale, "proactiveThawReminder", {
-      items: formatThawItems(thawItems, locale),
-    })}`;
-
   return {
     kind: "meal_checkin",
     locale,
@@ -668,7 +710,7 @@ export async function handleProactiveCheck(
       proteinGrams: planned.proteinGrams,
     },
     thawItems,
-    message,
+    message: checkinMessage,
   };
 }
 
@@ -715,7 +757,7 @@ export async function handleSmartGenerateMealPlan(
   const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
-    loadUserPreferences(ctx),
+    loadUserPreferences(ctx, { asOfDate: startDate }),
   ]);
 
   const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
@@ -747,10 +789,11 @@ export async function handleSmartRecipeRecommend(
     throw new RangeError("mealType must be breakfast, lunch, or dinner");
   }
 
+  const asOfDate = localDateIso(new Date());
   const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
-    loadUserPreferences(ctx),
+    loadUserPreferences(ctx, { asOfDate }),
   ]);
 
   const dailyTarget = bmrProfile?.targetKcal ?? 2000;
@@ -762,6 +805,7 @@ export async function handleSmartRecipeRecommend(
     maxKcal,
     candidates: [...candidates],
     preferences,
+    recentDishSlugs: preferences.recentDishSlugs,
   });
 }
 
@@ -859,22 +903,6 @@ function thawIngredientFor(
     ...(typeof grams === "number" && Number.isFinite(grams) ? { grams } : {}),
     ...(food?.name ? { name: food.name } : {}),
   };
-}
-
-function formatThawItems(items: ProactiveThawItem[], locale: Language): string {
-  const itemSeparator = locale === "zh" ? "；" : "; ";
-  const ingredientSeparator = locale === "zh" ? "、" : ", ";
-
-  return items
-    .map((item) => {
-      const ingredientNames = item.ingredients
-        .map((ingredient) => ingredient.name ?? ingredient.slug)
-        .join(ingredientSeparator);
-      return locale === "zh"
-        ? `${item.dishName}（${ingredientNames}）`
-        : `${item.dishName} (${ingredientNames})`;
-    })
-    .join(itemSeparator);
 }
 
 function tomorrow(): string {

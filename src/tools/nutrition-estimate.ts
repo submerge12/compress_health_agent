@@ -1,5 +1,6 @@
 import { resolveNaturalPortion } from "../engine/natural-units.js";
 import { aggregateNutrition } from "../engine/nutrition.js";
+import type { EmbeddingClient } from "../embeddings/client.js";
 import type {
   FoodPortionRecord,
   NaturalUnitRecord,
@@ -53,16 +54,48 @@ export interface WeightBasisDiagnostic {
   message: string;
 }
 
+export interface FallbackEstimateDiagnostic {
+  segment: string;
+  grams: number;
+  kcal: number;
+  proteinGrams: number;
+  carbsGrams: number;
+  fatGrams: number;
+  sodiumMg: number;
+  confidence: "low";
+  assumption: string;
+}
+
 export interface NutritionEstimateResult extends NutrientSnapshot {
   description: string;
   items: NutritionEntry[];
   needsConfirmation?: FoodResolutionDiagnostic[];
   unmatched?: FoodResolutionDiagnostic[];
   basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
 }
 
 export interface NutritionResolutionOptions {
   requireWeightBasis?: boolean;
+}
+
+export interface SemanticFoodCandidate {
+  slug: string;
+  score: number;
+  label?: string;
+}
+
+export interface SemanticFoodSearch {
+  findFoodCandidatesByEmbedding(
+    queryEmbedding: readonly number[],
+    limit: number,
+  ): Promise<SemanticFoodCandidate[]>;
+}
+
+export interface SemanticNutritionResolutionOptions {
+  embeddingClient: EmbeddingClient;
+  semanticSearch: SemanticFoodSearch;
 }
 
 interface MatchedFood {
@@ -78,6 +111,16 @@ const HIGH_CONFIDENCE = 0.55;
 const LOW_CONFIDENCE = 0.25;
 const AMBIGUITY_DELTA = 0.001;
 const CANDIDATE_LIMIT = 3;
+export const FALLBACK_FOOD_SLUG = "unknown_food";
+const FALLBACK_DEFAULT_GRAMS = 350;
+const FALLBACK_NUTRITION_PER_100G = {
+  kcal: 180,
+  proteinGrams: 8,
+  carbsGrams: 18,
+  fatGrams: 8,
+  sodiumMg: 600,
+};
+const FALLBACK_GRAMS_PATTERN = /(\d+(?:\.\d+)?)\s*(?:g|grams?|\u514b)/i;
 
 export function nutritionEstimate(
   input: NutritionEstimateInput,
@@ -86,22 +129,18 @@ export function nutritionEstimate(
   const fields = requireInputObject(input, "input");
   const description = requireText(fields.description, "description");
   const resolution = resolveMealItems(description, catalog);
-  const items = resolution.items;
-  const aggregate = aggregateNutrition({ foods: items, foodRecords: catalog.foods, requireWeightType: true });
-  return {
-    description,
-    items,
-    ...snapshotFromTotals(aggregate.total),
-    ...(resolution.needsConfirmation.length > 0
-      ? { needsConfirmation: resolution.needsConfirmation }
-      : {}),
-    ...(resolution.unmatched.length > 0
-      ? { unmatched: resolution.unmatched }
-      : {}),
-    ...(resolution.basisWarnings.length > 0
-      ? { basisWarnings: resolution.basisWarnings }
-      : {}),
-  };
+  return nutritionEstimateFromResolution(description, catalog, resolution);
+}
+
+export async function nutritionEstimateWithSemanticFallback(
+  input: NutritionEstimateInput,
+  catalog: MealCatalog,
+  options: SemanticNutritionResolutionOptions,
+): Promise<NutritionEstimateResult> {
+  const fields = requireInputObject(input, "input");
+  const description = requireText(fields.description, "description");
+  const resolution = await resolveMealItemsWithSemanticFallback(description, catalog, options);
+  return nutritionEstimateFromResolution(description, catalog, resolution);
 }
 
 export function parseMealItems(
@@ -122,6 +161,25 @@ export function parseMealItems(
   return resolution.items;
 }
 
+export async function parseMealItemsWithSemanticFallback(
+  description: string,
+  catalog: MealCatalog,
+  semanticOptions: SemanticNutritionResolutionOptions,
+  options: NutritionResolutionOptions = {},
+): Promise<NutritionEntry[]> {
+  const resolution = await resolveMealItemsWithSemanticFallback(description, catalog, semanticOptions);
+  if (resolution.needsConfirmation.length > 0 || resolution.unmatched.length > 0) {
+    throw new RangeError("description includes ambiguous or unrecognized food");
+  }
+  if (options.requireWeightBasis === true && resolution.basisWarnings.length > 0) {
+    throw new RangeError("description needs weight basis confirmation");
+  }
+  if (resolution.items.length === 0) {
+    throw new RangeError("description must include at least one recognized food");
+  }
+  return resolution.items;
+}
+
 export function assertNutritionEstimateResolved(
   result: NutritionEstimateResult,
   options: NutritionResolutionOptions = {},
@@ -129,7 +187,9 @@ export function assertNutritionEstimateResolved(
   if ((result.needsConfirmation?.length ?? 0) > 0) {
     throw new RangeError("meal description needs food confirmation before logging");
   }
-  if ((result.unmatched?.length ?? 0) > 0) {
+  const unmatchedCount = result.unmatched?.length ?? 0;
+  const fallbackCount = result.fallbackEstimates?.length ?? 0;
+  if (unmatchedCount > fallbackCount) {
     throw new RangeError("meal description includes unrecognized food");
   }
   if (options.requireWeightBasis === true && (result.basisWarnings?.length ?? 0) > 0) {
@@ -170,6 +230,36 @@ function resolveMealItems(description: string, catalog: MealCatalog): MealResolu
   return { items, needsConfirmation, unmatched, basisWarnings };
 }
 
+async function resolveMealItemsWithSemanticFallback(
+  description: string,
+  catalog: MealCatalog,
+  options: SemanticNutritionResolutionOptions,
+): Promise<MealResolution> {
+  validateCatalog(catalog);
+  const safeDescription = requireText(description, "description");
+  const segments = safeDescription.split(SPLIT_PATTERN).map((part) => part.trim()).filter(Boolean);
+  const items: NutritionEntry[] = [];
+  const needsConfirmation: FoodResolutionDiagnostic[] = [];
+  const unmatched: FoodResolutionDiagnostic[] = [];
+  const basisWarnings: WeightBasisDiagnostic[] = [];
+
+  for (const segment of segments) {
+    const resolution = await parseMealSegmentWithSemanticFallback(segment, catalog, options);
+    if (resolution.kind === "matched") {
+      items.push(resolution.item);
+      if (resolution.basisWarning !== undefined) {
+        basisWarnings.push(resolution.basisWarning);
+      }
+    } else if (resolution.kind === "needs_confirmation") {
+      needsConfirmation.push({ segment, candidates: resolution.candidates });
+    } else {
+      unmatched.push({ segment, candidates: resolution.candidates });
+    }
+  }
+
+  return { items, needsConfirmation, unmatched, basisWarnings };
+}
+
 type SegmentResolution =
   | { kind: "matched"; item: NutritionEntry; basisWarning?: WeightBasisDiagnostic }
   | { kind: "needs_confirmation"; candidates: FoodMatchCandidateSummary[] }
@@ -191,6 +281,61 @@ function parseMealSegment(segment: string, catalog: MealCatalog): SegmentResolut
   } catch {
     return { kind: "unmatched", candidates: summarizeCandidates(candidates) };
   }
+}
+
+async function parseMealSegmentWithSemanticFallback(
+  segment: string,
+  catalog: MealCatalog,
+  options: SemanticNutritionResolutionOptions,
+): Promise<SegmentResolution> {
+  let candidates = rankFoodCandidates(segment, catalog, CANDIDATE_LIMIT);
+  const [bestLexical] = candidates;
+  if (bestLexical === undefined || bestLexical.score < LOW_CONFIDENCE) {
+    const semanticCandidates = await rankSemanticFoodCandidates(segment, catalog, options);
+    if (semanticCandidates.length > 0) {
+      candidates = semanticCandidates;
+    }
+  }
+
+  const match = selectFoodMatch(candidates);
+  if (match.kind !== "matched") return match;
+
+  try {
+    const portion = extractPortion(segment, match.label);
+    const resolved = resolveNaturalPortion(portion, match.food, catalog.naturalUnits);
+    return {
+      kind: "matched",
+      item: { slug: match.food.slug, grams: resolved.grams },
+      basisWarning: basisWarningForSegment(segment, match.food, resolved.source),
+    };
+  } catch {
+    return { kind: "unmatched", candidates: summarizeCandidates(candidates) };
+  }
+}
+
+async function rankSemanticFoodCandidates(
+  segment: string,
+  catalog: MealCatalog,
+  options: SemanticNutritionResolutionOptions,
+): Promise<FoodMatchCandidate[]> {
+  const [queryEmbedding] = await options.embeddingClient.embed([segment]);
+  if (queryEmbedding === undefined) return [];
+  const foodsBySlug = new Map(catalog.foods.map((food) => [food.slug, food]));
+  const rows = await options.semanticSearch.findFoodCandidatesByEmbedding(queryEmbedding, CANDIDATE_LIMIT);
+
+  const candidates: FoodMatchCandidate[] = [];
+  for (const row of rows) {
+    const food = foodsBySlug.get(row.slug);
+    if (food === undefined || row.score <= 0) continue;
+    candidates.push({
+        food,
+        label: row.label ?? displayLabelForFood(food),
+        score: roundScore(row.score),
+        matchType: "semantic" as const,
+    });
+  }
+
+  return candidates.sort((left, right) => right.score - left.score || left.food.slug.localeCompare(right.food.slug));
 }
 
 function basisWarningForSegment(
@@ -254,6 +399,34 @@ function extractPortion(segment: string, label: string): string | null {
   return null;
 }
 
+function nutritionEstimateFromResolution(
+  description: string,
+  catalog: MealCatalog,
+  resolution: MealResolution,
+): NutritionEstimateResult {
+  const items = resolution.items;
+  const aggregate = aggregateNutrition({ foods: items, foodRecords: catalog.foods, requireWeightType: true });
+  const fallbackEstimates = resolution.unmatched.map(fallbackEstimateForSegment);
+  const totals = addSnapshots(snapshotFromTotals(aggregate.total), snapshotFromFallbackEstimates(fallbackEstimates));
+  return {
+    description,
+    items,
+    ...totals,
+    ...(resolution.needsConfirmation.length > 0
+      ? { needsConfirmation: resolution.needsConfirmation }
+      : {}),
+    ...(resolution.unmatched.length > 0
+      ? { unmatched: resolution.unmatched }
+      : {}),
+    ...(resolution.basisWarnings.length > 0
+      ? { basisWarnings: resolution.basisWarnings }
+      : {}),
+    ...(fallbackEstimates.length > 0
+      ? { fallbackEstimates, uncertain: true }
+      : {}),
+  };
+}
+
 function snapshotFromTotals(total: NutrientSnapshot): NutrientSnapshot {
   return {
     kcal: total.kcal,
@@ -263,6 +436,82 @@ function snapshotFromTotals(total: NutrientSnapshot): NutrientSnapshot {
     sodiumMg: total.sodiumMg,
     micronutrients: { ...total.micronutrients },
   };
+}
+
+function fallbackEstimateForSegment(diagnostic: FoodResolutionDiagnostic): FallbackEstimateDiagnostic {
+  const grams = fallbackGrams(diagnostic.segment);
+  const scale = grams / 100;
+  return {
+    segment: diagnostic.segment,
+    grams,
+    kcal: Math.round(FALLBACK_NUTRITION_PER_100G.kcal * scale),
+    proteinGrams: roundTo(FALLBACK_NUTRITION_PER_100G.proteinGrams * scale, 1),
+    carbsGrams: roundTo(FALLBACK_NUTRITION_PER_100G.carbsGrams * scale, 1),
+    fatGrams: roundTo(FALLBACK_NUTRITION_PER_100G.fatGrams * scale, 1),
+    sodiumMg: Math.round(FALLBACK_NUTRITION_PER_100G.sodiumMg * scale),
+    confidence: "low",
+    assumption: "Conservative generic meal estimate; refine when the food can be identified.",
+  };
+}
+
+function fallbackGrams(segment: string): number {
+  const grams = segment.match(FALLBACK_GRAMS_PATTERN);
+  if (grams !== null) {
+    return Math.max(1, Math.round(Number(grams[1])));
+  }
+  return FALLBACK_DEFAULT_GRAMS;
+}
+
+function snapshotFromFallbackEstimates(estimates: readonly FallbackEstimateDiagnostic[]): NutrientSnapshot {
+  return estimates.reduce<NutrientSnapshot>((total, estimate) => addSnapshots(total, {
+    kcal: estimate.kcal,
+    proteinGrams: estimate.proteinGrams,
+    carbsGrams: estimate.carbsGrams,
+    fatGrams: estimate.fatGrams,
+    sodiumMg: estimate.sodiumMg,
+    micronutrients: {},
+  }), zeroSnapshot());
+}
+
+function addSnapshots(left: NutrientSnapshot, right: NutrientSnapshot): NutrientSnapshot {
+  return {
+    kcal: left.kcal + right.kcal,
+    proteinGrams: roundTo(left.proteinGrams + right.proteinGrams, 1),
+    carbsGrams: roundTo(left.carbsGrams + right.carbsGrams, 1),
+    fatGrams: roundTo(left.fatGrams + right.fatGrams, 1),
+    sodiumMg: left.sodiumMg + right.sodiumMg,
+    micronutrients: {
+      ...left.micronutrients,
+      ...Object.fromEntries(Object.entries(right.micronutrients).map(([key, value]) => [
+        key,
+        roundTo((left.micronutrients[key] ?? 0) + value, 2),
+      ])),
+    },
+  };
+}
+
+function zeroSnapshot(): NutrientSnapshot {
+  return {
+    kcal: 0,
+    proteinGrams: 0,
+    carbsGrams: 0,
+    fatGrams: 0,
+    sodiumMg: 0,
+    micronutrients: {},
+  };
+}
+
+function roundTo(value: number, digits: number): number {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
+
+function displayLabelForFood(food: FoodCatalogRecord): string {
+  return food.nameZh ?? food.name ?? food.slug;
+}
+
+function roundScore(value: number): number {
+  return Math.round(value * 1000) / 1000;
 }
 
 function validateCatalog(catalog: MealCatalog): void {

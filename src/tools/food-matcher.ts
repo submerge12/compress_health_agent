@@ -1,6 +1,6 @@
 import type { MealCatalog, FoodCatalogRecord } from "./nutrition-estimate.js";
 
-export type FoodMatchType = "exact" | "alias" | "fuzzy";
+export type FoodMatchType = "exact" | "alias" | "fuzzy" | "semantic";
 
 export interface FoodMatchCandidate {
   food: FoodCatalogRecord;
@@ -198,6 +198,7 @@ function compareCandidates(left: FoodMatchCandidate, right: FoodMatchCandidate):
 function typeRank(type: FoodMatchType): number {
   if (type === "exact") return 3;
   if (type === "alias") return 2;
+  if (type === "semantic") return 1;
   return 1;
 }
 

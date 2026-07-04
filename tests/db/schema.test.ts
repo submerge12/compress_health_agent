@@ -3,6 +3,8 @@ import { describe, expect, test } from "vitest";
 
 import * as schema from "../../src/db/schema.js";
 import {
+  dedupeFoodLibraryRows,
+  loadFoodAliasesFromCsv,
   loadFoodItemsFromCsv,
   loadNaturalUnitsFromCsv,
   loadSeasoningsFromCsv,
@@ -87,6 +89,10 @@ describe("database schema", () => {
     }
   });
 
+  test("test_food_items_exposes_semantic_embedding_column", () => {
+    expect(schema.foodItems).toHaveProperty("embedding");
+  });
+
   test("test_user_dishes_exposes_side_composition_columns", () => {
     expect(schema.userDishes).toHaveProperty("role");
     expect(schema.userDishes).toHaveProperty("sideKind");
@@ -95,6 +101,10 @@ describe("database schema", () => {
 
   test("test_memory_records_exposes_pg_trgm_normalized_column", () => {
     expect(schema.memoryRecords).toHaveProperty("contentNorm");
+  });
+
+  test("test_memory_records_exposes_semantic_embedding_column", () => {
+    expect(schema.memoryRecords).toHaveProperty("embedding");
   });
 
   test("test_connection_module_imports_without_requiring_a_live_query", async () => {
@@ -135,6 +145,41 @@ describe("seed csv helpers", () => {
         sodiumMg: 74
       })
     ]);
+  });
+
+  test("test_loadFoodAliasesFromCsv_expands_alias_column_into_food_alias_rows", () => {
+    const csv = [
+      "slug,name,name_zh,aliases",
+      "chicken_breast,Chicken breast,鸡胸脯肉,鸡胸肉|鸡胸",
+      "brown_rice,Brown rice,糙米,"
+    ].join("\n");
+
+    expect(loadFoodAliasesFromCsv(csv)).toEqual([
+      { slug: "chicken_breast", alias: "鸡胸肉", locale: "zh" },
+      { slug: "chicken_breast", alias: "鸡胸", locale: "zh" },
+    ]);
+  });
+
+  test("test_dedupeFoodLibraryRows_skips_rows_matching_curated_labels_or_aliases", () => {
+    const curatedRows = loadFoodItemsFromCsv([
+      "slug,name,name_zh,category,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "chicken_breast,Chicken breast,鸡胸脯肉,poultry,118,19.4,2.5,5,34.4"
+    ].join("\n"));
+    const curatedAliases = loadFoodAliasesFromCsv([
+      "slug,name,name_zh,aliases",
+      "chicken_breast,Chicken breast,鸡胸脯肉,鸡胸肉|鸡胸"
+    ].join("\n"));
+    const libraryRows = loadFoodItemsFromCsv([
+      "slug,name_zh,name_en,category_zh,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "xlsx_1025,鸡胸脯肉,鸡胸脯肉,鸡,118,19.4,2.5,5,34.4",
+      "xlsx_0545,蘑菇,蘑菇（鲜蘑）,菌类,24,2.7,4.1,0.1,8.3"
+    ].join("\n"));
+
+    const result = dedupeFoodLibraryRows(curatedRows, curatedAliases, libraryRows);
+
+    expect(result.foodItems.map((row) => row.slug)).toEqual(["xlsx_0545"]);
+    expect(result.skippedCount).toBe(1);
+    expect(result.aliases).toEqual([]);
   });
 
   test("test_loadFoodItemsFromCsv_normalizes_phase3_metadata_columns", () => {
@@ -197,6 +242,28 @@ describe("seed csv helpers", () => {
       weightType: "dry",
     });
     expect(bySlug.get("red_bean")?.executionBuckets).not.toContain("soy_product");
+  });
+
+  test("test_loadFoodItemsFromCsv_infers_allergen_tags_from_chinese_library_fields", () => {
+    const csv = [
+      "slug,name_zh,name_en,category_code,category_zh,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "xlsx_fish,\u9c88\u9c7c,Sea bream,121,\u9c7c,100,20,0,2,60",
+      "xlsx_shrimp,\u57fa\u56f4\u867e,Shrimp,122,\u867e,100,18,1,1,170",
+      "xlsx_crab,\u68ad\u5b50\u87f9,Crab,123,\u87f9,100,17,1,1,240",
+      "xlsx_milk,\u725b\u5976,Milk,101,\u6db2\u6001\u4e73,60,3,5,3,40",
+      "xlsx_tofu,\u8c46\u8150,Tofu,031,\u5927\u8c46,80,8,3,4,10",
+      "xlsx_red_bean,\u8d64\u8c46,Red bean,033,\u8d64\u8c46,324,20,63,1,12",
+      "xlsx_almond,\u674f\u4ec1,Almond,071,\u6811\u575a\u679c,580,21,22,50,1",
+    ].join("\n");
+    const bySlug = new Map(loadFoodItemsFromCsv(csv).map((item) => [item.slug, item]));
+
+    expect(bySlug.get("xlsx_fish")?.allergenTags).toEqual(["fish", "seafood"]);
+    expect(bySlug.get("xlsx_shrimp")?.allergenTags).toEqual(["seafood", "shellfish", "shrimp"]);
+    expect(bySlug.get("xlsx_crab")?.allergenTags).toEqual(["seafood", "shellfish"]);
+    expect(bySlug.get("xlsx_milk")?.allergenTags).toEqual(["dairy"]);
+    expect(bySlug.get("xlsx_tofu")?.allergenTags).toEqual(["soy"]);
+    expect(bySlug.get("xlsx_red_bean")?.allergenTags).toEqual([]);
+    expect(bySlug.get("xlsx_almond")?.allergenTags).toEqual(["nuts"]);
   });
 
   test("test_loadSeasoningsFromCsv_normalizes_servings_and_sodium", () => {
