@@ -1,7 +1,9 @@
 import { describe, expect, test } from "vitest";
 
 import { dishBucketsRoles } from "../../src/engine/classification.js";
+import { filterUsableCandidates } from "../../src/engine/meal-planner.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
+import { loadFoodItemsFromCsv } from "../../src/db/seed.js";
 import type { FoodCatalogRecord } from "../../src/tools/nutrition-estimate.js";
 
 function food(overrides: Partial<FoodCatalogRecord> & Pick<FoodCatalogRecord, "slug">): FoodCatalogRecord {
@@ -117,5 +119,34 @@ describe("dishBucketsRoles", () => {
       cookingDifficulties: [],
       availabilityTags: [],
     });
+  });
+
+  test("library seafood allergen tags exclude user dishes for seafood allergy", () => {
+    const [libraryShrimp] = loadFoodItemsFromCsv([
+      "slug,name_zh,name_en,category_code,category_zh,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "xlsx_library_shrimp,\u57fa\u56f4\u867e,Shrimp,122,\u867e,100,18,1,1,170",
+    ].join("\n"));
+    if (libraryShrimp === undefined) {
+      throw new Error("Expected library shrimp seed row.");
+    }
+    const candidate = dish([{ slug: "xlsx_library_shrimp", grams: 120 }]);
+    const classification = dishBucketsRoles(candidate, {
+      foods: [
+        food({
+          slug: libraryShrimp.slug,
+          name: libraryShrimp.name,
+          category: libraryShrimp.category,
+          allergenTags: libraryShrimp.allergenTags,
+        }),
+      ],
+      naturalUnits: [],
+    });
+    const classifiedCandidate: RecipeDish = {
+      ...candidate,
+      allergenTags: classification.allergenTags,
+    };
+
+    expect(classification.allergenTags).toEqual(["seafood", "shellfish", "shrimp"]);
+    expect(filterUsableCandidates([classifiedCandidate], { allergens: ["seafood"] })).toEqual([]);
   });
 });

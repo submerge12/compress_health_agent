@@ -110,7 +110,7 @@ function food(slug: string, name: string, category: string) {
 }
 
 describe("handleProactiveCheck", () => {
-  test("returns an English meal check-in and derives thaw items from food categories", async () => {
+  test("returns an English meal check-in and keeps thaw items out of the one-question message", async () => {
     const ctx = makeContext({
       "2026-06-25": [
         mealPlanEntry({
@@ -154,7 +154,7 @@ describe("handleProactiveCheck", () => {
       ingredients: [{ slug: "future_meat", grams: 140, category: "meat", name: "Future meat" }],
     });
     expect(result.message).toContain("Meal check-in");
-    expect(result.message).toContain("🧊 Thaw reminder");
+    expect(result.message).not.toContain("Thaw reminder");
     expect(result.message).not.toContain("Past breakfast");
   });
 
@@ -200,7 +200,7 @@ describe("handleProactiveCheck", () => {
     expect(result.kind).toBe("meal_checkin");
     expect(result.thawItems).toHaveLength(1);
     expect(result.thawItems[0]?.entryId).toBe("tomorrow-lunch");
-    expect(result.message).toContain("Tomorrow shrimp");
+    expect(result.message).not.toContain("Tomorrow shrimp");
   });
 
   test("late-night check returns localized daily summary for yesterday", async () => {

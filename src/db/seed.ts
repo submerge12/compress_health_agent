@@ -4,7 +4,7 @@ import { sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as dbSchema from "./schema.js";
-import { foodItems, naturalUnits, seasonings } from "./schema.js";
+import { foodAliases, foodItems, naturalUnits, seasonings } from "./schema.js";
 import {
   allergenTagsForFood,
   frequencyHintForFood,
@@ -53,6 +53,12 @@ export interface FoodItemSeed extends NutritionSeed {
   source: string;
 }
 
+export interface FoodAliasSeed {
+  slug: string;
+  alias: string;
+  locale?: string;
+}
+
 export interface SeasoningSeed {
   slug: string;
   name: string;
@@ -88,8 +94,15 @@ export interface SeedCsvPaths {
 
 export interface SeedCounts {
   foodItems: number;
+  foodAliases: number;
   seasonings: number;
   naturalUnits: number;
+}
+
+export interface FoodLibraryDedupeResult {
+  foodItems: FoodItemSeed[];
+  aliases: FoodAliasSeed[];
+  skippedCount: number;
 }
 
 export type SeedDatabase = PostgresJsDatabase<typeof dbSchema>;
@@ -253,18 +266,27 @@ function nutritionFromRow(row: CsvRow): NutritionSeed {
 
 function toFoodItemSeed(row: CsvRow): FoodItemSeed {
   const slug = requiredText(row, ["slug", "food_slug"], "food slug");
-  const category = optionalText(row, ["category_en", "category", "group"]);
+  const name = optionalText(row, ["name_en", "name", "food_name"]) ?? slug;
+  const nameZh = optionalText(row, ["name_zh", "zh_name"]);
+  const category = optionalText(row, ["category_en", "category", "group"]) ??
+    optionalText(row, ["category_zh", "category_code"]);
+  const allergenSignal = [
+    name,
+    nameZh,
+    optionalText(row, ["category_zh"]),
+    optionalText(row, ["category_code"]),
+  ].filter((value): value is string => value !== undefined).join(" ");
   const defaults = defaultFoodClassification(slug, category);
 
   return {
     slug,
-    name: optionalText(row, ["name_en", "name", "food_name"]) ?? slug,
-    nameZh: optionalText(row, ["name_zh", "zh_name"]),
+    name,
+    nameZh,
     category,
     executionBuckets: listValue(row, ["execution_buckets", "buckets"]) ?? defaults.executionBuckets,
     roles: listValue(row, ["roles", "execution_roles"]) ?? defaults.roles,
     weeklyFloor: numberValue(row, ["weekly_floor"], defaults.weeklyFloor),
-    allergenTags: listValue(row, ["allergen_tags", "allergens"]) ?? allergenTagsForFood(slug, category),
+    allergenTags: listValue(row, ["allergen_tags", "allergens"]) ?? allergenTagsForFood(slug, category, allergenSignal),
     weightType: weightTypeValue(row, ["weight_type", "weightType"], inferWeightType(slug, category)),
     frequencyHint: optionalText(row, ["frequency_hint", "frequency"]) ?? frequencyHintForFood(slug),
     cookingDifficulty: optionalText(row, ["cooking_difficulty", "difficulty"]),
@@ -370,6 +392,72 @@ export function loadFoodItemsFromCsv(csv: string): FoodItemSeed[] {
     .sort((left: FoodItemSeed, right: FoodItemSeed) => left.slug.localeCompare(right.slug));
 }
 
+export function loadFoodAliasesFromCsv(csv: string): FoodAliasSeed[] {
+  return parseCsv(csv).flatMap(toFoodAliasSeeds);
+}
+
+export function dedupeFoodLibraryRows(
+  curatedRows: readonly FoodItemSeed[],
+  curatedAliases: readonly FoodAliasSeed[],
+  libraryRows: readonly FoodItemSeed[],
+): FoodLibraryDedupeResult {
+  const labelsBySlug = new Map<string, Set<string>>();
+  const labelOwners = new Map<string, string | null>();
+
+  const registerLabel = (slug: string, label: string | undefined): void => {
+    const key = labelKey(label);
+    if (key === undefined) return;
+    const existingOwner = labelOwners.get(key);
+    if (existingOwner === undefined) {
+      labelOwners.set(key, slug);
+    } else if (existingOwner !== slug) {
+      labelOwners.set(key, null);
+    }
+
+    const labels = labelsBySlug.get(slug) ?? new Set<string>();
+    labels.add(key);
+    labelsBySlug.set(slug, labels);
+  };
+
+  for (const row of curatedRows) {
+    for (const label of foodLabels(row, true)) {
+      registerLabel(row.slug, label);
+    }
+  }
+  for (const alias of curatedAliases) {
+    registerLabel(alias.slug, alias.alias);
+  }
+
+  const kept: FoodItemSeed[] = [];
+  const aliases: FoodAliasSeed[] = [];
+  let skippedCount = 0;
+
+  for (const row of libraryRows) {
+    const owner = findLibraryOwner(row, labelOwners);
+    if (owner === undefined) {
+      kept.push(row);
+      continue;
+    }
+
+    skippedCount += 1;
+    const knownLabels = labelsBySlug.get(owner) ?? new Set<string>();
+    labelsBySlug.set(owner, knownLabels);
+
+    for (const alias of foodLabels(row, false)) {
+      const key = labelKey(alias);
+      if (key === undefined || knownLabels.has(key)) continue;
+      knownLabels.add(key);
+      aliases.push({
+        slug: owner,
+        alias,
+        locale: aliasLocale(alias),
+      });
+    }
+  }
+
+  return { foodItems: kept, aliases, skippedCount };
+}
+
 export function loadSeasoningsFromCsv(csv: string): SeasoningSeed[] {
   return parseCsv(csv)
     .map(toSeasoningSeed)
@@ -391,15 +479,18 @@ export async function readCsvFile(path: string): Promise<string> {
 
 export async function seedReferenceData(database: SeedDatabase, csv: SeedCsvBundle): Promise<SeedCounts> {
   const foodRows = csv.foodItems === undefined ? [] : loadFoodItemsFromCsv(csv.foodItems);
+  const foodAliasRows = csv.foodItems === undefined ? [] : loadFoodAliasesFromCsv(csv.foodItems);
   const seasoningRows = csv.seasonings === undefined ? [] : loadSeasoningsFromCsv(csv.seasonings);
   const unitRows = csv.naturalUnits === undefined ? [] : loadNaturalUnitsFromCsv(csv.naturalUnits);
 
   await insertFoodItems(database, foodRows);
+  await insertFoodAliases(database, foodAliasRows);
   await insertSeasonings(database, seasoningRows);
   await insertNaturalUnits(database, unitRows);
 
   return {
     foodItems: foodRows.length,
+    foodAliases: foodAliasRows.length,
     seasonings: seasoningRows.length,
     naturalUnits: unitRows.length
   };
@@ -457,6 +548,14 @@ async function insertFoodItems(database: SeedDatabase, rows: FoodItemSeed[]): Pr
   });
 }
 
+export async function insertFoodAliases(database: SeedDatabase, rows: FoodAliasSeed[]): Promise<void> {
+  if (rows.length === 0) {
+    return;
+  }
+
+  await database.insert(foodAliases).values(rows).onConflictDoNothing();
+}
+
 async function insertSeasonings(database: SeedDatabase, rows: SeasoningSeed[]): Promise<void> {
   if (rows.length === 0) {
     return;
@@ -471,4 +570,70 @@ async function insertNaturalUnits(database: SeedDatabase, rows: NaturalUnitSeed[
   }
 
   await database.insert(naturalUnits).values(rows).onConflictDoNothing();
+}
+
+function toFoodAliasSeeds(row: CsvRow): FoodAliasSeed[] {
+  const aliases = listValue(row, ["aliases", "food_aliases"]) ?? [];
+  if (aliases.length === 0) return [];
+
+  const slug = requiredText(row, ["slug", "food_slug"], "food slug");
+  const seen = new Set<string>();
+  const rows: FoodAliasSeed[] = [];
+  for (const alias of aliases) {
+    const key = labelKey(alias);
+    if (key === undefined || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      slug,
+      alias,
+      locale: aliasLocale(alias),
+    });
+  }
+  return rows;
+}
+
+function foodLabels(row: FoodItemSeed, includeSlug: boolean): string[] {
+  return uniqueText([
+    includeSlug ? row.slug : undefined,
+    includeSlug ? row.slug.replace(/_/g, " ") : undefined,
+    row.name,
+    row.nameZh,
+  ]);
+}
+
+function findLibraryOwner(
+  row: FoodItemSeed,
+  labelOwners: ReadonlyMap<string, string | null>,
+): string | undefined {
+  for (const label of foodLabels(row, true)) {
+    const owner = labelOwners.get(labelKey(label) ?? "");
+    if (owner !== undefined && owner !== null) {
+      return owner;
+    }
+  }
+  return undefined;
+}
+
+function uniqueText(values: readonly (string | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    const key = labelKey(trimmed);
+    if (trimmed === undefined || key === undefined || seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function labelKey(value: string | undefined): string | undefined {
+  const key = value?.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
+  return key ? key : undefined;
+}
+
+function aliasLocale(value: string): string | undefined {
+  if (/\p{Script=Han}/u.test(value)) return "zh";
+  if (/[a-z]/i.test(value)) return "en";
+  return undefined;
 }

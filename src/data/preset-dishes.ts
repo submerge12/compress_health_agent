@@ -220,6 +220,53 @@ export const presetDishes: readonly RecipeDish[] = [
 
   // ── Plant-protein additions (tofu + soy milk) ──
   {
+    slug: "black_pepper_chicken_breast",
+    name: "Black pepper chicken breast",
+    mealTypes: ["lunch", "dinner"],
+    role: "main",
+    selfContained: true,
+    nutrition: { kcal: 536, proteinGrams: 46.8, carbsGrams: 10.2, fatGrams: 18.2, sodiumMg: 520 },
+    ingredients: [
+      { slug: "chicken_breast", grams: 230 },
+      { slug: "onion", grams: 60 },
+    ],
+    seasonings: ["olive_oil", "garlic", "black_pepper", "salt", "cooking_wine"],
+    source: "preset",
+    method: "pan_searing",
+  },
+  {
+    slug: "garlic_chicken_egg_plate",
+    name: "Garlic chicken and egg plate",
+    mealTypes: ["lunch", "dinner"],
+    role: "main",
+    selfContained: true,
+    nutrition: { kcal: 552, proteinGrams: 50, carbsGrams: 8.6, fatGrams: 21.4, sodiumMg: 560 },
+    ingredients: [
+      { slug: "chicken_breast", grams: 210 },
+      { slug: "egg", grams: 80 },
+      { slug: "cucumber", grams: 80 },
+    ],
+    seasonings: ["olive_oil", "garlic", "black_pepper", "salt"],
+    source: "preset",
+    method: "pan_searing",
+  },
+  {
+    slug: "lean_beef_egg_plate",
+    name: "Lean beef and egg plate",
+    mealTypes: ["lunch", "dinner"],
+    role: "main",
+    selfContained: true,
+    nutrition: { kcal: 535, proteinGrams: 45.6, carbsGrams: 9.8, fatGrams: 19.2, sodiumMg: 540 },
+    ingredients: [
+      { slug: "beef_tenderloin", grams: 180 },
+      { slug: "egg", grams: 50 },
+      { slug: "onion", grams: 60 },
+    ],
+    seasonings: ["olive_oil", "garlic", "black_pepper", "salt", "cooking_wine"],
+    source: "preset",
+    method: "pan_searing",
+  },
+  {
     slug: "braised_tofu_rice",
     name: "红烧豆腐",
     mealTypes: ["lunch", "dinner"],

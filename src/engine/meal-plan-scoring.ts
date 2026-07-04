@@ -2,6 +2,7 @@ import type { MealPlanEntry, WeeklyMealPlan } from "./meal-planner.js";
 import type { RecipePreferences } from "./recipe-engine.js";
 import {
   DEFAULT_SCORING_WEIGHTS,
+  FAT_ADVISORY_TOLERANCE_RATIO,
   MAX_DISH_USES_PER_WEEK,
   MIN_DISTINCT_DISHES,
   SODIUM_CAP_MG,
@@ -47,7 +48,7 @@ export function scorePlan(
     macro: macroPenalty(plan, profile),
     diversity: diversityPenalty(plan),
     preferenceBonus: preferenceBonus(plan.entries, preferences),
-    recency: recencyPenalty(plan.entries),
+    recency: recencyPenalty(plan.entries, preferences),
   };
   const penalty =
     raw.protein * weights.protein +
@@ -109,7 +110,7 @@ function macroPenalty(plan: WeeklyMealPlan, profile: PlanScoringProfile): number
     return average(plan.days.map((day) => {
       const fatPenalty = dailyFatTarget === undefined
         ? 0
-        : Math.max(0, day.totals.fatGrams - dailyFatTarget) / dailyFatTarget;
+        : Math.max(0, day.totals.fatGrams - dailyFatTarget * FAT_ADVISORY_TOLERANCE_RATIO) / dailyFatTarget;
       const carbsPenalty = dailyCarbsTarget === undefined
         ? 0
         : Math.abs(day.totals.carbsGrams - dailyCarbsTarget) / dailyCarbsTarget;
@@ -170,9 +171,16 @@ function preferenceBonus(entries: readonly MealPlanEntry[], preferences: RecipeP
   return Math.min(6, matches) / 6;
 }
 
-function recencyPenalty(entries: readonly MealPlanEntry[]): number {
-  return entries.filter((entry) => entry.dish.lastServedAt !== undefined && entry.dish.lastServedAt !== null).length /
-    Math.max(1, entries.length);
+function recencyPenalty(entries: readonly MealPlanEntry[], preferences: RecipePreferences): number {
+  const recentDishSlugs = new Set((preferences.recentDishSlugs ?? []).map(normalize));
+  const avoidedDishSlugs = new Set((preferences.avoidedDishSlugs ?? []).map(normalize));
+  const score = entries.reduce((sum, entry) => {
+    const slug = normalize(entry.dish.slug);
+    if (avoidedDishSlugs.has(slug)) return sum + 2;
+    if (recentDishSlugs.has(slug)) return sum + 1;
+    return entry.dish.lastServedAt !== undefined && entry.dish.lastServedAt !== null ? sum + 1 : sum;
+  }, 0);
+  return score / Math.max(1, entries.length);
 }
 
 function average(values: readonly number[]): number {

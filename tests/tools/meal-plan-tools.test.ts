@@ -105,6 +105,23 @@ describe("meal plan tools", () => {
     expect(result.summary).toContain("Turkey Rice Bowl");
   });
 
+  it("test_recipe_recommend_uses_recent_dishes_from_preferences_when_explicit_history_absent", () => {
+    const result = recipeRecommend({
+      mealType: "lunch",
+      maxKcal: 700,
+      candidates: [
+        makeDish("recent_chicken_bowl", "lunch", 620, "chicken"),
+        makeDish("fresh_chicken_bowl", "lunch", 620, "chicken"),
+      ],
+      preferences: { recentDishSlugs: ["recent_chicken_bowl"] },
+    });
+
+    expect(result.options.map((option) => option.slug)).toEqual([
+      "fresh_chicken_bowl",
+      "recent_chicken_bowl",
+    ]);
+  });
+
   it("test_generate_meal_plan_stores_entries_and_returns_seven_day_overview", () => {
     const storedEntries: unknown[] = [];
     const result = generateMealPlan({

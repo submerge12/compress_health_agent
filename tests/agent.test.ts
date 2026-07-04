@@ -120,17 +120,20 @@ describe("agent profile", () => {
     ]);
   });
 
-  test("test_systemPrompt_foodPreferenceInterview_isAllergyFirstWithDefaultBasket", () => {
+  test("test_systemPrompt_workflowOptimizesCheckinsAndWeeklyReview", () => {
     const prompt = profile.systemPrompt;
     const allergyIndex = prompt.indexOf("Allergies first");
-    const preferenceIndex = prompt.indexOf("Preference basket");
+    const optionalPreferenceIndex = prompt.indexOf("Optional preference tuning");
 
     expect(allergyIndex).toBeGreaterThanOrEqual(0);
-    expect(preferenceIndex).toBeGreaterThan(allergyIndex);
-    expect(prompt).toContain("default basket");
-    expect(prompt).toContain("remove/add");
+    expect(optionalPreferenceIndex).toBeGreaterThan(allergyIndex);
+    expect(prompt).toContain("planned meals through meal_checkin first");
+    expect(prompt).toContain("Free-text log_meal is for off-plan meals");
+    expect(prompt).toContain("Ask at most one forward-looking question");
+    expect(prompt).toContain("Scheduled proactive messages must ask exactly one question");
+    expect(prompt).toContain("physical profile plus allergies");
+    expect(prompt).toContain("learn likes and dislikes from check-ins");
     expect(prompt).toContain("seafood doesn't work for me");
-    expect(prompt).toContain("do not force fruit or vegetables");
   });
 
   test("test_validateAgentProfile_duplicateScheduledTaskIds_throwHelpfulError", () => {

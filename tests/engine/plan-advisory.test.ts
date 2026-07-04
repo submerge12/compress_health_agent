@@ -46,10 +46,19 @@ describe("buildCoverageReport", () => {
           type: "fat_ceiling",
           key: "fat",
           actual: 50,
-          target: 35,
+          target: 40.3,
         }),
       ]),
     );
+  });
+
+  test("does not surface fat ceiling advisory inside the tolerance band", () => {
+    const slightlyOver = dish("slightly_over_fat", 600, 40, 500, [], {}, undefined, { fatGrams: 46 });
+    const plan = planWith([entry(0, "lunch", slightlyOver)]);
+
+    const report = buildCoverageReport(plan, { dailyFatTarget: 40 });
+
+    expect(report.unmet.map((item) => item.type)).not.toContain("fat_ceiling");
   });
 
   test("advises when the accepted pool has only staples and no protein sources", () => {

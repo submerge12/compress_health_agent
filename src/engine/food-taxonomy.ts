@@ -3,6 +3,52 @@ export type FoodWeightType = "raw" | "cooked" | "dry";
 const FISH_SLUGS = new Set(["salmon", "cod", "mackerel", "sardine", "hairtail", "sea_bream"]);
 const SHRIMP_SLUGS = new Set(["shrimp_jiweixia", "dried_shrimp", "shrimp_paste"]);
 const SOY_SLUGS = new Set(["tofu", "soy_milk", "soybean", "edamame"]);
+const FISH_CATEGORY_CODES = new Set(["121"]);
+const SHELLFISH_CATEGORY_CODES = new Set(["122", "123", "124", "129"]);
+const DAIRY_CATEGORY_CODES = new Set(["101", "102", "103", "104", "105", "109", "164"]);
+const SOY_CATEGORY_CODES = new Set(["031"]);
+const NUT_CATEGORY_CODES = new Set(["071"]);
+const FISH_KEYWORDS = [
+  "\u9c7c",
+  "\u5e26\u9c7c",
+  "\u9cb7",
+  "\u9cd5",
+  "\u9c95",
+  "\u9cc8",
+];
+const SHELLFISH_KEYWORDS = [
+  "\u867e",
+  "\u87f9",
+  "\u8d1d",
+  "\u9c8d",
+  "\u86ce",
+  "\u868c",
+  "\u7ae0\u9c7c",
+  "\u8f6f\u4f53",
+];
+const DAIRY_KEYWORDS = [
+  "\u4e73",
+  "\u5976",
+  "\u725b\u5976",
+  "\u9178\u5976",
+  "\u5976\u916a",
+  "\u829d\u58eb",
+];
+const SOY_KEYWORDS = [
+  "\u5927\u8c46",
+  "\u9ec4\u8c46",
+  "\u8c46\u8150",
+  "\u8c46\u6d46",
+  "\u8150\u7af9",
+];
+const NUT_KEYWORDS = [
+  "\u575a\u679c",
+  "\u6811\u575a\u679c",
+  "\u679c\u4ec1",
+  "\u674f\u4ec1",
+  "\u8170\u679c",
+  "\u6838\u6843",
+];
 const DRY_WEIGHT_SLUGS = new Set([
   "oats",
   "brown_rice",
@@ -27,28 +73,65 @@ const SEASONING_ALLERGEN_TAGS = new Map<string, readonly string[]>([
 
 const HIDDEN_ALLERGEN_SEASONINGS = new Set(["oyster_sauce", "fish_sauce", "shrimp_paste", "dried_shrimp"]);
 
-export function allergenTagsForFood(slug: string, category: string | null | undefined): string[] {
+export function allergenTagsForFood(
+  slug: string,
+  category: string | null | undefined,
+  label?: string | null | undefined,
+): string[] {
   const normalizedSlug = normalizeToken(slug);
   const normalizedCategory = normalizeToken(category ?? "");
+  const normalizedLabel = normalizeToken(label ?? "");
+  const signal = [normalizedSlug, normalizedCategory, normalizedLabel].filter(Boolean).join("_");
   const tags = new Set<string>();
 
-  if (normalizedCategory === "seafood" || FISH_SLUGS.has(normalizedSlug) || SHRIMP_SLUGS.has(normalizedSlug)) {
+  if (
+    normalizedCategory === "seafood" ||
+    FISH_SLUGS.has(normalizedSlug) ||
+    SHRIMP_SLUGS.has(normalizedSlug) ||
+    FISH_CATEGORY_CODES.has(normalizedCategory) ||
+    SHELLFISH_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, FISH_KEYWORDS) ||
+    includesAny(signal, SHELLFISH_KEYWORDS)
+  ) {
     tags.add("seafood");
   }
-  if (FISH_SLUGS.has(normalizedSlug)) {
+  if (
+    FISH_SLUGS.has(normalizedSlug) ||
+    FISH_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, FISH_KEYWORDS)
+  ) {
     tags.add("fish");
   }
-  if (SHRIMP_SLUGS.has(normalizedSlug)) {
+  if (
+    SHRIMP_SLUGS.has(normalizedSlug) ||
+    SHELLFISH_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, SHELLFISH_KEYWORDS)
+  ) {
     tags.add("shellfish");
+  }
+  if (SHRIMP_SLUGS.has(normalizedSlug) || includesAny(signal, ["shrimp", "\u867e"])) {
     tags.add("shrimp");
   }
-  if (SOY_SLUGS.has(normalizedSlug) || normalizedSlug.includes("soy")) {
+  if (
+    SOY_SLUGS.has(normalizedSlug) ||
+    normalizedSlug.includes("soy") ||
+    SOY_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, SOY_KEYWORDS)
+  ) {
     tags.add("soy");
   }
-  if (normalizedCategory === "dairy") {
+  if (
+    normalizedCategory === "dairy" ||
+    DAIRY_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, DAIRY_KEYWORDS)
+  ) {
     tags.add("dairy");
   }
-  if (normalizedCategory === "nut") {
+  if (
+    normalizedCategory === "nut" ||
+    NUT_CATEGORY_CODES.has(normalizedCategory) ||
+    includesAny(signal, NUT_KEYWORDS)
+  ) {
     tags.add("nuts");
   }
 

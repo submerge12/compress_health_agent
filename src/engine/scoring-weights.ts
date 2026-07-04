@@ -23,6 +23,7 @@ export const DEFAULT_SCORING_WEIGHTS: MealPlanScoringWeights = {
 export const ENERGY_TOLERANCE_RATIO = 0.12;
 export const MAX_ENERGY_TOLERANCE_RATIO = 0.15;
 export const PROTEIN_FLOOR_RATIO = 0.8;
+export const FAT_ADVISORY_TOLERANCE_RATIO = 1.15;
 export const SODIUM_CAP_MG = 2300;
 export const MIN_DISTINCT_DISHES = 10;
 export const MAX_DISH_USES_PER_WEEK = 3;

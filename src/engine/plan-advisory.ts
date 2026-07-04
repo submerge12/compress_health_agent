@@ -1,6 +1,7 @@
 import type { HardViolation, WeeklyMealPlan } from "./meal-planner.js";
 import type { RecipeDish } from "./recipe-engine.js";
 import {
+  FAT_ADVISORY_TOLERANCE_RATIO,
   MIN_DISTINCT_DISHES,
   SODIUM_CAP_MG,
   WEEKLY_FLOORS,
@@ -261,13 +262,14 @@ function fatCeilingItems(
 ): readonly CoverageItem[] {
   if (dailyFatTarget === undefined || dailyFatTarget <= 0) return [];
   const actual = round1(Math.max(...plan.days.map((day) => day.totals.fatGrams), 0));
-  if (actual <= dailyFatTarget) return [];
+  const toleratedTarget = round1(dailyFatTarget * FAT_ADVISORY_TOLERANCE_RATIO);
+  if (actual <= toleratedTarget) return [];
   return [{
     type: "fat_ceiling",
     key: "fat",
     actual,
-    target: dailyFatTarget,
-    message: `fat reached ${actual}g/day vs ${dailyFatTarget}g ceiling`,
+    target: toleratedTarget,
+    message: `fat reached ${actual}g/day vs ${toleratedTarget}g tolerated ceiling`,
   }];
 }
 

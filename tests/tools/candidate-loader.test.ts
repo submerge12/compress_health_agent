@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import { presetDishes } from "../../src/data/preset-dishes.js";
-import type { MemoryKind, MemoryRecordRow, UserDishRow } from "../../src/db/repository.js";
+import type { DietLogRow, MealPlanEntryRow, MemoryKind, MemoryRecordRow, UserDishRow } from "../../src/db/repository.js";
 import type { FoodCatalogRecord } from "../../src/tools/nutrition-estimate.js";
 import type { ToolContext } from "../../src/tools/context.js";
 import { loadCandidateDishes, loadUserPreferences } from "../../src/tools/candidate-loader.js";
@@ -211,6 +211,8 @@ function makePreferenceContext(opts: {
   dislikes?: MemoryRecordRow[];
   likes?: MemoryRecordRow[];
   tableRejected?: string[];
+  planEntries?: MealPlanEntryRow[];
+  dietLogs?: DietLogRow[];
 }): ToolContext {
   return {
     userId: "user-id",
@@ -225,6 +227,8 @@ function makePreferenceContext(opts: {
         return opts.dislikes ?? [];
       },
       listRejectedSeasoningSlugs: async () => opts.tableRejected ?? [],
+      listMealPlanEntriesRange: async () => opts.planEntries ?? [],
+      listDietLogsRange: async () => opts.dietLogs ?? [],
     } as unknown as ToolContext["repo"],
     close: async () => undefined,
   };
@@ -298,4 +302,86 @@ describe("loadUserPreferences", () => {
     expect(prefs.rejectedIngredients).toEqual([]);
     expect(prefs.preferredIngredients).toEqual([]);
   });
+
+  test("mines recent check-ins into preference and recency planning signals", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      planEntries: [
+        mealPlanEntry({ id: "skip-1", planDate: "2026-07-02", recipeSlug: "boiled_chicken", status: "skipped" }),
+        mealPlanEntry({ id: "skip-2", planDate: "2026-07-04", recipeSlug: "boiled_chicken", status: "skipped" }),
+        mealPlanEntry({ id: "followed-1", planDate: "2026-07-05", recipeSlug: "scallion_beef", status: "followed" }),
+        mealPlanEntry({ id: "old-1", planDate: "2026-06-20", recipeSlug: "old_dish", status: "followed" }),
+      ],
+      dietLogs: [
+        dietLog({
+          id: "subst-1",
+          logDate: "2026-07-06",
+          source: "substituted",
+          ingredientsJson: [{ slug: "chicken_breast", grams: 180 }],
+        }),
+        dietLog({
+          id: "planned-1",
+          logDate: "2026-07-06",
+          source: "planned",
+          ingredientsJson: [{ slug: "mushroom", grams: 100 }],
+        }),
+        dietLog({
+          id: "fallback-1",
+          logDate: "2026-07-06",
+          source: "substituted",
+          ingredientsJson: [{
+            slug: "unknown_food",
+            grams: 200,
+            estimateSource: "fallback",
+            segment: "mystery food 200g",
+          }],
+        }),
+      ],
+    }), { asOfDate: "2026-07-08" });
+
+    expect(prefs.recentDishSlugs).toEqual(expect.arrayContaining(["boiled_chicken", "scallion_beef"]));
+    expect(prefs.recentDishSlugs).not.toContain("old_dish");
+    expect(prefs.avoidedDishSlugs).toEqual(["boiled_chicken"]);
+    expect(prefs.preferredIngredients).toContain("chicken_breast");
+    expect(prefs.preferredIngredients).not.toContain("mushroom");
+    expect(prefs.preferredIngredients).not.toContain("unknown_food");
+  });
 });
+
+function mealPlanEntry(overrides: Partial<MealPlanEntryRow>): MealPlanEntryRow {
+  return {
+    id: "entry-id",
+    userId: "user-id",
+    planDate: "2026-07-01",
+    mealType: "lunch",
+    dishName: "Dish",
+    recipeSlug: "dish_slug",
+    status: "planned",
+    ingredientsJson: [],
+    seasoningsJson: [],
+    caloriesKcal: 500,
+    proteinGrams: 30,
+    carbsGrams: 50,
+    fatGrams: 10,
+    sodiumMg: 400,
+    ...overrides,
+  };
+}
+
+function dietLog(overrides: Partial<DietLogRow>): DietLogRow {
+  return {
+    id: "diet-log-id",
+    userId: "user-id",
+    logDate: "2026-07-01",
+    mealType: "lunch",
+    description: "meal",
+    source: "planned",
+    ingredientsJson: [],
+    seasoningsJson: [],
+    caloriesKcal: 500,
+    proteinGrams: 30,
+    carbsGrams: 50,
+    fatGrams: 10,
+    sodiumMg: 400,
+    ...overrides,
+  };
+}

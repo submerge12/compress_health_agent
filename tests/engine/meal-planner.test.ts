@@ -6,6 +6,11 @@ import {
   validateWeeklyMealPlan,
   type MealType,
 } from "../../src/engine/meal-planner.js";
+import { presetDishes } from "../../src/data/preset-dishes.js";
+import {
+  allergenTagsForFood,
+  allergenTagsForSeasoning,
+} from "../../src/engine/food-taxonomy.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
 
 const mealTypes: readonly MealType[] = ["breakfast", "lunch", "dinner"];
@@ -142,8 +147,45 @@ describe("generateWeeklyMealPlan", () => {
       );
     }
   });
+
+  it("test_generate_weekly_meal_plan_seafood_allergy_meets_high_protein_floor_with_real_presets", () => {
+    const plan = generateWeeklyMealPlan({
+      startDate: "2026-07-06",
+      dailyKcalTarget: 1771,
+      dailyProteinTarget: 140,
+      presetDishes,
+      preferences: { allergens: ["seafood"] },
+    });
+    const validation = validateWeeklyMealPlan(plan, {
+      dailyKcalTarget: 1771,
+      dailyProteinTarget: 140,
+    });
+
+    expect(validation.ok).toBe(true);
+    expect(validation.violations).toEqual([]);
+    expect(plan.days.every((day) => day.totals.proteinGrams >= 112)).toBe(true);
+    expect(plan.entries.flatMap((entry) => [entry.dish, entry.side].filter(isDish)).every((dish) =>
+      !containsSeafood(dish)
+    )).toBe(true);
+  });
 });
 
 function toTitleCase(part: string): string {
   return `${part.charAt(0).toUpperCase()}${part.slice(1)}`;
+}
+
+function isDish(value: RecipeDish | undefined): value is RecipeDish {
+  return value !== undefined;
+}
+
+function containsSeafood(dish: RecipeDish): boolean {
+  return dish.ingredients.some((ingredient) =>
+    allergenTagsForFood(ingredient.slug, undefined).some(isSeafoodTag)
+  ) || dish.seasonings.some((seasoning) =>
+    allergenTagsForSeasoning(seasoning).some(isSeafoodTag)
+  ) || (dish.allergenTags ?? []).some(isSeafoodTag);
+}
+
+function isSeafoodTag(tag: string): boolean {
+  return tag === "seafood" || tag === "fish" || tag === "shellfish" || tag === "shrimp";
 }

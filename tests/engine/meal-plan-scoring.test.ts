@@ -132,4 +132,33 @@ describe("scorePlan", () => {
       dailyCarbsTarget: 180,
     }).breakdown.macro);
   });
+
+  test("does not penalize fat inside the advisory tolerance band", () => {
+    const insideTolerance = dish("inside_fat_tolerance", 600, 40, [], { fatGrams: 46, carbsGrams: 60 });
+    const aboveTolerance = dish("above_fat_tolerance", 600, 40, [], { fatGrams: 47, carbsGrams: 60 });
+
+    expect(scorePlan(plan([entry(0, "lunch", insideTolerance)]), {
+      dailyFatTarget: 40,
+    }).breakdown.macro).toBe(0);
+    expect(scorePlan(plan([entry(0, "lunch", aboveTolerance)]), {
+      dailyFatTarget: 40,
+    }).breakdown.macro).toBeGreaterThan(0);
+  });
+
+  test("penalizes dishes recently served or repeatedly skipped by the user", () => {
+    const accepted = dish("accepted_chicken", 600, 40);
+    const recent = dish("recent_chicken", 600, 40);
+    const avoided = dish("avoided_chicken", 600, 40);
+    const basePlan = plan([entry(0, "lunch", accepted)]);
+    const recentPlan = plan([entry(0, "lunch", recent)]);
+    const avoidedPlan = plan([entry(0, "lunch", avoided)]);
+
+    const base = scorePlan(basePlan, { dailyProteinTarget: 80 });
+    const recentScore = scorePlan(recentPlan, { dailyProteinTarget: 80 }, { recentDishSlugs: ["recent_chicken"] });
+    const avoidedScore = scorePlan(avoidedPlan, { dailyProteinTarget: 80 }, { avoidedDishSlugs: ["avoided_chicken"] });
+
+    expect(recentScore.breakdown.recency).toBeGreaterThan(base.breakdown.recency);
+    expect(avoidedScore.breakdown.recency).toBeGreaterThan(recentScore.breakdown.recency);
+    expect(avoidedScore.penalty).toBeGreaterThan(recentScore.penalty);
+  });
 });

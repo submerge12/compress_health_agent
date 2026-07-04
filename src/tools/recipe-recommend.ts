@@ -28,7 +28,7 @@ export function recipeRecommend(input: RecipeRecommendInput): RecipeRecommendRes
     mealType: input.mealType,
     target: { kcal: input.maxKcal },
     preferences: input.preferences,
-    recentDishSlugs: input.recentDishSlugs,
+    recentDishSlugs: input.recentDishSlugs ?? input.preferences?.recentDishSlugs,
     limit: 3,
   });
   return { options, summary: formatRecommendationSummary(options) };

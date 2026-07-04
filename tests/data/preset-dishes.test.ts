@@ -4,6 +4,10 @@ import { join } from "node:path";
 
 import { presetDishes } from "../../src/data/preset-dishes.js";
 import { loadFoodItemsFromCsv } from "../../src/db/seed.js";
+import {
+  allergenTagsForFood,
+  allergenTagsForSeasoning,
+} from "../../src/engine/food-taxonomy.js";
 
 describe("preset dishes", () => {
   test("main dishes are main-only and do not bundle brown rice staples", () => {
@@ -62,10 +66,39 @@ describe("preset dishes", () => {
 
     expect(missing).toEqual([]);
   });
+
+  test("preset pool includes high-protein non-seafood main meals", () => {
+    const highProteinSafeMains = presetDishes.filter((dish) =>
+      dish.role !== "side" &&
+      (dish.mealTypes?.includes("lunch") || dish.mealTypes?.includes("dinner")) &&
+      dish.nutrition.proteinGrams >= 40 &&
+      !containsSeafood(dish)
+    );
+
+    expect(highProteinSafeMains.map((dish) => dish.slug).sort()).toEqual(
+      expect.arrayContaining([
+        "black_pepper_chicken_breast",
+        "garlic_chicken_egg_plate",
+        "lean_beef_egg_plate",
+      ]),
+    );
+  });
 });
 
 function ingredientSlugs(slug: string): readonly string[] {
   const dish = presetDishes.find((candidate) => candidate.slug === slug);
   expect(dish).toBeDefined();
   return dish!.ingredients.map((ingredient) => ingredient.slug);
+}
+
+function containsSeafood(dish: (typeof presetDishes)[number]): boolean {
+  return dish.ingredients.some((ingredient) =>
+    allergenTagsForFood(ingredient.slug, undefined).some(isSeafoodTag)
+  ) || dish.seasonings.some((seasoning) =>
+    allergenTagsForSeasoning(seasoning).some(isSeafoodTag)
+  ) || (dish.allergenTags ?? []).some(isSeafoodTag);
+}
+
+function isSeafoodTag(tag: string): boolean {
+  return tag === "seafood" || tag === "fish" || tag === "shellfish" || tag === "shrimp";
 }

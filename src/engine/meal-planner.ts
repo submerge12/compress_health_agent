@@ -18,6 +18,7 @@ import {
 import { scorePlan, type MealPlanScore } from "./meal-plan-scoring.js";
 import {
   ENERGY_TOLERANCE_RATIO,
+  FAT_ADVISORY_TOLERANCE_RATIO,
   MAX_ENERGY_TOLERANCE_RATIO,
   PROTEIN_FLOOR_RATIO,
 } from "./scoring-weights.js";
@@ -449,9 +450,10 @@ function validateDailyProtein(plan: WeeklyMealPlan, dailyProteinTarget: number |
 function validateDailyFat(plan: WeeklyMealPlan, dailyFatTarget: number | undefined): readonly string[] {
   const target = positiveTarget(dailyFatTarget);
   if (target === undefined) return [];
+  const toleratedTarget = roundTo(target * FAT_ADVISORY_TOLERANCE_RATIO, 1);
   return plan.days
     .filter((day) => !isDailyFatWithinCeiling(day.totals.fatGrams, target))
-    .map((day) => `${day.date} fat ${day.totals.fatGrams}g above ${target}g ceiling`);
+    .map((day) => `${day.date} fat ${day.totals.fatGrams}g above ${toleratedTarget}g tolerated ceiling`);
 }
 
 function validateStructuralCompleteness(plan: WeeklyMealPlan): readonly string[] {
@@ -475,7 +477,7 @@ function isDailyProteinWithinFloor(proteinGrams: number, dailyProteinTarget: num
 }
 
 function isDailyFatWithinCeiling(fatGrams: number, dailyFatTarget: number): boolean {
-  return fatGrams <= dailyFatTarget;
+  return fatGrams <= dailyFatTarget * FAT_ADVISORY_TOLERANCE_RATIO;
 }
 
 function validateDistinctDishes(
