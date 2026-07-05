@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type { ToolContext } from "../tools/context.js";
-import type { MealPlanEntryRow } from "../db/repository.js";
+import { storedProcurement, storedWeekView } from "./display-queries.js";
 import {
   handleDailySummary,
   handleGetProfile,
@@ -49,8 +49,22 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     const start = requireQueryDate(query, "start");
     const days = boundedInt(query.get("days"), 7, 1, 31);
     const end = addDaysIso(start, days - 1);
-    const rows = await ctx.repo.listMealPlanEntriesRange(ctx.userId, start, end);
-    return { startDate: start, endDate: end, days: groupByDate(rows, start, days) };
+    const [rows, profile] = await Promise.all([
+      ctx.repo.listMealPlanEntriesRange(ctx.userId, start, end),
+      ctx.repo.getLatestBmrProfile(ctx.userId),
+    ]);
+    return storedWeekView(rows, start, days, {
+      ...(profile?.targetKcal === undefined ? {} : { targetKcal: profile.targetKcal }),
+      ...(profile?.proteinTargetGrams === undefined ? {} : { proteinTargetGrams: profile.proteinTargetGrams }),
+      ...(profile?.fatTargetGrams === undefined ? {} : { fatTargetGrams: profile.fatTargetGrams }),
+      ...(profile?.carbsTargetGrams === undefined ? {} : { carbsTargetGrams: profile.carbsTargetGrams }),
+    });
+  },
+  "GET /api/procurement": async (ctx, query) => {
+    const start = requireQueryDate(query, "start");
+    const days = boundedInt(query.get("days"), 7, 1, 31);
+    const rows = await ctx.repo.listMealPlanEntriesRange(ctx.userId, start, addDaysIso(start, days - 1));
+    return storedProcurement(rows);
   },
   "POST /api/plan/generate": (ctx, _query, body) => handleSmartGenerateMealPlan(ctx, cast(body)),
 
@@ -175,17 +189,6 @@ function readJsonBody(request: IncomingMessage): Promise<Body> {
         reject(new Error("request body is not valid JSON"));
       }
     });
-  });
-}
-
-function groupByDate(
-  rows: readonly MealPlanEntryRow[],
-  start: string,
-  days: number,
-): { date: string; entries: MealPlanEntryRow[] }[] {
-  return Array.from({ length: days }, (_, index) => {
-    const date = addDaysIso(start, index);
-    return { date, entries: rows.filter((row) => row.planDate === date) };
   });
 }
 

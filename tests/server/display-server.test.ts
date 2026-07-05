@@ -58,7 +58,35 @@ describe("display server (P1 contract)", () => {
     expect(payload.days[0].date).toBe("2026-07-08");
     expect(payload.days[0].entries.map((entry: MealPlanEntryRow) => entry.mealType))
       .toEqual(["breakfast", "lunch", "dinner"]);
+    expect(payload.days[0].totals.kcal).toBe(1530);
     expect(payload.days[1].entries).toEqual([]);
+    // Weekly lines carry the profile targets scaled to the window.
+    expect(payload.weekly.fatGrams.target).toBe(98);
+    expect(payload.weekly.kcal.actual).toBe(1530);
+  });
+
+  test("GET /api/procurement aggregates stored ingredients with buffer", async () => {
+    const rows = [
+      { ...row("row-lunch", "lunch", 520, 32), ingredientsJson: [
+        { slug: "beef_tenderloin", grams: 200 },
+        { slug: "brown_rice", grams: 60 },
+      ] },
+      { ...row("row-dinner", "dinner", 560, 35), ingredientsJson: [
+        { slug: "beef_tenderloin", grams: 100 },
+      ] },
+      { ...row("row-skipped", "breakfast", 450, 28), status: "skipped", ingredientsJson: [
+        { slug: "egg", grams: 100 },
+      ] },
+    ];
+    const base = await boot(context({ rows }));
+    const response = await fetch(`${base}/api/procurement?start=2026-07-08&days=2`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    const beef = payload.items.find((item: { slug: string }) => item.slug === "beef_tenderloin");
+    expect(beef.totalGrams).toBe(300);
+    expect(beef.bufferedGrams).toBe(350);
+    // Skipped meals do not go on the shopping list.
+    expect(payload.items.some((item: { slug: string }) => item.slug === "egg")).toBe(false);
   });
 
   test("GET /api/plan without a start date is a 400 with a usable message", async () => {
