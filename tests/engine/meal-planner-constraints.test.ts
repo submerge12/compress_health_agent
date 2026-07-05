@@ -99,7 +99,7 @@ describe("meal planner hard constraints", () => {
     }
   });
 
-  test("treats the personalized fat ceiling as soft: still generates a plan, surfaces it as advisory", () => {
+  test("treats the personalized fat ceiling as soft: still generates a plan, surfaces it as weekly budget", () => {
     const request = {
       startDate: "2026-06-16",
       dailyKcalTarget: 1800,
@@ -116,10 +116,11 @@ describe("meal planner hard constraints", () => {
     expect(plan.entries.length).toBeGreaterThan(0);
     expect(plan.hardViolations).toEqual([]);
 
-    // ...but it is surfaced as a soft advisory.
+    // ...but it is surfaced as a weekly budget, not a per-day advisory.
     const validation = validateWeeklyMealPlan(plan, { dailyKcalTarget: 1800, dailyFatTarget: 35 });
-    expect(validation.ok).toBe(false);
-    expect(validation.violations.join(" ")).toContain("ceiling");
+    expect(validation.ok).toBe(true);
+    expect(validation.violations.join(" ")).not.toContain("ceiling");
+    expect(plan.weeklyBudgets.fat.status).toBe("over");
   });
 
   test("does not let the soft fat ceiling outrank hard energy feasibility", () => {
@@ -137,7 +138,8 @@ describe("meal planner hard constraints", () => {
 
     expect(plan.hardViolations).toEqual([]);
     expect(validateWeeklyMealPlan(plan, { dailyKcalTarget: 1800, dailyFatTarget: 30 }).violations.join(" "))
-      .toContain("fat");
+      .not.toContain("fat");
+    expect(plan.weeklyBudgets.fat.status).toBe("over");
   });
 
   test("filters dishes with rejected ingredients before planning", () => {

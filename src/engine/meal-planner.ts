@@ -11,16 +11,19 @@ import {
   addNutrition,
   composeMealNutrition,
   dishNutrition,
+  solveProteinTopUps,
   solveStaplePortionsForDay,
+  stapleNutrition,
+  type ProteinTopUpPortion,
   type Staple,
   type StaplePortion,
 } from "./meal-composition.js";
 import { scorePlan, type MealPlanScore } from "./meal-plan-scoring.js";
 import {
   ENERGY_TOLERANCE_RATIO,
-  FAT_ADVISORY_TOLERANCE_RATIO,
   MAX_ENERGY_TOLERANCE_RATIO,
   PROTEIN_FLOOR_RATIO,
+  SODIUM_CAP_MG,
 } from "./scoring-weights.js";
 import type { MealCatalog } from "../tools/nutrition-estimate.js";
 
@@ -37,6 +40,16 @@ export interface MealPlanRequest {
   presetDishes?: readonly RecipeDish[];
   userDishes?: readonly RecipeDish[];
   candidates?: readonly RecipeDish[];
+  /**
+   * Explicit role split from pool selection. When present it is authoritative:
+   * the planner must not re-derive roles from mealTypes (a mealTypes-undefined
+   * dish matches every role matcher and would leak mains into breakfasts).
+   */
+  pools?: {
+    breakfasts: readonly RecipeDish[];
+    mains: readonly RecipeDish[];
+    sides: readonly RecipeDish[];
+  };
   preferences?: RecipePreferences;
 }
 
@@ -49,8 +62,20 @@ export interface MealPlanEntry {
   dish: RecipeDish;
   side?: RecipeDish;
   staple?: StaplePortion;
+  /** Protein-lever add-ons attached to this meal; included in `nutrition`. */
+  proteinTopUps?: readonly ProteinTopUpPortion[];
+  /**
+   * Pre-vetted swaps from the weekly pool: substituting one and re-running
+   * the levers keeps the day inside the kcal band and protein floor.
+   */
+  alternates?: readonly MealPlanAlternate[];
   nutrition: RecipeNutrition;
   status: "planned" | "followed" | "substituted" | "skipped";
+}
+
+export interface MealPlanAlternate {
+  slug: string;
+  name: string;
 }
 
 export interface MealPlanDay {
@@ -65,7 +90,30 @@ export interface WeeklyMealPlan {
   entries: readonly MealPlanEntry[];
   distinctDishCount: number;
   hardViolations: readonly HardViolation[];
+  weeklyBudgets: WeeklyBudgets;
   score?: MealPlanScore;
+}
+
+export type WeeklyBudgetStatus = "over" | "under" | "on_target" | "no_target";
+
+export interface WeeklyBudget {
+  actual: number;
+  target: number;
+  difference: number;
+  percentDifference: number;
+  status: WeeklyBudgetStatus;
+}
+
+export interface WeeklyBudgets {
+  fat: WeeklyBudget;
+  sodium: WeeklyBudget;
+  carbs: WeeklyBudget;
+}
+
+export interface WeeklyBudgetTargets {
+  dailyFatTarget?: number;
+  dailySodiumTarget?: number;
+  dailyCarbsTarget?: number;
 }
 
 export interface HardViolation {
@@ -96,6 +144,7 @@ export interface MealPlanValidationOptions {
   dailyKcalTarget: number;
   dailyProteinTarget?: number;
   dailyFatTarget?: number;
+  dailyCarbsTarget?: number;
   minimumDistinctDishes?: number;
   energyToleranceRatio?: number;
 }
@@ -109,15 +158,24 @@ const MEAL_TYPES: readonly MealType[] = ["breakfast", "lunch", "dinner"];
 
 export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan {
   validateMealPlanRequest(request);
-  const rawCandidates = collectCandidates(request);
+  const rawCandidates = request.pools === undefined
+    ? collectCandidates(request)
+    : [...request.pools.breakfasts, ...request.pools.mains, ...request.pools.sides];
   const candidates = filterUsableCandidates(rawCandidates, request.preferences);
   if (candidates.length === 0) {
     throw new MealPlanInfeasibleError(noUsableCandidatesResult(request, rawCandidates.length));
   }
 
-  const breakfastPool = candidates.filter(matchesBreakfast);
-  const mainPool = candidates.filter(matchesMain);
-  const sidePool = candidates.filter(matchesSide);
+  const usable = new Set(candidates.map((dish) => dish.slug));
+  const breakfastPool = request.pools === undefined
+    ? candidates.filter(matchesBreakfast)
+    : request.pools.breakfasts.filter((dish) => usable.has(dish.slug));
+  const mainPool = request.pools === undefined
+    ? candidates.filter(matchesMain)
+    : request.pools.mains.filter((dish) => usable.has(dish.slug));
+  const sidePool = request.pools === undefined
+    ? candidates.filter(matchesSide)
+    : request.pools.sides.filter((dish) => usable.has(dish.slug));
   if (breakfastPool.length === 0) {
     throw new MealPlanInfeasibleError(noMealRoleCandidatesResult(request.startDate, "breakfast"));
   }
@@ -126,36 +184,41 @@ export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan
   }
 
   const entries: MealPlanEntry[] = [];
-  const mainUsage = new Map<string, number>();
-  const sideUsage = new Map<string, number>();
+  const rotationMains = sortMainsByProteinDesc(mainPool, request.catalog);
   for (let dayIndex = 0; dayIndex < 7; dayIndex += 1) {
     const date = addDays(request.startDate, dayIndex);
-    const dayEntries = selectDayCombo(
+    const assignment = rotationAssignment(breakfastPool, rotationMains, sidePool, dayIndex);
+    const dayEntries = buildDayEntries(
       request,
-      entries,
-      mainUsage,
-      sideUsage,
-      breakfastPool,
-      mainPool,
+      date,
+      dayIndex,
+      assignment.breakfast,
+      assignment.lunch,
+      assignment.dinner,
+      assignment.lunchSide,
+      assignment.dinnerSide,
+    );
+    entries.push(...withMainAlternates(
+      request,
+      dayEntries,
+      assignment,
+      rotationMains,
       sidePool,
       date,
       dayIndex,
-    );
-    for (const entry of dayEntries) {
-      entries.push(entry);
-      mainUsage.set(entry.dish.slug, (mainUsage.get(entry.dish.slug) ?? 0) + 1);
-      if (entry.side !== undefined) {
-        sideUsage.set(entry.side.slug, (sideUsage.get(entry.side.slug) ?? 0) + 1);
-      }
-    }
+    ));
   }
 
-  const plan = buildPlan(request.startDate, entries, []);
+  const budgetTargets = {
+    dailyFatTarget: request.dailyFatTarget,
+    dailyCarbsTarget: request.dailyCarbsTarget,
+  };
+  const plan = buildPlan(request.startDate, entries, [], budgetTargets);
   const hardViolations = hardViolationsForPlan(plan, request);
   if (hardViolations.length > 0) {
     throw new MealPlanInfeasibleError(buildInfeasibleResult(hardViolations));
   }
-  const withViolations = buildPlan(request.startDate, entries, hardViolations);
+  const withViolations = buildPlan(request.startDate, entries, hardViolations, budgetTargets);
   return {
     ...withViolations,
     score: scorePlan(
@@ -178,44 +241,169 @@ export function validateWeeklyMealPlan(
   const violations = [
     ...validateDailyKcal(plan, options.dailyKcalTarget, options.energyToleranceRatio ?? ENERGY_TOLERANCE_RATIO),
     ...validateDailyProtein(plan, options.dailyProteinTarget),
-    ...validateDailyFat(plan, options.dailyFatTarget),
     ...validateStructuralCompleteness(plan),
     ...validateDistinctDishes(plan, options.minimumDistinctDishes),
   ];
   return { ok: violations.length === 0, violations };
 }
 
-function selectDayCombo(
-  request: MealPlanRequest,
-  entries: readonly MealPlanEntry[],
-  mainUsage: Map<string, number>,
-  sideUsage: Map<string, number>,
+export function buildWeeklyBudgets(plan: Pick<WeeklyMealPlan, "days">, targets: WeeklyBudgetTargets): WeeklyBudgets {
+  return {
+    fat: weeklyBudget(
+      sumValues(plan.days.map((day) => day.totals.fatGrams)),
+      targets.dailyFatTarget,
+      1,
+    ),
+    sodium: weeklyBudget(
+      sumValues(plan.days.map((day) => day.totals.sodiumMg)),
+      targets.dailySodiumTarget ?? SODIUM_CAP_MG,
+      0,
+    ),
+    carbs: weeklyBudget(
+      sumValues(plan.days.map((day) => day.totals.carbsGrams)),
+      targets.dailyCarbsTarget,
+      1,
+    ),
+  };
+}
+
+export function formatWeeklyBudgetLine(budgets: WeeklyBudgets): string {
+  return `Weekly budgets: ${formatBudget("fat", budgets.fat, "g")}; ${formatBudget("sodium", budgets.sodium, "mg")}; ${formatBudget("carbs", budgets.carbs, "g")}.`;
+}
+
+interface RotationAssignment {
+  breakfast: RecipeDish;
+  lunch: RecipeDish;
+  dinner: RecipeDish;
+  lunchSide?: RecipeDish;
+  dinnerSide?: RecipeDish;
+}
+
+/**
+ * Rule-based rotation fill (v2): lunch walks the main pool in order and
+ * dinner walks it half a cycle ahead. With 7 mains this gives every main
+ * exactly two uses per week and no main on consecutive days; smaller pools
+ * degrade gracefully (a 1-main pool repeats it, as before).
+ *
+ * The pool is protein-sorted (strongest first), so the half-cycle offset
+ * pairs strong-protein mains with weak ones and no day concentrates the
+ * pool's weakest dishes — the daily protein floor is a hard rule, while fat
+ * is a weekly budget and its per-day placement is free.
+ */
+function rotationAssignment(
   breakfastPool: readonly RecipeDish[],
   mainPool: readonly RecipeDish[],
+  sidePool: readonly RecipeDish[],
+  dayIndex: number,
+): RotationAssignment {
+  const dinnerOffset = Math.max(1, Math.ceil(mainPool.length / 2));
+  const lunch = atCycle(mainPool, dayIndex);
+  const dinner = atCycle(mainPool, dayIndex + dinnerOffset);
+  const lunchSide = rotationSide(lunch, sidePool, dayIndex * 2);
+  const dinnerSide = rotationSide(dinner, sidePool, dayIndex * 2 + 1);
+  return {
+    breakfast: atCycle(breakfastPool, dayIndex),
+    lunch,
+    dinner,
+    ...(lunchSide === undefined ? {} : { lunchSide }),
+    ...(dinnerSide === undefined ? {} : { dinnerSide }),
+  };
+}
+
+/**
+ * V2-P4 alternates: for the lunch and dinner entries, offer up to two pool
+ * mains that (a) do not collide with this day's or the adjacent days'
+ * rotation slots and (b) keep the day inside the hard gates after the levers
+ * re-run — so a "换一个" swap can never invalidate the day.
+ */
+function withMainAlternates(
+  request: MealPlanRequest,
+  dayEntries: readonly MealPlanEntry[],
+  assignment: RotationAssignment,
+  rotationMains: readonly RecipeDish[],
   sidePool: readonly RecipeDish[],
   date: string,
   dayIndex: number,
 ): readonly MealPlanEntry[] {
-  let best: readonly MealPlanEntry[] | undefined;
-  let bestScore = Number.POSITIVE_INFINITY;
-  for (const breakfast of breakfastPool) {
-    for (const lunch of mainPool) {
-      for (const dinner of mainPool) {
-        for (const lunchSide of sideOptionsFor(lunch, sidePool)) {
-          for (const dinnerSide of sideOptionsFor(dinner, sidePool)) {
-            const combo = buildDayEntries(request, date, dayIndex, breakfast, lunch, dinner, lunchSide, dinnerSide);
-            const candidateScore = comboScore(request, entries, combo, mainUsage, sideUsage);
-            if (candidateScore < bestScore) {
-              best = combo;
-              bestScore = candidateScore;
-            }
-          }
-        }
+  const [breakfastEntry, lunchEntry, dinnerEntry] = dayEntries;
+  if (breakfastEntry === undefined || lunchEntry === undefined || dinnerEntry === undefined) {
+    return dayEntries;
+  }
+  const adjacentSlugs = new Set<string>();
+  for (const adjacentDay of [dayIndex - 1, dayIndex + 1]) {
+    if (adjacentDay < 0 || adjacentDay > 6) continue;
+    const adjacent = rotationAssignment([assignment.breakfast], rotationMains, sidePool, adjacentDay);
+    adjacentSlugs.add(adjacent.lunch.slug);
+    adjacentSlugs.add(adjacent.dinner.slug);
+  }
+
+  const alternatesFor = (slot: "lunch" | "dinner"): readonly MealPlanAlternate[] => {
+    const alternates: MealPlanAlternate[] = [];
+    for (const candidate of rotationMains) {
+      if (alternates.length >= 2) break;
+      if (candidate.slug === assignment.lunch.slug || candidate.slug === assignment.dinner.slug) continue;
+      if (adjacentSlugs.has(candidate.slug)) continue;
+      const trial = buildDayEntries(
+        request,
+        date,
+        dayIndex,
+        assignment.breakfast,
+        slot === "lunch" ? candidate : assignment.lunch,
+        slot === "dinner" ? candidate : assignment.dinner,
+        slot === "lunch" ? rotationSide(candidate, sidePool, dayIndex * 2) : assignment.lunchSide,
+        slot === "dinner" ? rotationSide(candidate, sidePool, dayIndex * 2 + 1) : assignment.dinnerSide,
+      );
+      if (dayMeetsHardGates(trial, request)) {
+        alternates.push({ slug: candidate.slug, name: candidate.name });
       }
     }
-  }
-  if (best === undefined) throw new RangeError("No meal-plan combo candidates");
-  return best;
+    return alternates;
+  };
+
+  const lunchAlternates = alternatesFor("lunch");
+  const dinnerAlternates = alternatesFor("dinner");
+  return [
+    breakfastEntry,
+    { ...lunchEntry, ...(lunchAlternates.length === 0 ? {} : { alternates: lunchAlternates }) },
+    { ...dinnerEntry, ...(dinnerAlternates.length === 0 ? {} : { alternates: dinnerAlternates }) },
+  ];
+}
+
+function dayMeetsHardGates(dayEntries: readonly MealPlanEntry[], request: MealPlanRequest): boolean {
+  const totals = sumNutrition(dayEntries.map((entry) => entry.nutrition));
+  return isDailyKcalWithinTarget(totals.kcal, request.dailyKcalTarget, MAX_ENERGY_TOLERANCE_RATIO) &&
+    isDailyProteinWithinFloor(totals.proteinGrams, request.dailyProteinTarget);
+}
+
+/** Rotation order: strongest protein first. Shared with the pool-time kcal screen. */
+export function sortMainsByProteinDesc(
+  mains: readonly RecipeDish[],
+  catalog: MealCatalog | undefined,
+): readonly RecipeDish[] {
+  const proteinOf = (dish: RecipeDish): number => {
+    if (catalog !== undefined) {
+      try {
+        return dishNutrition(dish, catalog).proteinGrams;
+      } catch {
+        // uncataloged ingredients fall back to the stored block
+      }
+    }
+    return dish.nutrition.proteinGrams;
+  };
+  return [...mains].sort((left, right) => proteinOf(right) - proteinOf(left));
+}
+
+function rotationSide(
+  main: RecipeDish,
+  sidePool: readonly RecipeDish[],
+  slot: number,
+): RecipeDish | undefined {
+  if (isSelfContainedMain(main) || sidePool.length === 0) return undefined;
+  return atCycle(sidePool, slot);
+}
+
+function atCycle<T>(items: readonly T[], index: number): T {
+  return items[index % items.length] as T;
 }
 
 function buildDayEntries(
@@ -242,11 +430,23 @@ function buildDayEntries(
   const lunchNutrition = composeMealNutrition({ dish: lunch, side: lunchSide }, request.catalog);
   const dinnerNutrition = composeMealNutrition({ dish: dinner, side: dinnerSide }, request.catalog);
   const fixedNutrition = sumNutrition([breakfastNutrition, lunchNutrition, dinnerNutrition]);
+  const staple = request.staple ?? DEFAULT_STAPLE;
+
+  // Lever order: protein top-ups close the floor first (crediting only the
+  // staple minimum the day will carry anyway), then the staple lever re-trues
+  // kcal around the enlarged fixed load.
+  const proteinTopUps = solveDayProteinTopUps(request, fixedNutrition, staple);
+  const topUpNutrition = proteinTopUps.length === 0
+    ? undefined
+    : sumNutrition(proteinTopUps.map((topUp) => topUp.nutrition));
+  const fixedWithTopUps = topUpNutrition === undefined
+    ? fixedNutrition
+    : addNutrition(fixedNutrition, topUpNutrition);
   const stapleSolve = solveStaplePortionsForDay({
     dailyKcalTarget: request.dailyKcalTarget,
-    fixedNutrition,
+    fixedNutrition: fixedWithTopUps,
     mainMealCount: 2,
-    staple: request.staple ?? DEFAULT_STAPLE,
+    staple,
     catalog: request.catalog,
     energyToleranceRatio: ENERGY_TOLERANCE_RATIO,
   });
@@ -255,16 +455,53 @@ function buildDayEntries(
     { dish: lunch, side: lunchSide, staple: lunchStaple },
     request.catalog,
   );
-  const dinnerComposedNutrition = composeMealNutrition(
+  const dinnerComposedBase = composeMealNutrition(
     { dish: dinner, side: dinnerSide, staple: dinnerStaple },
     request.catalog,
   );
+  const dinnerComposedNutrition = topUpNutrition === undefined
+    ? dinnerComposedBase
+    : addNutrition(dinnerComposedBase, topUpNutrition);
 
   return [
     buildEntry(date, dayIndex, "breakfast", breakfast, breakfastNutrition),
     buildEntry(date, dayIndex, "lunch", lunch, lunchComposedNutrition, lunchStaple, lunchSide),
-    buildEntry(date, dayIndex, "dinner", dinner, dinnerComposedNutrition, dinnerStaple, dinnerSide),
+    {
+      ...buildEntry(date, dayIndex, "dinner", dinner, dinnerComposedNutrition, dinnerStaple, dinnerSide),
+      ...(proteinTopUps.length === 0 ? {} : { proteinTopUps }),
+    },
   ];
+}
+
+/**
+ * Protein lever: when the day's fixed dishes (plus the guaranteed staple
+ * minimum) sit under the protein floor, append add-ons from the ordered
+ * top-up menu within the day's remaining kcal headroom.
+ */
+function solveDayProteinTopUps(
+  request: MealPlanRequest,
+  fixedNutrition: RecipeNutrition,
+  staple: Staple,
+): readonly ProteinTopUpPortion[] {
+  if (request.catalog === undefined || request.dailyProteinTarget === undefined) return [];
+  const floor = Math.round(request.dailyProteinTarget * PROTEIN_FLOOR_RATIO);
+  if (floor <= 0) return [];
+  let minStaple: RecipeNutrition = { kcal: 0, proteinGrams: 0, carbsGrams: 0, fatGrams: 0, sodiumMg: 0 };
+  try {
+    minStaple = stapleNutrition({ slug: staple.slug, grams: staple.minGrams * 2 }, request.catalog);
+  } catch {
+    // staple missing from the catalog: solve without the staple credit
+  }
+  if (fixedNutrition.proteinGrams + minStaple.proteinGrams >= floor) return [];
+  const solve = solveProteinTopUps({
+    proteinFloorGrams: floor - minStaple.proteinGrams,
+    fixedNutrition,
+    remainingKcalBudget:
+      request.dailyKcalTarget * (1 + ENERGY_TOLERANCE_RATIO) - fixedNutrition.kcal - minStaple.kcal,
+    catalog: request.catalog,
+    ...(request.preferences === undefined ? {} : { preferences: request.preferences }),
+  });
+  return solve.addOns;
 }
 
 function buildEntry(
@@ -294,60 +531,22 @@ function nutritionForDish(dish: RecipeDish, catalog: MealCatalog): RecipeNutriti
   return dishNutrition(dish, catalog);
 }
 
-function comboScore(
-  request: MealPlanRequest,
-  existingEntries: readonly MealPlanEntry[],
-  combo: readonly MealPlanEntry[],
-  mainUsage: ReadonlyMap<string, number>,
-  sideUsage: ReadonlyMap<string, number>,
-): number {
-  const trialEntries = [...existingEntries, ...combo];
-  const dayTotals = sumNutrition(combo.map((entry) => entry.nutrition));
-  const energySoftMiss = Math.max(
-    0,
-    Math.abs(dayTotals.kcal - request.dailyKcalTarget) -
-      request.dailyKcalTarget * ENERGY_TOLERANCE_RATIO,
-  ) / request.dailyKcalTarget;
-  const energyMiss = Math.max(
-    0,
-    Math.abs(dayTotals.kcal - request.dailyKcalTarget) -
-      request.dailyKcalTarget * MAX_ENERGY_TOLERANCE_RATIO,
-  ) / request.dailyKcalTarget;
-  const proteinFloor = (request.dailyProteinTarget ?? 0) * PROTEIN_FLOOR_RATIO;
-  const proteinMiss = proteinFloor === 0 ? 0 : Math.max(0, proteinFloor - dayTotals.proteinGrams) / proteinFloor;
-  const duplicateMainPenalty = combo[1]?.dish.slug === combo[2]?.dish.slug ? 4 : 0;
-  const duplicateSidePenalty =
-    combo[1]?.side !== undefined && combo[1].side?.slug === combo[2]?.side?.slug ? 1 : 0;
-  const usagePenalty = combo.reduce((sum, entry) => sum + (mainUsage.get(entry.dish.slug) ?? 0), 0) * 0.7;
-  const sideUsagePenalty = combo.reduce(
-    (sum, entry) => sum + (entry.side === undefined ? 0 : sideUsage.get(entry.side.slug) ?? 0),
-    0,
-  ) * 0.25;
-  const repeatIngredientPenalty = wouldRepeatIngredients(existingEntries, combo) ? 2 : 0;
-  const trialPlan = buildPlan(request.startDate, trialEntries, []);
-  const softPenalty = scorePlan(
-    trialPlan,
-    {
-      dailyKcalTarget: request.dailyKcalTarget,
-      dailyProteinTarget: request.dailyProteinTarget,
-      dailyFatTarget: request.dailyFatTarget,
-      dailyCarbsTarget: request.dailyCarbsTarget,
-    },
-    request.preferences,
-  ).penalty;
-  const hardMissCount = Number(energyMiss > 0) + Number(proteinMiss > 0);
-  const hardMissMagnitude = energyMiss + proteinMiss;
-  return hardMissCount * 1_000_000 + hardMissMagnitude * 100_000 + energySoftMiss * 1_000 + duplicateMainPenalty + duplicateSidePenalty + usagePenalty + sideUsagePenalty + repeatIngredientPenalty + softPenalty;
-}
-
 function buildPlan(
   startDate: string,
   entries: readonly MealPlanEntry[],
   hardViolations: readonly HardViolation[],
+  targets: WeeklyBudgetTargets = {},
 ): WeeklyMealPlan {
   const days = Array.from({ length: 7 }, (_, dayIndex) => buildDay(addDays(startDate, dayIndex), entries));
   const distinctDishCount = new Set(entries.map((entry) => entry.dish.slug)).size;
-  return { startDate, days, entries, distinctDishCount, hardViolations };
+  return {
+    startDate,
+    days,
+    entries,
+    distinctDishCount,
+    hardViolations,
+    weeklyBudgets: buildWeeklyBudgets({ days }, targets),
+  };
 }
 
 function buildDay(date: string, entries: readonly MealPlanEntry[]): MealPlanDay {
@@ -377,9 +576,8 @@ function hardViolationsForPlan(plan: WeeklyMealPlan, request: MealPlanRequest): 
         message: `${day.date} protein ${day.totals.proteinGrams}g below ${target}g floor`,
       };
     });
-  // Fat is a SOFT constraint: it is not a hard violation. It stays as a strong
-  // ranking signal in comboScore, a soft penalty in scorePlan, and an advisory
-  // note via validateDailyFat — but it never blocks plan generation.
+  // Fat is a SOFT constraint: it is not a hard violation. It stays as a ranking
+  // signal and is reported as a weekly budget instead of a per-day advisory.
   return [...energyViolations, ...proteinViolations];
 }
 
@@ -447,15 +645,6 @@ function validateDailyProtein(plan: WeeklyMealPlan, dailyProteinTarget: number |
     .map((day) => `${day.date} protein ${day.totals.proteinGrams}g below ${floor}g floor`);
 }
 
-function validateDailyFat(plan: WeeklyMealPlan, dailyFatTarget: number | undefined): readonly string[] {
-  const target = positiveTarget(dailyFatTarget);
-  if (target === undefined) return [];
-  const toleratedTarget = roundTo(target * FAT_ADVISORY_TOLERANCE_RATIO, 1);
-  return plan.days
-    .filter((day) => !isDailyFatWithinCeiling(day.totals.fatGrams, target))
-    .map((day) => `${day.date} fat ${day.totals.fatGrams}g above ${toleratedTarget}g tolerated ceiling`);
-}
-
 function validateStructuralCompleteness(plan: WeeklyMealPlan): readonly string[] {
   return plan.days.flatMap((day) => {
     const mealTypes = day.meals.map((meal) => meal.mealType);
@@ -476,30 +665,12 @@ function isDailyProteinWithinFloor(proteinGrams: number, dailyProteinTarget: num
   return dailyProteinTarget === undefined || proteinGrams >= Math.round(dailyProteinTarget * PROTEIN_FLOOR_RATIO);
 }
 
-function isDailyFatWithinCeiling(fatGrams: number, dailyFatTarget: number): boolean {
-  return fatGrams <= dailyFatTarget * FAT_ADVISORY_TOLERANCE_RATIO;
-}
-
 function validateDistinctDishes(
   plan: WeeklyMealPlan,
   minimumDistinctDishes: number | undefined,
 ): readonly string[] {
   if (minimumDistinctDishes === undefined || plan.distinctDishCount >= minimumDistinctDishes) return [];
   return [`only ${plan.distinctDishCount} distinct dishes planned`];
-}
-
-function wouldRepeatIngredients(existingEntries: readonly MealPlanEntry[], combo: readonly MealPlanEntry[]): boolean {
-  const sequence = [...existingEntries.slice(-2), ...combo];
-  for (let index = 2; index < sequence.length; index += 1) {
-    const current = sequence[index];
-    const previous = sequence[index - 1];
-    const before = sequence[index - 2];
-    if (current === undefined || previous === undefined || before === undefined) continue;
-    for (const slug of ingredientSlugs(current.dish)) {
-      if (ingredientSlugs(previous.dish).has(slug) && ingredientSlugs(before.dish).has(slug)) return true;
-    }
-  }
-  return false;
 }
 
 function collectCandidates(request: MealPlanRequest): readonly RecipeDish[] {
@@ -540,11 +711,6 @@ function matchesSide(dish: RecipeDish): boolean {
   );
 }
 
-function sideOptionsFor(main: RecipeDish, sidePool: readonly RecipeDish[]): readonly (RecipeDish | undefined)[] {
-  if (isSelfContainedMain(main) || sidePool.length === 0) return [undefined];
-  return sidePool;
-}
-
 function isSelfContainedMain(dish: RecipeDish): boolean {
   return dish.selfContained !== false;
 }
@@ -564,8 +730,33 @@ function sumNutrition(items: readonly RecipeNutrition[]): RecipeNutrition {
   };
 }
 
-function ingredientSlugs(dish: RecipeDish): ReadonlySet<string> {
-  return new Set(dish.ingredients.map((ingredient) => ingredient.slug));
+function weeklyBudget(actualRaw: number, dailyTarget: number | undefined, decimals: number): WeeklyBudget {
+  const actual = roundTo(actualRaw, decimals);
+  const positiveDailyTarget = positiveTarget(dailyTarget);
+  const target = positiveDailyTarget === undefined ? 0 : roundTo(positiveDailyTarget * 7, decimals);
+  const difference = roundTo(actual - target, decimals);
+  const percentDifference = target === 0 ? 0 : roundTo(Math.abs(difference) / target * 100, 1);
+  const status: WeeklyBudgetStatus = target === 0
+    ? "no_target"
+    : difference > 0
+      ? "over"
+      : difference < 0
+        ? "under"
+        : "on_target";
+  return { actual, target, difference, percentDifference, status };
+}
+
+function formatBudget(label: string, budget: WeeklyBudget, unit: string): string {
+  if (budget.status === "no_target") return `${label} ${formatNumber(budget.actual)}${unit} logged, no weekly target`;
+  return `${label} ${formatNumber(budget.actual)}${unit} / ${formatNumber(budget.target)}${unit}, ${formatNumber(budget.percentDifference)}% ${budget.status === "on_target" ? "on target" : budget.status}`;
+}
+
+function formatNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function sumValues(values: readonly number[]): number {
+  return values.reduce((sum, value) => sum + value, 0);
 }
 
 function validateMealPlanRequest(request: MealPlanRequest): void {

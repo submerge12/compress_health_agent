@@ -55,7 +55,7 @@ describe("meal planner composition", () => {
 
     expect(plan.entries).toHaveLength(21);
     expect(plan.entries.filter((entry) => entry.mealType !== "breakfast").every((entry) =>
-      entry.staple?.slug === "brown_rice" && entry.staple.grams >= 40,
+      entry.staple?.slug === "brown_rice" && entry.staple.grams >= 30 && entry.staple.grams % 30 === 0,
     )).toBe(true);
     expect(plan.entries.filter((entry) => entry.mealType === "breakfast").every((entry) =>
       entry.staple === undefined,

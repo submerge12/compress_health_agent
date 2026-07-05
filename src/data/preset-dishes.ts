@@ -41,6 +41,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "corn_fresh", grams: 120 },
       { slug: "steamed_bun", grams: 80 },
       { slug: "egg", grams: 100 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["olive_oil"],
     source: "preset",
@@ -55,6 +56,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "quinoa_ciabatta", grams: 90 },
       { slug: "egg", grams: 100 },
       { slug: "whole_milk", grams: 200 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["olive_oil", "black_pepper"],
     source: "preset",
@@ -70,9 +72,13 @@ export const presetDishes: readonly RecipeDish[] = [
     role: "main",
     selfContained: false,
     nutrition: { kcal: 561, proteinGrams: 31.9, carbsGrams: 45.3, fatGrams: 24.5, sodiumMg: 628 },
+    // Cooking oil is a gram-bearing ingredient (meal nutrition is computed
+    // from ingredients); the oil slug stays in seasonings only as the
+    // preference-matching tag.
     ingredients: [
       { slug: "beef_tenderloin", grams: 150 },
       { slug: "scallion", grams: 30 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["light_soy_sauce", "olive_oil", "garlic", "ginger"],
     source: "preset",
@@ -89,6 +95,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "chicken_thigh", grams: 150 },
       { slug: "egg", grams: 50 },
       { slug: "shiitake_fresh", grams: 50 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["light_soy_sauce", "dark_soy_sauce", "cooking_wine", "star_anise", "cinnamon", "ginger"],
     source: "preset",
@@ -106,6 +113,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "shrimp_jiweixia", grams: 80 },
       { slug: "cucumber", grams: 80 },
       { slug: "carrot", grams: 50 },
+      { slug: "sesame_oil", grams: 10 },
     ],
     seasonings: ["sesame_oil", "light_soy_sauce", "aged_vinegar"],
     source: "preset",
@@ -120,6 +128,7 @@ export const presetDishes: readonly RecipeDish[] = [
     nutrition: { kcal: 529, proteinGrams: 31.6, carbsGrams: 43.5, fatGrams: 22.8, sodiumMg: 639 },
     ingredients: [
       { slug: "hairtail", grams: 150 },
+      { slug: "olive_oil", grams: 15 },
     ],
     seasonings: ["light_soy_sauce", "dark_soy_sauce", "cooking_wine", "ginger", "garlic", "star_anise"],
     source: "preset",
@@ -135,10 +144,30 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "beef_tenderloin", grams: 150 },
       { slug: "onion", grams: 80 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["light_soy_sauce", "oyster_sauce", "olive_oil", "garlic"],
     source: "preset",
     method: "stir_fry",
+  },
+
+  {
+    slug: "chaoshan_beef_soup",
+    name: "潮汕牛肉汤",
+    mealTypes: ["lunch", "dinner"],
+    role: "main",
+    selfContained: false,
+    // Clear-broth blanched tenderloin, no shacha dip (user preference, fat-loss
+    // phase). Leanest main in the pool; carries the red-meat weekly floor when
+    // the fat budget is tight.
+    nutrition: { kcal: 400, proteinGrams: 47.5, carbsGrams: 38, fatGrams: 4.5, sodiumMg: 650 },
+    ingredients: [
+      { slug: "beef_tenderloin", grams: 200 },
+      { slug: "scallion", grams: 10 },
+    ],
+    seasonings: ["salt", "ginger"],
+    source: "preset",
+    method: "boiling",
   },
 
   // ── Main meals (continued) — lighter mains, ~580–650 kcal ──
@@ -151,6 +180,8 @@ export const presetDishes: readonly RecipeDish[] = [
     nutrition: { kcal: 483, proteinGrams: 38.4, carbsGrams: 37.9, fatGrams: 16.7, sodiumMg: 469 },
     ingredients: [
       { slug: "sea_bream", grams: 200 },
+      { slug: "sesame_oil", grams: 5 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["light_soy_sauce", "ginger", "scallion", "sesame_oil", "garlic"],
     source: "preset",
@@ -166,6 +197,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "shrimp_jiweixia", grams: 120 },
       { slug: "broccoli", grams: 150 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["garlic", "olive_oil", "light_soy_sauce", "cooking_wine"],
     source: "preset",
@@ -182,6 +214,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "shrimp_jiweixia", grams: 80 },
       { slug: "baby_napa", grams: 120 },
       { slug: "glass_noodles", grams: 40 },
+      { slug: "sesame_oil", grams: 5 },
     ],
     seasonings: ["garlic", "light_soy_sauce", "sesame_oil"],
     source: "preset",
@@ -197,6 +230,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "chicken_breast", grams: 130 },
       { slug: "carrot", grams: 80 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["light_soy_sauce", "cooking_wine", "olive_oil", "ginger"],
     source: "preset",
@@ -212,6 +246,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "sea_bream", grams: 200 },
       { slug: "lemon", grams: 20 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["olive_oil", "salt", "black_pepper", "ginger"],
     source: "preset",
@@ -229,6 +264,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "chicken_breast", grams: 230 },
       { slug: "onion", grams: 60 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["olive_oil", "garlic", "black_pepper", "salt", "cooking_wine"],
     source: "preset",
@@ -245,6 +281,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "chicken_breast", grams: 210 },
       { slug: "egg", grams: 80 },
       { slug: "cucumber", grams: 80 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["olive_oil", "garlic", "black_pepper", "salt"],
     source: "preset",
@@ -261,6 +298,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "beef_tenderloin", grams: 180 },
       { slug: "egg", grams: 50 },
       { slug: "onion", grams: 60 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["olive_oil", "garlic", "black_pepper", "salt", "cooking_wine"],
     source: "preset",
@@ -275,6 +313,7 @@ export const presetDishes: readonly RecipeDish[] = [
     nutrition: { kcal: 477, proteinGrams: 32.3, carbsGrams: 43.1, fatGrams: 18.9, sodiumMg: 589 },
     ingredients: [
       { slug: "tofu", grams: 280 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["light_soy_sauce", "dark_soy_sauce", "garlic", "ginger"],
     source: "preset",
@@ -290,6 +329,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "tofu", grams: 250 },
       { slug: "broccoli", grams: 150 },
+      { slug: "olive_oil", grams: 10 },
     ],
     seasonings: ["light_soy_sauce", "olive_oil", "garlic"],
     source: "preset",
@@ -333,6 +373,8 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "tofu", grams: 280 },
       { slug: "scallion", grams: 30 },
+      { slug: "olive_oil", grams: 5 },
+      { slug: "sesame_oil", grams: 5 },
     ],
     seasonings: ["light_soy_sauce", "dark_soy_sauce", "sesame_oil", "ginger"],
     source: "preset",
@@ -349,6 +391,7 @@ export const presetDishes: readonly RecipeDish[] = [
       { slug: "tofu", grams: 200 },
       { slug: "nori_dried", grams: 5 },
       { slug: "egg", grams: 50 },
+      { slug: "sesame_oil", grams: 5 },
     ],
     seasonings: ["light_soy_sauce", "sesame_oil", "salt"],
     source: "preset",
@@ -363,6 +406,7 @@ export const presetDishes: readonly RecipeDish[] = [
     nutrition: { kcal: 27, proteinGrams: 3.5, carbsGrams: 3.7, fatGrams: 0.6, sodiumMg: 47 },
     ingredients: [
       { slug: "broccoli", grams: 100 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["garlic", "olive_oil", "light_soy_sauce"],
     source: "preset",
@@ -378,6 +422,7 @@ export const presetDishes: readonly RecipeDish[] = [
     ingredients: [
       { slug: "bok_choy", grams: 80 },
       { slug: "shiitake_fresh", grams: 30 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["garlic", "olive_oil"],
     source: "preset",
@@ -392,6 +437,7 @@ export const presetDishes: readonly RecipeDish[] = [
     nutrition: { kcal: 11, proteinGrams: 1.1, carbsGrams: 1.9, fatGrams: 0.2, sodiumMg: 106 },
     ingredients: [
       { slug: "bok_choy", grams: 80 },
+      { slug: "olive_oil", grams: 5 },
     ],
     seasonings: ["garlic", "olive_oil"],
     source: "preset",

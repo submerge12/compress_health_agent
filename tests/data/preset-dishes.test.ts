@@ -41,6 +41,7 @@ describe("preset dishes", () => {
     expect(mainDishes.filter((dish) => dish.selfContained === false).map((dish) => dish.slug).sort()).toEqual([
       "braised_hairtail_rice",
       "braised_tofu_rice",
+      "chaoshan_beef_soup",
       "chicken_carrot_rice",
       "chicken_shrimp_salad_soup",
       "onion_beef_rice",

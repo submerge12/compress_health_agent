@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import { scorePlan } from "../../src/engine/meal-plan-scoring.js";
-import type { MealPlanEntry, WeeklyMealPlan } from "../../src/engine/meal-planner.js";
+import { buildWeeklyBudgets, type MealPlanEntry, type WeeklyMealPlan } from "../../src/engine/meal-planner.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
 
 function dish(
@@ -58,6 +58,7 @@ function plan(entries: readonly MealPlanEntry[]): WeeklyMealPlan {
     entries,
     distinctDishCount: new Set(entries.map((item) => item.dish.slug)).size,
     hardViolations: [],
+    weeklyBudgets: buildWeeklyBudgets({ days }, {}),
   };
 }
 

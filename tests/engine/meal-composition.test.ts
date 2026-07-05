@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   DEFAULT_STAPLE,
   composeMealNutrition,
+  solveProteinTopUps,
   solveStaplePortionsForDay,
   stapleNutrition,
 } from "../../src/engine/meal-composition.js";
@@ -49,6 +50,48 @@ const catalog: MealCatalog = {
       carbsGramsPer100g: 75,
       fatGramsPer100g: 2.7,
       sodiumMgPer100g: 1,
+    },
+    {
+      slug: "egg",
+      name: "egg",
+      aliases: [],
+      defaultGrams: 50,
+      defaultUnit: "piece",
+      weightType: "raw",
+      kcalPer100g: 144,
+      proteinGramsPer100g: 13,
+      carbsGramsPer100g: 1.1,
+      fatGramsPer100g: 9.5,
+      sodiumMgPer100g: 140,
+      allergenTags: ["egg"],
+    },
+    {
+      slug: "tofu",
+      name: "tofu",
+      aliases: [],
+      defaultGrams: 150,
+      defaultUnit: "serving",
+      weightType: "raw",
+      kcalPer100g: 84,
+      proteinGramsPer100g: 8.1,
+      carbsGramsPer100g: 2,
+      fatGramsPer100g: 4.8,
+      sodiumMgPer100g: 8,
+      allergenTags: ["soy"],
+    },
+    {
+      slug: "soy_milk",
+      name: "soy milk",
+      aliases: [],
+      defaultGrams: 250,
+      defaultUnit: "cup",
+      weightType: "raw",
+      kcalPer100g: 32,
+      proteinGramsPer100g: 3,
+      carbsGramsPer100g: 1.8,
+      fatGramsPer100g: 1.6,
+      sodiumMgPer100g: 14,
+      allergenTags: ["soy"],
     },
   ],
   naturalUnits: [],
@@ -99,11 +142,13 @@ describe("meal composition", () => {
       catalog,
     });
 
+    // Half-bowl lattice (30 g dry): the 350 kcal gap solves to 90 g total,
+    // split 1 碗 + 半碗 instead of scale-precise 50/50.
     expect(result.portions).toEqual([
-      { slug: "brown_rice", grams: 50 },
-      { slug: "brown_rice", grams: 50 },
+      { slug: "brown_rice", grams: 60 },
+      { slug: "brown_rice", grams: 30 },
     ]);
-    expect(result.composedKcal).toBe(1798);
+    expect(result.composedKcal).toBe(1763);
     expect(result.withinEnergyBand).toBe(true);
     expect(result.clamped).toBe(false);
   });
@@ -123,6 +168,56 @@ describe("meal composition", () => {
     ]);
     expect(result.clamped).toBe(true);
     expect(result.withinEnergyBand).toBe(false);
+  });
+
+  test("solveProteinTopUps adds ordered protein portions until a low-protein day reaches the floor", () => {
+    const result = solveProteinTopUps({
+      proteinFloorGrams: 92,
+      fixedNutrition: { kcal: 1200, proteinGrams: 70, carbsGrams: 140, fatGrams: 35, sodiumMg: 800 },
+      remainingKcalBudget: 300,
+      catalog,
+    });
+
+    expect(result.addOns.map((addOn) => addOn.slug)).toEqual([
+      "protein_topup_egg",
+      "protein_topup_tofu",
+      "protein_topup_soy_milk",
+    ]);
+    expect(result.composedNutrition.proteinGrams).toBeGreaterThanOrEqual(92);
+    expect(result.meetsProteinFloor).toBe(true);
+  });
+
+  test("solveProteinTopUps filters add-ons that violate allergen and dislike preferences", () => {
+    const result = solveProteinTopUps({
+      proteinFloorGrams: 82,
+      fixedNutrition: { kcal: 1200, proteinGrams: 70, carbsGrams: 140, fatGrams: 35, sodiumMg: 800 },
+      remainingKcalBudget: 300,
+      preferences: {
+        allergens: ["soy"],
+        rejectedIngredients: ["egg"],
+      },
+      catalog,
+    });
+
+    expect(result.addOns).toEqual([]);
+    expect(result.meetsProteinFloor).toBe(false);
+  });
+
+  test("solveProteinTopUps keeps add-on kcal inside the remaining staple energy budget", () => {
+    const result = solveProteinTopUps({
+      proteinFloorGrams: 92,
+      fixedNutrition: { kcal: 1200, proteinGrams: 70, carbsGrams: 140, fatGrams: 35, sodiumMg: 800 },
+      remainingKcalBudget: 200,
+      catalog,
+    });
+
+    const addOnKcal = result.addOns.reduce((sum, addOn) => sum + addOn.nutrition.kcal, 0);
+    expect(result.addOns.map((addOn) => addOn.slug)).toEqual([
+      "protein_topup_egg",
+      "protein_topup_tofu",
+    ]);
+    expect(addOnKcal).toBeLessThanOrEqual(200);
+    expect(result.kcalWithinBudget).toBe(true);
   });
 });
 

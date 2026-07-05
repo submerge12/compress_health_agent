@@ -56,6 +56,13 @@ export function buildProcurementList(
         buckets: entry.side!.buckets ?? [],
         roles: entry.side!.roles ?? [],
       })),
+      ...(entry.proteinTopUps ?? []).flatMap((topUp) =>
+        topUp.ingredients.map((ingredient) => ({
+          ingredient,
+          componentSlug: topUp.slug,
+          buckets: [],
+          roles: [],
+        }))),
       ...(entry.staple === undefined
         ? []
         : [{

@@ -1,7 +1,6 @@
-import type { HardViolation, WeeklyMealPlan } from "./meal-planner.js";
+import { buildWeeklyBudgets, type HardViolation, type WeeklyMealPlan } from "./meal-planner.js";
 import type { RecipeDish } from "./recipe-engine.js";
 import {
-  FAT_ADVISORY_TOLERANCE_RATIO,
   MIN_DISTINCT_DISHES,
   SODIUM_CAP_MG,
   WEEKLY_FLOORS,
@@ -10,8 +9,7 @@ import {
 export type CoverageItemType =
   | "weekly_floor"
   | "protein_average"
-  | "fat_ceiling"
-  | "sodium"
+  | "weekly_budget"
   | "diversity"
   | "hard_violation"
   | "pool_coverage"
@@ -28,6 +26,8 @@ export interface CoverageItem {
 export interface CoverageReportOptions {
   dailyProteinTarget?: number;
   dailyFatTarget?: number;
+  dailyCarbsTarget?: number;
+  dailySodiumTarget?: number;
   weeklyFloors?: Readonly<Record<string, number>>;
   minDistinctDishes?: number;
   sodiumCapMg?: number;
@@ -46,8 +46,12 @@ export function buildCoverageReport(
     unmet: [
       ...weeklyFloorItems(plan, options.weeklyFloors ?? WEEKLY_FLOORS),
       ...proteinAverageItems(plan, options.dailyProteinTarget),
-      ...fatCeilingItems(plan, options.dailyFatTarget),
-      ...sodiumItems(plan, options.sodiumCapMg ?? SODIUM_CAP_MG),
+      ...weeklyBudgetItems(plan, {
+        dailyFatTarget: options.dailyFatTarget,
+        dailyCarbsTarget: options.dailyCarbsTarget,
+        dailySodiumTarget: options.dailySodiumTarget ?? options.sodiumCapMg ?? SODIUM_CAP_MG,
+      }),
+      ...sodiumSpikeItems(plan, options.sodiumCapMg ?? SODIUM_CAP_MG),
       ...diversityItems(plan, options.minDistinctDishes ?? MIN_DISTINCT_DISHES),
       ...hardViolationItems(plan.hardViolations),
       ...frequencyHintItems(plan),
@@ -256,32 +260,50 @@ function proteinAverageItems(
   }];
 }
 
-function fatCeilingItems(
+function weeklyBudgetItems(
   plan: WeeklyMealPlan,
-  dailyFatTarget: number | undefined,
+  targets: Parameters<typeof buildWeeklyBudgets>[1],
 ): readonly CoverageItem[] {
-  if (dailyFatTarget === undefined || dailyFatTarget <= 0) return [];
-  const actual = round1(Math.max(...plan.days.map((day) => day.totals.fatGrams), 0));
-  const toleratedTarget = round1(dailyFatTarget * FAT_ADVISORY_TOLERANCE_RATIO);
-  if (actual <= toleratedTarget) return [];
-  return [{
-    type: "fat_ceiling",
-    key: "fat",
-    actual,
-    target: toleratedTarget,
-    message: `fat reached ${actual}g/day vs ${toleratedTarget}g tolerated ceiling`,
-  }];
+  const budgets = buildWeeklyBudgets(plan, targets);
+  return [
+    budgetItem("fat", budgets.fat, "g"),
+    budgetItem("sodium", budgets.sodium, "mg"),
+    budgetItem("carbs", budgets.carbs, "g"),
+  ].filter((item): item is CoverageItem => item !== undefined);
 }
 
-function sodiumItems(plan: WeeklyMealPlan, sodiumCapMg: number): readonly CoverageItem[] {
-  const daysOver = plan.days.filter((day) => day.totals.sodiumMg > sodiumCapMg).length;
-  if (daysOver === 0) return [];
+function budgetItem(
+  key: "fat" | "sodium" | "carbs",
+  budget: ReturnType<typeof buildWeeklyBudgets>[typeof key],
+  unit: string,
+): CoverageItem | undefined {
+  // Weekly budgets are ceilings: only OVER-budget is an unmet item. Reporting
+  // "under" as unmet would reinstate the always-on advisory noise the v2
+  // design deletes (the budget line already states % over/under either way).
+  if (budget.status !== "over") return undefined;
+  return {
+    type: "weekly_budget",
+    key,
+    actual: budget.actual,
+    target: budget.target,
+    message: `${key}: ${formatNumber(budget.actual)}${unit}/${formatNumber(budget.target)}${unit}, ${formatNumber(budget.percentDifference)}% ${budget.status}`,
+  };
+}
+
+/**
+ * The weekly sodium budget can hide a single-day spike (one 6000 mg day in an
+ * otherwise lean week). The per-day cap is a health threshold, not budget
+ * smoothing, so spike days stay individually surfaced.
+ */
+function sodiumSpikeItems(plan: WeeklyMealPlan, capMg: number): readonly CoverageItem[] {
+  const daysOverCap = plan.days.filter((day) => day.totals.sodiumMg > capMg).length;
+  if (daysOverCap === 0) return [];
   return [{
-    type: "sodium",
-    key: "days_over_cap",
-    actual: daysOver,
+    type: "weekly_budget",
+    key: "sodium_days_over_cap",
+    actual: daysOverCap,
     target: 0,
-    message: `${daysOver} day(s) exceeded ${sodiumCapMg}mg sodium`,
+    message: `${daysOverCap} day(s) exceeded ${capMg}mg sodium`,
   }];
 }
 
@@ -340,4 +362,8 @@ function normalize(value: string): string {
 
 function round1(value: number): number {
   return Math.round(value * 10) / 10;
+}
+
+function formatNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
 }

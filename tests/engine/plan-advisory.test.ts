@@ -1,11 +1,11 @@
 import { describe, expect, test } from "vitest";
 
 import { buildCoverageReport } from "../../src/engine/plan-advisory.js";
-import type { MealPlanEntry, WeeklyMealPlan } from "../../src/engine/meal-planner.js";
+import { buildWeeklyBudgets, type MealPlanEntry, type WeeklyMealPlan } from "../../src/engine/meal-planner.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
 
 describe("buildCoverageReport", () => {
-  test("enumerates unmet weekly floors, protein average, sodium, and diversity terms", () => {
+  test("enumerates unmet weekly floors, protein average, weekly budgets, and diversity terms", () => {
     const beef = dish("beef", 600, 40, 900, ["red_meat"], { red_meat: 2 });
     const plain = dish("plain", 600, 20, 2600);
     const entries = [
@@ -28,14 +28,16 @@ describe("buildCoverageReport", () => {
         expect.objectContaining({ type: "weekly_floor", key: "deep_sea_fish", actual: 0, target: 2 }),
         expect.objectContaining({ type: "weekly_floor", key: "red_meat", actual: 1, target: 2 }),
         expect.objectContaining({ type: "protein_average", actual: 70, target: 100 }),
-        expect.objectContaining({ type: "sodium", key: "days_over_cap", actual: 2, target: 0 }),
         expect.objectContaining({ type: "diversity", actual: 2, target: 10 }),
       ]),
     );
+    // Budgets are ceilings: under-cap sodium is not an unmet item (that would
+    // be always-on advisory noise, which v2 deletes structurally).
+    expect(report.unmet.some((item) => item.type === "weekly_budget" && item.key === "sodium")).toBe(false);
   });
 
-  test("surfaces fat ceiling advisory when daily fat target is exceeded", () => {
-    const fatty = dish("fatty_main", 600, 40, 500, [], {}, undefined, { fatGrams: 50 });
+  test("surfaces over-budget fat as a weekly budget instead of a daily ceiling advisory", () => {
+    const fatty = dish("fatty_main", 600, 40, 500, [], {}, undefined, { fatGrams: 130 });
     const plan = planWith([entry(0, "lunch", fatty), entry(1, "lunch", fatty)]);
 
     const report = buildCoverageReport(plan, { dailyFatTarget: 35 });
@@ -43,22 +45,32 @@ describe("buildCoverageReport", () => {
     expect(report.unmet).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          type: "fat_ceiling",
+          type: "weekly_budget",
           key: "fat",
-          actual: 50,
-          target: 40.3,
+          actual: 260,
+          target: 245,
         }),
       ]),
     );
+    expect(report.unmet.map((item) => item.message).join(" ")).not.toContain("g/day");
   });
 
-  test("does not surface fat ceiling advisory inside the tolerance band", () => {
+  test("under-budget weeks emit no weekly_budget unmet items at all", () => {
+    const lean = dish("lean_main", 600, 40, 500, [], {}, undefined, { fatGrams: 20 });
+    const plan = planWith([entry(0, "lunch", lean), entry(1, "lunch", lean)]);
+
+    const report = buildCoverageReport(plan, { dailyFatTarget: 35, dailyCarbsTarget: 200 });
+
+    expect(report.unmet.filter((item) => item.type === "weekly_budget")).toEqual([]);
+  });
+
+  test("does not surface per-day fat ceiling advisory inside the old tolerance band", () => {
     const slightlyOver = dish("slightly_over_fat", 600, 40, 500, [], {}, undefined, { fatGrams: 46 });
     const plan = planWith([entry(0, "lunch", slightlyOver)]);
 
     const report = buildCoverageReport(plan, { dailyFatTarget: 40 });
 
-    expect(report.unmet.map((item) => item.type)).not.toContain("fat_ceiling");
+    expect(report.unmet.map((item) => item.message).join(" ")).not.toContain("tolerated ceiling");
   });
 
   test("advises when the accepted pool has only staples and no protein sources", () => {
@@ -229,15 +241,17 @@ function entry(dayIndex: number, mealType: MealPlanEntry["mealType"], dish: Reci
 }
 
 function planWith(entries: readonly MealPlanEntry[]): WeeklyMealPlan {
+  const days = [
+    day("2026-06-16", entries.filter((entry) => entry.dayIndex === 0)),
+    day("2026-06-17", entries.filter((entry) => entry.dayIndex === 1)),
+  ];
   return {
     startDate: "2026-06-16",
-    days: [
-      day("2026-06-16", entries.filter((entry) => entry.dayIndex === 0)),
-      day("2026-06-17", entries.filter((entry) => entry.dayIndex === 1)),
-    ],
+    days,
     entries,
     distinctDishCount: new Set(entries.map((entry) => entry.dish.slug)).size,
     hardViolations: [],
+    weeklyBudgets: buildWeeklyBudgets({ days }, {}),
   };
 }
 

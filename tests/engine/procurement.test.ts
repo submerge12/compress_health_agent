@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 
+import { buildWeeklyBudgets } from "../../src/engine/meal-planner.js";
 import { buildProcurementList } from "../../src/engine/procurement.js";
 import type { MealPlanEntry, WeeklyMealPlan } from "../../src/engine/meal-planner.js";
 import type { RecipeDish } from "../../src/engine/recipe-engine.js";
@@ -151,5 +152,6 @@ function planWith(entries: readonly MealPlanEntry[]): WeeklyMealPlan {
     entries,
     distinctDishCount: new Set(entries.map((item) => item.dish.slug)).size,
     hardViolations: [],
+    weeklyBudgets: buildWeeklyBudgets({ days: [] }, {}),
   };
 }
