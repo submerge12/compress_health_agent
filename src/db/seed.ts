@@ -102,6 +102,7 @@ export interface SeedCounts {
 export interface FoodLibraryDedupeResult {
   foodItems: FoodItemSeed[];
   aliases: FoodAliasSeed[];
+  skippedFoodItems: FoodItemSeed[];
   skippedCount: number;
 }
 
@@ -396,6 +397,29 @@ export function loadFoodAliasesFromCsv(csv: string): FoodAliasSeed[] {
   return parseCsv(csv).flatMap(toFoodAliasSeeds);
 }
 
+/**
+ * Collapse rows sharing one slug into a single row (keep-first), unioning
+ * allergen tags from the dropped duplicates. A batch INSERT ... ON CONFLICT DO
+ * UPDATE fails with "cannot affect row a second time" when the same conflict
+ * key appears twice in one statement, so every insert batch must be
+ * slug-unique.
+ */
+export function dedupeRowsBySlug(rows: readonly FoodItemSeed[]): FoodItemSeed[] {
+  const bySlug = new Map<string, FoodItemSeed>();
+  for (const row of rows) {
+    const existing = bySlug.get(row.slug);
+    if (existing === undefined) {
+      bySlug.set(row.slug, row);
+      continue;
+    }
+    const mergedAllergenTags = [...new Set([...existing.allergenTags, ...row.allergenTags])].sort();
+    if (mergedAllergenTags.length !== existing.allergenTags.length) {
+      bySlug.set(row.slug, { ...existing, allergenTags: mergedAllergenTags });
+    }
+  }
+  return [...bySlug.values()];
+}
+
 export function dedupeFoodLibraryRows(
   curatedRows: readonly FoodItemSeed[],
   curatedAliases: readonly FoodAliasSeed[],
@@ -430,6 +454,7 @@ export function dedupeFoodLibraryRows(
 
   const kept: FoodItemSeed[] = [];
   const aliases: FoodAliasSeed[] = [];
+  const skippedFoodItems: FoodItemSeed[] = [];
   let skippedCount = 0;
 
   for (const row of libraryRows) {
@@ -440,6 +465,7 @@ export function dedupeFoodLibraryRows(
     }
 
     skippedCount += 1;
+    skippedFoodItems.push(row);
     const knownLabels = labelsBySlug.get(owner) ?? new Set<string>();
     labelsBySlug.set(owner, knownLabels);
 
@@ -455,7 +481,7 @@ export function dedupeFoodLibraryRows(
     }
   }
 
-  return { foodItems: kept, aliases, skippedCount };
+  return { foodItems: kept, aliases, skippedFoodItems, skippedCount };
 }
 
 export function loadSeasoningsFromCsv(csv: string): SeasoningSeed[] {

@@ -23,6 +23,9 @@ const SHELLFISH_KEYWORDS = [
   "\u9c8d",
   "\u86ce",
   "\u868c",
+  "\u6587\u86e4",
+  "\u8840\u86e4",
+  "\u6c5f\u73e7\u86e4",
   "\u7ae0\u9c7c",
   "\u8f6f\u4f53",
 ];

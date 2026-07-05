@@ -182,6 +182,24 @@ describe("seed csv helpers", () => {
     expect(result.aliases).toEqual([]);
   });
 
+  test("test_dedupeFoodLibraryRows_preserves_skipped_duplicate_allergen_tags_for_stale_refresh", () => {
+    const curatedRows = loadFoodItemsFromCsv([
+      "slug,name,name_zh,category,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg,allergen_tags",
+      "shrimp_jiweixia,Shrimp,\u57fa\u56f4\u867e,seafood,101,18.2,3.9,1.4,172,seafood|shellfish|shrimp",
+    ].join("\n"));
+    const libraryRows = loadFoodItemsFromCsv([
+      "slug,name_zh,name_en,category_code,category_zh,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "\u57fa\u56f4\u867e,\u57fa\u56f4\u867e,Shrimp,122,\u867e,100,18,1,1,170",
+    ].join("\n"));
+
+    const result = dedupeFoodLibraryRows(curatedRows, [], libraryRows);
+
+    expect(result.foodItems).toEqual([]);
+    expect(result).toHaveProperty("skippedFoodItems");
+    expect(result.skippedFoodItems.map((row) => row.slug)).toEqual(["\u57fa\u56f4\u867e"]);
+    expect(result.skippedFoodItems[0]?.allergenTags).toEqual(["seafood", "shellfish", "shrimp"]);
+  });
+
   test("test_loadFoodItemsFromCsv_normalizes_phase3_metadata_columns", () => {
     const csv = [
       "slug,name,category,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg,allergen_tags,weight_type,frequency_hint,cooking_difficulty,availability,special_handling_tags",
@@ -264,6 +282,25 @@ describe("seed csv helpers", () => {
     expect(bySlug.get("xlsx_tofu")?.allergenTags).toEqual(["soy"]);
     expect(bySlug.get("xlsx_red_bean")?.allergenTags).toEqual([]);
     expect(bySlug.get("xlsx_almond")?.allergenTags).toEqual(["nuts"]);
+  });
+
+  test("test_loadFoodItemsFromCsv_infers_shellfish_for_true_clam_names_without_category_signal", () => {
+    const csv = [
+      "slug,name_zh,name_en,calories_kcal,protein_g,carbs_g,fat_g,sodium_mg",
+      "cfct6_124312,\u725b\u89d2\u6c5f\u73e7\u86e4,Long razor clam,59,7.1,0.5,4,5",
+      "cfct6_124313,\u6587\u86e4,Orient clam,56,9.2,0.7,3.2,18",
+      "cfct6_124314,\u8840\u86e4,Blood clam,51,8.2,0.5,3.3,29",
+      "cfct6_124601,\u6587\u86e4\u4e38,Clam ball,211,16.2,9.2,15.8,65",
+      "cfct6_219035,\u86e4\u86a7,Gecko,382,70.8,0,11,14.6",
+      "cfct6_219038,\u86e4\u87c6\u6cb9,Oviductus ranae,241,31.4,24.6,1.9,3.1",
+    ].join("\n");
+    const bySlug = new Map(loadFoodItemsFromCsv(csv).map((item) => [item.slug, item]));
+
+    for (const slug of ["cfct6_124312", "cfct6_124313", "cfct6_124314", "cfct6_124601"]) {
+      expect(bySlug.get(slug)?.allergenTags).toEqual(["seafood", "shellfish"]);
+    }
+    expect(bySlug.get("cfct6_219035")?.allergenTags).toEqual([]);
+    expect(bySlug.get("cfct6_219038")?.allergenTags).toEqual([]);
   });
 
   test("test_loadSeasoningsFromCsv_normalizes_servings_and_sodium", () => {

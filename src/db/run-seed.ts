@@ -1,16 +1,18 @@
 import { resolve } from "node:path";
 
-import { sql } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 
 import { db, closeDb } from "./connection.js";
 import {
   dedupeFoodLibraryRows,
+  dedupeRowsBySlug,
   insertFoodAliases,
   loadFoodAliasesFromCsv,
   loadFoodItemsFromCsv,
   readCsvFile,
   seedReferenceDataFromFiles,
 } from "./seed.js";
+import type { FoodItemSeed } from "./seed.js";
 import { foodItems } from "./schema.js";
 
 const SEED_DIR = resolve(import.meta.dirname, "../../seed");
@@ -34,7 +36,11 @@ async function main() {
   const curatedAliases = loadFoodAliasesFromCsv(curatedCsv);
   const libraryCsv = await readCsvFile(resolve(SEED_DIR, "food_library.csv"));
   const libraryDedupe = dedupeFoodLibraryRows(curatedRows, curatedAliases, loadFoodItemsFromCsv(libraryCsv));
-  const libraryRows = libraryDedupe.foodItems;
+  // Batch upserts require slug-unique batches: the library CSV contains many
+  // rows sharing one name (and therefore one slug), e.g. variants of the same
+  // fish, which would make ON CONFLICT DO UPDATE hit a row twice.
+  const libraryRows = dedupeRowsBySlug(libraryDedupe.foodItems);
+  const intraBatchDuplicates = libraryDedupe.foodItems.length - libraryRows.length;
   await insertFoodAliases(db, libraryDedupe.aliases);
   if (libraryRows.length > 0) {
     const BATCH = 500;
@@ -53,12 +59,34 @@ async function main() {
       }
     }
   }
+  const refreshedDuplicateAllergens = await refreshSkippedDuplicateAllergenTags(libraryDedupe.skippedFoodItems);
   console.log(`  Food library: ${libraryRows.length} foods loaded`);
+  console.log(`  Food library intra-batch duplicate slugs merged: ${intraBatchDuplicates}`);
   console.log(`  Food library duplicates skipped: ${libraryDedupe.skippedCount}`);
+  console.log(`  Food library duplicate allergen refreshes: ${refreshedDuplicateAllergens}`);
   console.log(`  Food aliases from duplicates: ${libraryDedupe.aliases.length}`);
 
   console.log("\nDone.");
   await closeDb();
+}
+
+async function refreshSkippedDuplicateAllergenTags(rows: readonly FoodItemSeed[]): Promise<number> {
+  let refreshed = 0;
+  for (const row of rows) {
+    if (row.allergenTags.length === 0) {
+      continue;
+    }
+
+    const updatedRows = await db.update(foodItems)
+      .set({
+        allergenTags: row.allergenTags,
+        updatedAt: sql`now()`,
+      })
+      .where(eq(foodItems.slug, row.slug))
+      .returning({ slug: foodItems.slug });
+    refreshed += updatedRows.length;
+  }
+  return refreshed;
 }
 
 main().catch((err) => {
