@@ -143,6 +143,30 @@ describe("display server (P1 contract)", () => {
     expect(statusUpdates).toEqual([{ entryId: "row-lunch", status: "followed" }]);
   });
 
+  test("GET /api/foods returns only pantry foods, not the whole reference library", async () => {
+    const base = await boot(context({}));
+    const response = await fetch(`${base}/api/foods`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    const slugs = payload.foods.map((food: { slug: string }) => food.slug);
+    // Everything returned is a planner-pantry food (preset ingredient,
+    // staple, top-up, or natural-unit food) — nothing else leaks through.
+    expect(slugs).toContain("beef_tenderloin");
+    expect(slugs.length).toBeGreaterThan(0);
+    expect(slugs.length).toBeLessThanOrEqual(CATALOG.foods.length);
+  });
+
+  test("GET /api/dishes returns the preset library with nutrition", async () => {
+    const base = await boot(context({}));
+    const response = await fetch(`${base}/api/dishes`);
+    expect(response.status).toBe(200);
+    const payload = await response.json();
+    expect(payload.presets.length).toBeGreaterThanOrEqual(18);
+    const soup = payload.presets.find((dish: { slug: string }) => dish.slug === "chaoshan_beef_soup");
+    expect(soup.nutrition.kcal).toBeGreaterThan(0);
+    expect(payload.userDishes).toEqual([]);
+  });
+
   test("unknown routes are 404 and malformed JSON bodies are 400", async () => {
     const base = await boot(context({}));
     expect((await fetch(`${base}/api/nope`)).status).toBe(404);

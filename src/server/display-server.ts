@@ -1,6 +1,8 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type { ToolContext } from "../tools/context.js";
+import { presetDishes } from "../data/preset-dishes.js";
+import { DEFAULT_PROTEIN_TOP_UP_MENU, STAPLES } from "../engine/meal-composition.js";
 import { storedProcurement, storedWeekView } from "./display-queries.js";
 import {
   handleDailySummary,
@@ -80,11 +82,59 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     ...(query.get("maxKcal") === null ? {} : { maxKcal: boundedInt(query.get("maxKcal"), 700, 100, 3000) }),
   }),
 
+  /**
+   * Fixed food items: the pantry the planner actually uses (preset dish
+   * ingredients, staples, top-up foods, natural-unit foods) — NOT the whole
+   * reference food library, which holds 1500+ lookup rows.
+   */
+  "GET /api/foods": async (ctx) => ({
+    foods: ctx.catalog.foods.filter((food) =>
+      PANTRY_SLUGS.has(food.slug) ||
+      ctx.catalog.naturalUnits.some((unit) => unit.foodSlug === food.slug),
+    ).map((food) => ({
+      slug: food.slug,
+      name: food.name ?? food.slug,
+      nameZh: food.nameZh ?? null,
+      category: food.category ?? null,
+      kcalPer100g: food.kcalPer100g,
+      proteinGramsPer100g: food.proteinGramsPer100g,
+      carbsGramsPer100g: food.carbsGramsPer100g,
+      fatGramsPer100g: food.fatGramsPer100g,
+      sodiumMgPer100g: food.sodiumMgPer100g,
+    })),
+    naturalUnits: ctx.catalog.naturalUnits,
+  }),
+
+  /** Default recipes: the preset dish library (plus the user's saved dishes). */
+  "GET /api/dishes": async (ctx) => {
+    const userDishes = await ctx.repo.listUserDishes(ctx.userId);
+    return {
+      presets: presetDishes.map((dish) => ({
+        slug: dish.slug,
+        name: dish.name,
+        mealTypes: dish.mealTypes ?? [],
+        role: dish.role ?? "main",
+        selfContained: dish.selfContained ?? true,
+        method: dish.method ?? null,
+        nutrition: dish.nutrition,
+        ingredients: dish.ingredients,
+        seasonings: dish.seasonings,
+      })),
+      userDishes,
+    };
+  },
+
   "POST /api/log/meal": (ctx, _query, body) => handleLogMeal(ctx, cast(body)),
   "POST /api/log/water": (ctx, _query, body) => handleLogWater(ctx, cast(body)),
   "POST /api/log/exercise": (ctx, _query, body) => handleLogExercise(ctx, cast(body)),
   "POST /api/log/weight": (ctx, _query, body) => handleLogWeight(ctx, cast(body)),
 };
+
+const PANTRY_SLUGS: ReadonlySet<string> = new Set([
+  ...presetDishes.flatMap((dish) => dish.ingredients.map((ingredient) => ingredient.slug)),
+  ...STAPLES.map((staple) => staple.slug),
+  ...DEFAULT_PROTEIN_TOP_UP_MENU.flatMap((topUp) => topUp.ingredients.map((ingredient) => ingredient.slug)),
+]);
 
 export function createDisplayServer(ctx: ToolContext, options: DisplayServerOptions = {}): Server {
   const corsOrigin = options.corsOrigin ?? DEFAULT_CORS_ORIGIN;
