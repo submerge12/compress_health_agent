@@ -1,7 +1,9 @@
 # Design: rotation-based meal planner (v2)
 
 **Date:** 2026-07-04
-**Status:** Design + phased migration plan. Not started.
+**Status:** Implemented 2026-07-05 (V2-P1…P5 in this repo; the P5 pi-harness registration is
+pending as Change 3 in `pi-harness-pending-changes.md`). Scored against
+`docs/reference-menu-eval-set.md`; baseline at `evidence/reference-eval/baseline.json`.
 **Relation to existing docs:** supersedes the *generation mechanics* of
 `food-preferences-and-planning-plan.md` §1 when implemented (the priority tiers survive; the
 *enforcement* moves from search-and-block to correct-by-construction). Preference collection (§3–4

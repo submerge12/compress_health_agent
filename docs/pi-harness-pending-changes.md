@@ -122,6 +122,44 @@ already used by every other tool):
 
 ---
 
+## Change 3 — register the new `swap_meal` write tool (V2-P5)
+
+The rotation-planner v2 work added per-entry pre-vetted `alternates` to `generate_meal_plan` output
+(pass-through JSON, no pi-harness change) and a new write tool `swap_meal`
+(`handlers.handleSwapMeal`) that swaps a planned lunch/dinner for an alternate and re-balances the
+day's staple and protein top-ups. The handler, prompt step 6b, and the repository method all ship
+via the package; only the tool registration is pi-harness-side.
+
+### Add the params
+```ts
+const swapMealParams = Type.Object({
+  date: Type.String(),          // YYYY-MM-DD
+  mealType: Type.String(),      // "lunch" | "dinner"
+  alternateSlug: Type.String(), // a slug from the entry's alternates (or any main-dish slug)
+});
+```
+
+### Add the registration inside `createCompassHealthToolRegistrations()`
+```ts
+{
+  tool: {
+    name: "swap_meal",
+    label: "Swap Meal",
+    description: "Swap a planned lunch/dinner for an alternate dish and re-balance the day's staple and protein.",
+    parameters: swapMealParams,
+    async execute(_toolCallId, params) {
+      return jsonResult(await handlers.handleSwapMeal(requireCtx(), params));
+    },
+  },
+  accessLevel: "write",
+},
+```
+
+Verification: generate a plan, pick a lunch entry's alternate, call `swap_meal`, then confirm the
+entry row shows the new dish and `meal_checkin` still attaches to it ("换一个 round-trips").
+
+---
+
 ## What does NOT need a pi-harness change (already done in this repo)
 
 Reaches the framework via `pnpm build` only:
