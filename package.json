@@ -27,6 +27,7 @@
     "build": "tsc -p tsconfig.build.json",
     "dev:repl": "tsx src/dev-repl.ts",
     "start": "tsx src/index.ts",
+    "serve:display": "tsx src/server/serve.ts",
     "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
