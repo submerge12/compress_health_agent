@@ -6,6 +6,8 @@ export interface WeeklyReportDay {
   carbsGrams: number;
   fatGrams: number;
   sodiumMg: number;
+  dailyCarbsTarget?: number;
+  dailyFatTarget?: number;
   micronutrients?: Readonly<Record<string, number>>;
   nutrientTargets?: Readonly<Record<string, number>>;
 }
@@ -28,12 +30,15 @@ export interface WeeklyReport {
   topNutrientGaps: NutrientGap[];
   sodiumTrend: "up" | "down" | "flat";
   sodiumOverLimitDays: string[];
+  weeklyBudgetLine: string;
   suggestions: string[];
 }
 
 export interface WeeklyReportInput {
   days: readonly WeeklyReportDay[];
   sodiumLimitMg?: number;
+  dailyCarbsTarget?: number;
+  dailyFatTarget?: number;
 }
 
 const round = (value: number): number => Math.round(value);
@@ -117,6 +122,38 @@ const sodiumTrend = (days: readonly WeeklyReportDay[]): WeeklyReport["sodiumTren
   return "flat";
 };
 
+const weeklyBudgetLine = (days: readonly WeeklyReportDay[], input: WeeklyReportInput): string => {
+  const dailyFatTarget = input.dailyFatTarget ?? firstPositive(days.map((day) => day.dailyFatTarget));
+  const dailyCarbsTarget = input.dailyCarbsTarget ?? firstPositive(days.map((day) => day.dailyCarbsTarget));
+  const sodiumLimitMg = input.sodiumLimitMg ?? 2000;
+  return [
+    "Weekly budgets:",
+    formatBudget("fat", sum(days.map((day) => day.fatGrams)), dailyFatTarget, "g"),
+    formatBudget("sodium", sum(days.map((day) => day.sodiumMg)), sodiumLimitMg, "mg"),
+    formatBudget("carbs", sum(days.map((day) => day.carbsGrams)), dailyCarbsTarget, "g"),
+  ].join(" ");
+};
+
+const formatBudget = (
+  label: string,
+  actualRaw: number,
+  dailyTarget: number | undefined,
+  unit: string,
+): string => {
+  const actual = unit === "mg" ? round(actualRaw) : roundTo(actualRaw, 1);
+  if (dailyTarget === undefined || dailyTarget <= 0) return `${label} ${formatNumber(actual)}${unit} logged, no weekly target;`;
+  const target = unit === "mg" ? round(dailyTarget * 7) : roundTo(dailyTarget * 7, 1);
+  const difference = roundTo(actual - target, unit === "mg" ? 0 : 1);
+  const percentDifference = target === 0 ? 0 : roundTo(Math.abs(difference) / target * 100, 1);
+  const status = difference > 0 ? "over" : difference < 0 ? "under" : "on target";
+  return `${label} ${formatNumber(actual)}${unit} / ${formatNumber(target)}${unit}, ${formatNumber(percentDifference)}% ${status};`;
+};
+
+const firstPositive = (values: readonly (number | undefined)[]): number | undefined =>
+  values.find((value) => value !== undefined && Number.isFinite(value) && value > 0);
+
+const sum = (values: readonly number[]): number => values.reduce((total, value) => total + value, 0);
+
 const suggestions = (
   report: Omit<WeeklyReport, "suggestions">,
   days: readonly WeeklyReportDay[],
@@ -153,10 +190,24 @@ export function generateWeeklyReport(input: WeeklyReportInput): WeeklyReport {
     topNutrientGaps: topNutrientGaps(days),
     sodiumTrend: sodiumTrend(days),
     sodiumOverLimitDays: days.filter((day) => day.sodiumMg > sodiumLimitMg).map((day) => day.date),
+    weeklyBudgetLine: trimBudgetLine(weeklyBudgetLine(days, input)),
   };
 
   return {
     ...withoutSuggestions,
     suggestions: suggestions(withoutSuggestions, days),
   };
+}
+
+function trimBudgetLine(line: string): string {
+  return line.replace(/;$/, ".");
+}
+
+function formatNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function roundTo(value: number, decimals: number): number {
+  const factor = 10 ** decimals;
+  return Math.round(value * factor) / factor;
 }

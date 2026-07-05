@@ -13,6 +13,7 @@ function makeDish(
   mealType: "breakfast" | "lunch" | "dinner",
   kcal: number,
   ingredientSlug: string,
+  options: Partial<RecipeDish> = {},
 ): RecipeDish {
   return {
     slug,
@@ -31,6 +32,7 @@ function makeDish(
     ingredients: [{ slug: ingredientSlug, grams: 150 }],
     seasonings: slug.includes("soy") ? ["light_soy_sauce"] : ["ginger"],
     source: "preset",
+    ...options,
   };
 }
 
@@ -40,15 +42,18 @@ const toolDishes: readonly RecipeDish[] = [
   makeDish("tofu_breakfast_hash", "breakfast", 470, "tofu"),
   makeDish("chicken_congee", "breakfast", 440, "chicken"),
   makeDish("turkey_rice_bowl", "lunch", 680, "turkey"),
-  makeDish("salmon_potato_plate", "lunch", 660, "salmon"),
+  makeDish("salmon_potato_plate", "lunch", 660, "salmon", { buckets: ["deep_sea_fish"] }),
   makeDish("lentil_chicken_soup", "lunch", 640, "lentils"),
-  makeDish("beef_barley_bowl", "lunch", 700, "beef"),
+  makeDish("beef_barley_bowl", "lunch", 700, "beef", { buckets: ["red_meat"] }),
   makeDish("soy_tofu_noodle", "lunch", 650, "noodles"),
-  makeDish("shrimp_quinoa_plate", "dinner", 650, "shrimp"),
-  makeDish("cod_veg_rice", "dinner", 670, "cod"),
-  makeDish("pork_squash_plate", "dinner", 620, "pork"),
+  makeDish("shrimp_quinoa_plate", "dinner", 650, "shrimp", { buckets: ["shellfish"] }),
+  makeDish("cod_veg_rice", "dinner", 670, "cod", { buckets: ["deep_sea_fish"] }),
+  makeDish("pork_squash_plate", "dinner", 620, "pork", { buckets: ["red_meat"] }),
   makeDish("bean_veg_chili", "dinner", 690, "beans"),
   makeDish("eggplant_chicken", "dinner", 640, "eggplant"),
+  makeDish("garlic_broccoli_side", "lunch", 30, "broccoli", { role: "side", sideKind: "vegetable" }),
+  makeDish("bok_choy_side", "lunch", 25, "bok_choy", { role: "side", sideKind: "vegetable" }),
+  makeDish("spinach_soup_side", "dinner", 20, "spinach", { role: "side", sideKind: "soup" }),
 ];
 
 describe("meal plan tools", () => {
@@ -156,9 +161,17 @@ describe("meal plan tools", () => {
       dailyKcalTarget: 1800,
       dailyProteinTarget: 180,
       presetDishes: [
-        makeDish("low_protein_breakfast", "breakfast", 450, "oats"),
-        makeDish("low_protein_lunch", "lunch", 675, "rice"),
-        makeDish("low_protein_dinner", "dinner", 675, "noodles"),
+        makeDish("low_protein_breakfast_a", "breakfast", 450, "oats"),
+        makeDish("low_protein_breakfast_b", "breakfast", 450, "rice"),
+        makeDish("low_protein_breakfast_c", "breakfast", 450, "corn"),
+        makeDish("low_protein_red_a", "lunch", 675, "beef", { buckets: ["red_meat"] }),
+        makeDish("low_protein_red_b", "lunch", 675, "pork", { buckets: ["red_meat"] }),
+        makeDish("low_protein_deep_a", "dinner", 675, "cod", { buckets: ["deep_sea_fish"] }),
+        makeDish("low_protein_deep_b", "dinner", 675, "salmon", { buckets: ["deep_sea_fish"] }),
+        makeDish("low_protein_shellfish", "dinner", 675, "shrimp", { buckets: ["shellfish"] }),
+        makeDish("low_protein_side_a", "lunch", 30, "broccoli", { role: "side", sideKind: "vegetable" }),
+        makeDish("low_protein_side_b", "lunch", 25, "bok_choy", { role: "side", sideKind: "vegetable" }),
+        makeDish("low_protein_side_c", "dinner", 20, "spinach", { role: "side", sideKind: "soup" }),
       ].map((dish) => ({
         ...dish,
         nutrition: { ...dish.nutrition, proteinGrams: 10 },

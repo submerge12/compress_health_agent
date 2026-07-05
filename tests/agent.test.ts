@@ -70,6 +70,7 @@ describe("agent profile", () => {
       "remember",
       "save_dish",
       "set_profile",
+      "swap_meal",
       "update_cooking_record",
     ]);
     expect(destructive).toEqual([]);

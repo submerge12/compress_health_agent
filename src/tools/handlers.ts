@@ -33,6 +33,7 @@ import {
 } from "./recipe-recommend.js";
 import {
   generateMealPlan as generateMealPlanCore,
+  type GenerateMealPlanDependencies,
   type GenerateMealPlanResult,
   type GenerateMealPlanInput,
 } from "./generate-meal-plan.js";
@@ -48,6 +49,28 @@ import {
   type ResolvedDish,
 } from "./add-dish.js";
 import type { MealPlanEntry, MealType } from "../engine/meal-planner.js";
+import {
+  DEFAULT_STAPLE,
+  STAPLES,
+  addNutrition,
+  dishNutrition,
+  solveProteinTopUps,
+  solveStaplePortionsForDay,
+  stapleNutrition,
+  type ProteinTopUpPortion,
+  type StaplePortion,
+} from "../engine/meal-composition.js";
+import {
+  hasRejectedIngredient,
+  hasRejectedSeasoning,
+  type RecipeDish,
+  type RecipeNutrition,
+} from "../engine/recipe-engine.js";
+import {
+  ENERGY_TOLERANCE_RATIO,
+  MAX_ENERGY_TOLERANCE_RATIO,
+  PROTEIN_FLOOR_RATIO,
+} from "../engine/scoring-weights.js";
 import { loadCandidateDishes, loadUserPreferences } from "./candidate-loader.js";
 import { renderTemplate, type Language } from "../i18n.js";
 
@@ -412,7 +435,12 @@ export async function handleWeeklyReport(ctx: ToolContext, input: WeeklyReportIn
     });
   }
 
-  return generateWeeklyReport({ days, sodiumLimitMg: input.sodiumLimitMg });
+  return generateWeeklyReport({
+    days,
+    sodiumLimitMg: input.sodiumLimitMg,
+    dailyFatTarget: bmrProfile?.fatTargetGrams,
+    dailyCarbsTarget: bmrProfile?.carbsTargetGrams,
+  });
 }
 
 // ── 8. Recipe Recommend (read-only) ──
@@ -429,14 +457,26 @@ export async function handleRecipeRecommend(
 export async function handleGenerateMealPlan(
   ctx: ToolContext,
   input: Omit<GenerateMealPlanInput, "store">,
+  dependencies: GenerateMealPlanDependencies | undefined = undefined,
 ): Promise<GenerateMealPlanResult> {
   const entries: MealPlanEntry[] = [];
   const store = {
     insertMealPlanEntry: (entry: MealPlanEntry) => { entries.push(entry); },
   };
-  const result = generateMealPlanCore({ ...input, catalog: ctx.catalog, store });
+  const result = generateMealPlanCore({ ...input, catalog: ctx.catalog, store }, dependencies);
 
-  for (const entry of entries) {
+  let occupiedSlots = new Set<string>();
+  if (entries.length > 0) {
+    // Regeneration supersedes: clear not-yet-actioned entries in the plan
+    // window so duplicate rows cannot accumulate. Check-in history is kept —
+    // and slots it occupies must not receive a second (planned) row.
+    const endDate = addDaysIso(input.startDate, 6);
+    await ctx.repo.deletePlannedMealPlanEntriesRange?.(ctx.userId, input.startDate, endDate);
+    const remaining = await ctx.repo.listMealPlanEntriesRange?.(ctx.userId, input.startDate, endDate) ?? [];
+    occupiedSlots = new Set(remaining.map((row) => `${row.planDate}|${row.mealType}`));
+  }
+
+  for (const entry of entries.filter((entry) => !occupiedSlots.has(`${entry.date}|${entry.mealType}`))) {
     await ctx.repo.insertMealPlanEntry({
       userId: ctx.userId,
       planDate: entry.date,
@@ -447,6 +487,7 @@ export async function handleGenerateMealPlan(
       ingredientsJson: [
         ...(entry.dish.ingredients ?? []),
         ...(entry.side?.ingredients ?? []),
+        ...(entry.proteinTopUps ?? []).flatMap((topUp) => topUp.ingredients),
         ...(entry.staple === undefined ? [] : [entry.staple]),
       ].map((i) => ({ slug: i.slug, grams: i.grams })),
       seasoningsJson: [
@@ -749,6 +790,7 @@ export interface SmartGenerateMealPlanInput {
 export async function handleSmartGenerateMealPlan(
   ctx: ToolContext,
   input: SmartGenerateMealPlanInput,
+  dependencies: GenerateMealPlanDependencies | undefined = undefined,
 ): Promise<GenerateMealPlanResult> {
   const startDate = input.startDate
     ? requireIsoDate(input.startDate)
@@ -770,7 +812,366 @@ export async function handleSmartGenerateMealPlan(
     dailyCarbsTarget: bmrProfile?.carbsTargetGrams,
     presetDishes: candidates,
     preferences,
+  }, dependencies);
+}
+
+// ── 12b. Swap Meal (V2-P5: "换一个") ──
+
+export interface SwapMealInput {
+  date: string;
+  mealType: string;
+  alternateSlug: string;
+}
+
+export interface SwapMealResult {
+  entryId: string;
+  date: string;
+  mealType: string;
+  previousDishSlug: string | null;
+  newDish: { slug: string; name: string };
+  sideSlug?: string;
+  stapleGrams?: number;
+  proteinTopUps: readonly string[];
+  dayTotals: RecipeNutrition;
+  withinEnergyBand: boolean;
+  meetsProteinFloor: boolean;
+}
+
+/**
+ * Swap a planned lunch/dinner main and re-run the levers for that one meal.
+ * The swap path enforces the same safety filters as planning, preserves the
+ * entry's staple type and (for non-self-contained mains) its side, and
+ * RE-VETS the whole day: if the requested dish cannot keep the day inside
+ * the hard kcal band and protein floor, the swap is refused rather than
+ * persisted. The entry keeps its `planned` status so check-ins still attach.
+ */
+export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Promise<SwapMealResult> {
+  const date = requireIsoDate(input.date);
+  const mealType = requireText(input.mealType, "mealType").toLowerCase();
+  if (mealType !== "lunch" && mealType !== "dinner") {
+    throw new RangeError("mealType must be lunch or dinner");
+  }
+  const alternateSlug = requireText(input.alternateSlug, "alternateSlug");
+  if (ctx.catalog.foods.length === 0) {
+    throw new RangeError("swap_meal requires the food catalog to re-balance the day");
+  }
+
+  const [bmrProfile, candidates, preferences, allRows] = await Promise.all([
+    ctx.repo.getLatestBmrProfile(ctx.userId),
+    loadCandidateDishes(ctx),
+    loadUserPreferences(ctx, { asOfDate: date }),
+    ctx.repo.listMealPlanEntries(ctx.userId, date),
+  ]);
+
+  const plannedOfType = allRows.filter((row) => row.mealType === mealType && row.status === "planned");
+  if (plannedOfType.length === 0) {
+    throw new RangeError(`no planned ${mealType} meal-plan entry found on ${date}`);
+  }
+  if (plannedOfType.length > 1) {
+    throw new RangeError(
+      `multiple planned ${mealType} entries found on ${date}; regenerate the plan to supersede stale entries before swapping`,
+    );
+  }
+  const target = plannedOfType[0] as MealPlanEntryRow;
+
+  const alternate = candidates.find((dish) =>
+    dish.slug === alternateSlug &&
+    dish.role !== "side" &&
+    (dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner"))
+  );
+  if (alternate === undefined) {
+    throw new RangeError(`unknown alternate main dish: ${alternateSlug}`);
+  }
+  if (isRejectedBySafety(alternate, preferences)) {
+    throw new RangeError(
+      `${alternateSlug} conflicts with saved allergies or exclusions and cannot be swapped in`,
+    );
+  }
+
+  const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
+  const proteinFloor = bmrProfile?.proteinTargetGrams === undefined
+    ? undefined
+    : Math.round(bmrProfile.proteinTargetGrams * PROTEIN_FLOOR_RATIO);
+
+  const rowIngredientSlugs = new Set(
+    (target.ingredientsJson ?? []).map((item) => String(item["slug"] ?? "")),
+  );
+  // Keep the plan's staple food: recover its type from the stored row rather
+  // than silently switching the user to the default staple.
+  const staple = STAPLES.find((candidate) => rowIngredientSlugs.has(candidate.slug)) ?? DEFAULT_STAPLE;
+
+  // Parity with planning-time vetting: the day's OTHER main frees its staple
+  // grams back into the solve, so a lighter alternate can be compensated
+  // across both meals exactly as it was when the alternate was vetted.
+  const counterpartRows = allRows.filter((row) =>
+    row.mealType === (mealType === "lunch" ? "dinner" : "lunch") && row.status === "planned");
+  const counterpart = counterpartRows.length === 1 ? counterpartRows[0] : undefined;
+  const counterpartStaple = counterpart === undefined ? undefined : stapleFromRow(counterpart);
+  const resolveCounterpart = counterpart !== undefined && counterpartStaple !== undefined;
+  const counterpartWithoutStaple = !resolveCounterpart || counterpart === undefined || counterpartStaple === undefined
+    ? undefined
+    : subtractNutrition(rowNutrition(counterpart), stapleNutrition(counterpartStaple, ctx.catalog));
+
+  // Day context beyond the two re-levered meals (skipped meals excluded).
+  const baseNutrition = allRows
+    .filter((row) =>
+      row.id !== target.id &&
+      (!resolveCounterpart || row.id !== counterpart?.id) &&
+      row.status !== "skipped")
+    .reduce<RecipeNutrition>((total, row) => addNutrition(total, rowNutrition(row)), ZERO_NUTRITION);
+  const fixedBeyondMeals = counterpartWithoutStaple === undefined
+    ? baseNutrition
+    : addNutrition(baseNutrition, counterpartWithoutStaple);
+  const mainMealCount = counterpartWithoutStaple === undefined ? 1 : 2;
+
+  const safeSides = candidates.filter((dish) =>
+    dish.role === "side" && !isRejectedBySafety(dish, preferences));
+  const resolveDish = (dish: RecipeDish): SwapDayResolution => resolveSwapDay({
+    dish,
+    catalog: ctx.catalog,
+    preferences,
+    rowIngredientSlugs,
+    safeSides,
+    fixedBeyondMeals,
+    mainMealCount,
+    staple,
+    dailyKcalTarget,
+    proteinFloor,
   });
+
+  const resolution = resolveDish(alternate);
+  if (!resolution.valid) {
+    // The refusal names swaps that DO work right now, so the user is never
+    // stranded pointing at an alternates list that only existed at
+    // generation time.
+    const validNow = candidates
+      .filter((dish) =>
+        dish.role !== "side" &&
+        (dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner")) &&
+        dish.slug !== alternate.slug &&
+        dish.slug !== target.recipeSlug &&
+        !isRejectedBySafety(dish, preferences))
+      .filter((dish) => {
+        try {
+          return resolveDish(dish).valid;
+        } catch {
+          // dishes with uncataloged ingredients cannot be suggested
+          return false;
+        }
+      })
+      .slice(0, 2);
+    throw new RangeError(
+      `swapping in ${alternate.name} would break the day ` +
+      `(kcal ${Math.round(resolution.dayTotals.kcal)} vs target ${dailyKcalTarget}` +
+      `${proteinFloor === undefined ? "" : `, protein ${resolution.dayTotals.proteinGrams}g vs ${proteinFloor}g floor`})` +
+      (validNow.length > 0
+        ? `; currently valid swaps: ${validNow.map((dish) => `${dish.name} (${dish.slug})`).join(", ")}`
+        : "; no valid swap is available right now — regenerate the day instead"),
+    );
+  }
+
+  await ctx.repo.updateMealPlanEntryDish(target.id, {
+    dishName: resolution.side === undefined
+      ? alternate.name
+      : `${alternate.name} + ${resolution.side.name}`,
+    recipeSlug: alternate.slug,
+    ingredientsJson: [
+      ...alternate.ingredients,
+      ...(resolution.side?.ingredients ?? []),
+      ...resolution.topUps.flatMap((topUp) => topUp.ingredients),
+      ...(resolution.swappedStaple === undefined ? [] : [resolution.swappedStaple]),
+    ].map((ingredient) => ({ slug: ingredient.slug, grams: ingredient.grams })),
+    seasoningsJson: [
+      ...alternate.seasonings,
+      ...(resolution.side?.seasonings ?? []),
+    ].map((seasoning) => ({ slug: seasoning })),
+    caloriesKcal: resolution.swappedMealNutrition.kcal,
+    proteinGrams: resolution.swappedMealNutrition.proteinGrams,
+    carbsGrams: resolution.swappedMealNutrition.carbsGrams,
+    fatGrams: resolution.swappedMealNutrition.fatGrams,
+    sodiumMg: resolution.swappedMealNutrition.sodiumMg,
+  });
+
+  if (
+    resolveCounterpart &&
+    counterpart !== undefined &&
+    counterpartStaple !== undefined &&
+    counterpartWithoutStaple !== undefined &&
+    resolution.counterpartStaple !== undefined &&
+    resolution.counterpartStaple.grams !== counterpartStaple.grams
+  ) {
+    const counterpartNutrition = addNutrition(
+      counterpartWithoutStaple,
+      stapleNutrition(resolution.counterpartStaple, ctx.catalog),
+    );
+    await ctx.repo.updateMealPlanEntryDish(counterpart.id, {
+      dishName: counterpart.dishName,
+      recipeSlug: counterpart.recipeSlug,
+      ingredientsJson: [
+        ...(counterpart.ingredientsJson ?? []).filter((item) => String(item["slug"] ?? "") !== counterpartStaple.slug),
+        { slug: resolution.counterpartStaple.slug, grams: resolution.counterpartStaple.grams },
+      ],
+      seasoningsJson: counterpart.seasoningsJson,
+      caloriesKcal: counterpartNutrition.kcal,
+      proteinGrams: counterpartNutrition.proteinGrams,
+      carbsGrams: counterpartNutrition.carbsGrams,
+      fatGrams: counterpartNutrition.fatGrams,
+      sodiumMg: counterpartNutrition.sodiumMg,
+    });
+  }
+
+  return {
+    entryId: target.id,
+    date,
+    mealType,
+    previousDishSlug: target.recipeSlug,
+    newDish: { slug: alternate.slug, name: alternate.name },
+    ...(resolution.side === undefined ? {} : { sideSlug: resolution.side.slug }),
+    ...(resolution.swappedStaple === undefined ? {} : { stapleGrams: resolution.swappedStaple.grams }),
+    proteinTopUps: resolution.topUps.map((topUp) => topUp.slug),
+    dayTotals: resolution.dayTotals,
+    withinEnergyBand:
+      Math.abs(resolution.dayTotals.kcal - dailyKcalTarget) <= dailyKcalTarget * ENERGY_TOLERANCE_RATIO,
+    meetsProteinFloor: proteinFloor === undefined || resolution.dayTotals.proteinGrams >= proteinFloor,
+  };
+}
+
+interface SwapDayResolution {
+  valid: boolean;
+  dayTotals: RecipeNutrition;
+  side?: RecipeDish;
+  topUps: readonly ProteinTopUpPortion[];
+  swappedStaple?: StaplePortion;
+  counterpartStaple?: StaplePortion;
+  swappedMealNutrition: RecipeNutrition;
+}
+
+function resolveSwapDay(input: {
+  dish: RecipeDish;
+  catalog: ToolContext["catalog"];
+  preferences: Awaited<ReturnType<typeof loadUserPreferences>>;
+  rowIngredientSlugs: ReadonlySet<string>;
+  safeSides: readonly RecipeDish[];
+  fixedBeyondMeals: RecipeNutrition;
+  mainMealCount: number;
+  staple: (typeof STAPLES)[number];
+  dailyKcalTarget: number;
+  proteinFloor: number | undefined;
+}): SwapDayResolution {
+  // Preserve the vegetable side for non-self-contained mains: recover the
+  // original from the stored row, else attach any safe side candidate.
+  let side: RecipeDish | undefined;
+  if (input.dish.selfContained === false) {
+    side = input.safeSides.find((candidate) =>
+      candidate.ingredients.length > 0 &&
+      candidate.ingredients.every((ingredient) => input.rowIngredientSlugs.has(ingredient.slug))) ??
+      input.safeSides[0];
+  }
+
+  let mealBase = dishNutrition(input.dish, input.catalog);
+  if (side !== undefined) mealBase = addNutrition(mealBase, dishNutrition(side, input.catalog));
+  const dayFixed = addNutrition(input.fixedBeyondMeals, mealBase);
+
+  let topUps: readonly ProteinTopUpPortion[] = [];
+  if (input.proteinFloor !== undefined && input.proteinFloor > 0) {
+    const minStaple = stapleNutrition(
+      { slug: input.staple.slug, grams: input.staple.minGrams * input.mainMealCount },
+      input.catalog,
+    );
+    if (dayFixed.proteinGrams + minStaple.proteinGrams < input.proteinFloor) {
+      topUps = solveProteinTopUps({
+        proteinFloorGrams: input.proteinFloor - minStaple.proteinGrams,
+        fixedNutrition: dayFixed,
+        remainingKcalBudget:
+          input.dailyKcalTarget * (1 + ENERGY_TOLERANCE_RATIO) - dayFixed.kcal - minStaple.kcal,
+        catalog: input.catalog,
+        preferences: input.preferences,
+      }).addOns;
+    }
+  }
+  const topUpNutrition = topUps.reduce<RecipeNutrition | undefined>(
+    (total, topUp) => total === undefined ? topUp.nutrition : addNutrition(total, topUp.nutrition),
+    undefined,
+  );
+  const fixedWithTopUps = topUpNutrition === undefined ? dayFixed : addNutrition(dayFixed, topUpNutrition);
+
+  const stapleSolve = solveStaplePortionsForDay({
+    dailyKcalTarget: input.dailyKcalTarget,
+    fixedNutrition: fixedWithTopUps,
+    mainMealCount: input.mainMealCount,
+    staple: input.staple,
+    catalog: input.catalog,
+    energyToleranceRatio: ENERGY_TOLERANCE_RATIO,
+  });
+  const portions = stapleSolve.portions as readonly (StaplePortion | undefined)[];
+  const counterpartStaple = input.mainMealCount === 2 ? portions[0] : undefined;
+  const swappedStaple = input.mainMealCount === 2 ? portions[1] : portions[0];
+
+  let swappedMealNutrition = mealBase;
+  if (topUpNutrition !== undefined) swappedMealNutrition = addNutrition(swappedMealNutrition, topUpNutrition);
+  if (swappedStaple !== undefined) {
+    swappedMealNutrition = addNutrition(swappedMealNutrition, stapleNutrition(swappedStaple, input.catalog));
+  }
+  let dayTotals = addNutrition(input.fixedBeyondMeals, swappedMealNutrition);
+  if (counterpartStaple !== undefined) {
+    dayTotals = addNutrition(dayTotals, stapleNutrition(counterpartStaple, input.catalog));
+  }
+
+  const withinHardBand =
+    Math.abs(dayTotals.kcal - input.dailyKcalTarget) <= input.dailyKcalTarget * MAX_ENERGY_TOLERANCE_RATIO;
+  const meetsFloor = input.proteinFloor === undefined || dayTotals.proteinGrams >= input.proteinFloor;
+  return {
+    valid: withinHardBand && meetsFloor,
+    dayTotals,
+    ...(side === undefined ? {} : { side }),
+    topUps,
+    ...(swappedStaple === undefined ? {} : { swappedStaple }),
+    ...(counterpartStaple === undefined ? {} : { counterpartStaple }),
+    swappedMealNutrition,
+  };
+}
+
+const ZERO_NUTRITION: RecipeNutrition = { kcal: 0, proteinGrams: 0, carbsGrams: 0, fatGrams: 0, sodiumMg: 0 };
+
+function rowNutrition(row: MealPlanEntryRow): RecipeNutrition {
+  return {
+    kcal: row.caloriesKcal,
+    proteinGrams: row.proteinGrams,
+    carbsGrams: row.carbsGrams,
+    fatGrams: row.fatGrams,
+    sodiumMg: row.sodiumMg,
+  };
+}
+
+function subtractNutrition(left: RecipeNutrition, right: RecipeNutrition): RecipeNutrition {
+  return {
+    kcal: left.kcal - right.kcal,
+    proteinGrams: left.proteinGrams - right.proteinGrams,
+    carbsGrams: left.carbsGrams - right.carbsGrams,
+    fatGrams: left.fatGrams - right.fatGrams,
+    sodiumMg: Math.max(0, left.sodiumMg - right.sodiumMg),
+  };
+}
+
+function stapleFromRow(row: MealPlanEntryRow): StaplePortion | undefined {
+  const stapleSlugs = new Set(STAPLES.map((staple) => staple.slug));
+  for (const item of row.ingredientsJson ?? []) {
+    const slug = String(item["slug"] ?? "");
+    const grams = Number(item["grams"] ?? 0);
+    if (stapleSlugs.has(slug) && Number.isFinite(grams) && grams > 0) {
+      return { slug, grams };
+    }
+  }
+  return undefined;
+}
+
+function isRejectedBySafety(dish: RecipeDish, preferences: {
+  rejectedIngredients?: readonly string[];
+  rejectedSeasonings?: readonly string[];
+  allergens?: readonly string[];
+}): boolean {
+  return hasRejectedIngredient(dish, preferences.rejectedIngredients ?? [], preferences.allergens ?? []) ||
+    hasRejectedSeasoning(dish, preferences.rejectedSeasonings ?? []);
 }
 
 // ── 13. Smart Recipe Recommend (auto-loads candidates) ──
@@ -909,6 +1310,12 @@ function tomorrow(): string {
   const d = new Date();
   d.setDate(d.getDate() + 1);
   return d.toISOString().slice(0, 10);
+}
+
+function addDaysIso(dateIso: string, days: number): string {
+  const date = new Date(`${dateIso}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
 }
 
 function sum(values: number[]): number {

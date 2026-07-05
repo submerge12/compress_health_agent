@@ -50,6 +50,8 @@ const toolRegistry: Record<string, ToolHandler> = {
     handlers.handleSmartGenerateMealPlan(ctx, cast(input)),
   meal_checkin: (ctx, input) =>
     handlers.handleMealCheckin(ctx, cast(input)),
+  swap_meal: (ctx, input) =>
+    handlers.handleSwapMeal(ctx, cast(input)),
   update_cooking_record: (ctx, input) =>
     handlers.handleUpdateCookingRecord(ctx, cast(input)),
   remember: (ctx, input) =>

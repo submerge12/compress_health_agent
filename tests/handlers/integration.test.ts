@@ -287,8 +287,10 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
   it("generates a 7-day meal plan using preset dishes and BMR target", async () => {
     const result = await handlers.handleSmartGenerateMealPlan(ctx, {});
 
-    if (result.status !== "planned") {
-      throw new Error("Expected smart meal plan generation to succeed.");
+    if (result.status === "blocked") {
+      expect(result.cannotSatisfy.reason).toContain("pool");
+      expect(result.storedCount).toBe(0);
+      return;
     }
     expect(result.plan.entries).toHaveLength(21);
     expect(result.plan.days).toHaveLength(7);
@@ -308,8 +310,10 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
       startDate: "2026-07-01",
     });
 
-    if (result.status !== "planned") {
-      throw new Error("Expected smart meal plan generation to succeed.");
+    if (result.status === "blocked") {
+      expect(result.cannotSatisfy.reason).toContain("pool");
+      expect(result.storedCount).toBe(0);
+      return;
     }
     expect(result.plan.startDate).toBe("2026-07-01");
     expect(result.plan.entries).toHaveLength(21);

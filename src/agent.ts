@@ -140,6 +140,11 @@ const writeTools: readonly AgentToolRegistration[] = [
     description: "Record whether a planned meal was followed, substituted, or skipped.",
   },
   {
+    name: "swap_meal",
+    accessLevel: "write",
+    description: "Swap a planned lunch/dinner for an alternate dish and re-balance the day's staple and protein.",
+  },
+  {
     name: "remember",
     accessLevel: "write",
     description: "Store a durable user preference, dislike, routine, or note.",
@@ -190,8 +195,13 @@ Workflow
    If the result contains cannotSatisfy, do NOT pretend a plan was made: tell the user which hard
    constraint could not be met (cannotSatisfy.reason) and offer the listed cannotSatisfy.suggestions
    as concrete choices (e.g. add a lean protein, lower the protein target). Never relax an allergy or
-   safety exclusion. If the plan is produced but carries a fat advisory, mention it briefly - it is a
-   suggestion, not a failure.
+   safety exclusion. If the plan is produced, mention the weekly fat/sodium/carbs budget status once
+   when it is over or materially under target; it is guidance, not a failure.
+6b. When the user wants to swap a planned meal ("换一个"), suggest the entry's alternates when the plan
+   is at hand, then call swap_meal with the date, meal type, and chosen dish slug. swap_meal re-validates
+   any requested dish against allergies and the day's targets and refuses swaps that would break the day —
+   if it refuses, relay its reason and offer a different alternate or regenerate-day. On success the
+   day's staple and protein top-ups are re-balanced; report the new dish and day totals in one sentence.
 7. When the user asks for recipe ideas, call recipe_recommend with the meal type. It loads candidates automatically.
 8. When the user states a durable preference, dislike, routine, or note, call remember; confirm first if confidence is low.
 9. Before personalised recommendations or plans, call recall for relevant active memories.

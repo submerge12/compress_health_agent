@@ -378,6 +378,40 @@ export function createRepository(db: Db, repositoryOptions: RepositoryOptions = 
         .where(eq(schema.mealPlanEntries.id, entryId));
     },
 
+    /**
+     * Remove not-yet-actioned entries so a regenerated week supersedes the old
+     * one. Rows with check-in statuses (followed/substituted/skipped) are
+     * behavioral history feeding W2 and are never deleted.
+     */
+    async deletePlannedMealPlanEntriesRange(userId: string, startDate: string, endDate: string): Promise<void> {
+      await db.delete(schema.mealPlanEntries).where(and(
+        eq(schema.mealPlanEntries.userId, userId),
+        eq(schema.mealPlanEntries.status, "planned"),
+        gte(schema.mealPlanEntries.planDate, startDate),
+        lte(schema.mealPlanEntries.planDate, endDate),
+      ));
+    },
+
+    async updateMealPlanEntryDish(
+      entryId: string,
+      data: Pick<
+        MealPlanEntryRow,
+        | "dishName"
+        | "recipeSlug"
+        | "ingredientsJson"
+        | "seasoningsJson"
+        | "caloriesKcal"
+        | "proteinGrams"
+        | "carbsGrams"
+        | "fatGrams"
+        | "sodiumMg"
+      >,
+    ): Promise<void> {
+      await db.update(schema.mealPlanEntries)
+        .set({ ...data, updatedAt: new Date() })
+        .where(eq(schema.mealPlanEntries.id, entryId));
+    },
+
     // ── Cooking Records ──
     async listCookingRecords(userId: string): Promise<CookingRecordRow[]> {
       const rows = await db.select().from(schema.cookingRecords)
