@@ -162,7 +162,10 @@ export function calculateMacros(
   const proteinUpperG = weightKg * upperP;
 
   // Step 4 — fat
-  const fatMinG = (sex === "male" ? 0.6 : 0.8) * weightKg;
+  // Male floor raised 0.6 -> 0.7 g/kg (user decision 2026-07-05): 0.6 g/kg
+  // proved infeasible with the real dish pool; 0.7 keeps the weekly fat
+  // budget reachable while staying inside the 20-30% energy band.
+  const fatMinG = (sex === "male" ? 0.7 : 0.8) * weightKg;
   let fatG = Math.max(fatMinG, (calories * 0.20) / 9);
   const fatSoftMaxG = (calories * 0.40) / 9;
 

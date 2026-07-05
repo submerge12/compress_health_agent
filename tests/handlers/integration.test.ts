@@ -61,7 +61,7 @@ describe.skipIf(!isDbAvailable)("handler end-to-end", () => {
     expect(result.plan.tdeeKcal).toBe(2006);
     expect(result.plan.targetKcal).toBe(1771);
     expect(result.plan.macros.proteinGrams).toBe(140);
-    expect(result.plan.macros.fatGrams).toBe(42);
+    expect(result.plan.macros.fatGrams).toBe(49);
     expect(result.profile.targetKcal).toBe(1771);
   });
 

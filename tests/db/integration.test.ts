@@ -134,7 +134,9 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
   it("loads meal catalog from seeded data", async () => {
     const catalog = await loadMealCatalog(db);
     expect(catalog.foods.length).toBeGreaterThanOrEqual(32);
-    expect(catalog.naturalUnits.length).toBe(35);
+    expect(catalog.naturalUnits.length).toBeGreaterThanOrEqual(35);
+    // Cooking-oil spoon units (5 g) arrived with the explicit-oil-grams work.
+    expect(catalog.naturalUnits.some((u) => u.foodSlug === "olive_oil")).toBe(true);
 
     const chicken = catalog.foods.find((f) => f.slug === "chicken_breast");
     expect(chicken).toBeDefined();

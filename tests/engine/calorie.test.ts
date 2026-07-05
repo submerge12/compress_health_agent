@@ -102,8 +102,8 @@ describe("calorie engine", () => {
     it("Holly's profile: 1771 kcal, 70kg, male, 23y, fat_loss_moderate, non-exerciser", () => {
       const { macros, statuses } = calculateMacros(1771, 70, "male", 23, "fat_loss_moderate", false);
       expect(macros.proteinGrams).toBe(140);
-      expect(macros.fatGrams).toBe(42);
-      expect(macros.carbsGrams).toBeCloseTo(208.3, 0);
+      expect(macros.fatGrams).toBe(49);
+      expect(macros.carbsGrams).toBeCloseTo(192.5, 0);
       expect(statuses.protein).toBe("appropriate");
       expect(statuses.fat).toBe("appropriate");
       expect(statuses.carbs).toBe("appropriate");
@@ -129,7 +129,7 @@ describe("calorie engine", () => {
       expect(plan.calorieStatus).toBe("lower_overrides_upper");
       expect(plan.isExerciser).toBe(false);
       expect(plan.macros.proteinGrams).toBe(140);
-      expect(plan.macros.fatGrams).toBe(42);
+      expect(plan.macros.fatGrams).toBe(49);
       expect(plan.warnings.length).toBeGreaterThan(0);
     });
 
