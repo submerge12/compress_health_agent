@@ -32,11 +32,13 @@ import {
   type RecipeRecommendResult,
 } from "./recipe-recommend.js";
 import {
+  buildPoolRequest,
   generateMealPlan as generateMealPlanCore,
   type GenerateMealPlanDependencies,
   type GenerateMealPlanResult,
   type GenerateMealPlanInput,
 } from "./generate-meal-plan.js";
+import { selectWeeklyPool } from "../engine/pool-selection.js";
 import {
   updateCookingRecord as updateCookingRecordCore,
   type UpdateCookingRecordInput,
@@ -838,12 +840,17 @@ export interface SwapMealResult {
 }
 
 /**
- * Swap a planned lunch/dinner main and re-run the levers for that one meal.
- * The swap path enforces the same safety filters as planning, preserves the
- * entry's staple type and (for non-self-contained mains) its side, and
- * RE-VETS the whole day: if the requested dish cannot keep the day inside
- * the hard kcal band and protein floor, the swap is refused rather than
- * persisted. The entry keeps its `planned` status so check-ins still attach.
+ * Swap a planned lunch/dinner main to one of its PRE-VETTED ALTERNATES and
+ * re-run the levers for that one meal. Bounded semantics (G2 decision
+ * CHA-MPV2-8): free-form substitution is out of scope — the target must
+ * satisfy the same rules the planner used to offer alternates, recomputed
+ * from stored state because alternates are not persisted (re-vetting at swap
+ * time is the no-migration path): pool-drawn and safe, collision-free with
+ * this day's and the adjacent days' mains, lever-valid for the whole day
+ * (hard kcal band + protein floor), and at the minimal weekly use count
+ * available. Non-alternate targets are rejected with a clear error naming
+ * the swaps that are pre-vetted right now. The entry keeps its `planned`
+ * status so check-ins still attach.
  */
 export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Promise<SwapMealResult> {
   const date = requireIsoDate(input.date);
@@ -856,11 +863,12 @@ export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Pr
     throw new RangeError("swap_meal requires the food catalog to re-balance the day");
   }
 
-  const [bmrProfile, candidates, preferences, allRows] = await Promise.all([
+  const [bmrProfile, candidates, preferences, allRows, surroundingRows] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
     loadUserPreferences(ctx, { asOfDate: date }),
     ctx.repo.listMealPlanEntries(ctx.userId, date),
+    ctx.repo.listMealPlanEntriesRange(ctx.userId, addDaysIso(date, -3), addDaysIso(date, 3)),
   ]);
 
   const plannedOfType = allRows.filter((row) => row.mealType === mealType && row.status === "planned");
@@ -888,6 +896,29 @@ export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Pr
     );
   }
 
+  // Collision rule of the bounded semantics: a pre-vetted alternate never
+  // repeats a main within the day or on adjacent days (rotation rules).
+  const isCountedMain = (row: MealPlanEntryRow): boolean =>
+    (row.mealType === "lunch" || row.mealType === "dinner") && row.status !== "skipped";
+  const mainSlugOf = (row: MealPlanEntryRow): string | null => row.recipeSlug;
+  const sameDaySlugs = new Set(
+    allRows.filter(isCountedMain).map(mainSlugOf).filter((slug): slug is string => slug !== null),
+  );
+  const adjacentDates = new Set([addDaysIso(date, -1), addDaysIso(date, 1)]);
+  const adjacentSlugs = new Set(
+    surroundingRows
+      .filter((row) => isCountedMain(row) && adjacentDates.has(row.planDate))
+      .map(mainSlugOf)
+      .filter((slug): slug is string => slug !== null),
+  );
+  if (sameDaySlugs.has(alternate.slug) || adjacentSlugs.has(alternate.slug)) {
+    throw new RangeError(
+      `${alternate.slug} is not one of this entry's pre-vetted alternates: it is already planned ` +
+      `${sameDaySlugs.has(alternate.slug) ? `on ${date}` : "on an adjacent day"}, ` +
+      "and rotation never repeats a main on consecutive days",
+    );
+  }
+
   const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
   const proteinFloor = bmrProfile?.proteinTargetGrams === undefined
     ? undefined
@@ -899,6 +930,31 @@ export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Pr
   // Keep the plan's staple food: recover its type from the stored row rather
   // than silently switching the user to the default staple.
   const staple = STAPLES.find((candidate) => rowIngredientSlugs.has(candidate.slug)) ?? DEFAULT_STAPLE;
+
+  // A2 repair (R6 C1): the alternates-only bound requires POOL MEMBERSHIP.
+  // Derive the week's selected pool exactly the way generation does — the
+  // shared buildPoolRequest wiring into selectWeeklyPool — so pool semantics
+  // (lean tilt, kcal screen, node-6's skipped>=2 exclusion) keep a single
+  // source of truth. The full dish catalog is NOT the pool: most catalog
+  // mains sit outside any given week's rotation pool and must be rejected.
+  const poolResult = selectWeeklyPool(buildPoolRequest({
+    startDate: date,
+    dailyKcalTarget,
+    ...(bmrProfile?.proteinTargetGrams === undefined ? {} : { dailyProteinTarget: bmrProfile.proteinTargetGrams }),
+    ...(bmrProfile?.fatTargetGrams === undefined ? {} : { dailyFatTarget: bmrProfile.fatTargetGrams }),
+    ...(bmrProfile?.carbsTargetGrams === undefined ? {} : { dailyCarbsTarget: bmrProfile.carbsTargetGrams }),
+    catalog: ctx.catalog,
+    staple,
+    preferences,
+    presetDishes: candidates,
+  }, candidates, true));
+  if (!poolResult.ok) {
+    throw new RangeError(
+      `cannot establish this week's pre-vetted pool for swapping: ${poolResult.cannotSatisfy.reason}` +
+      "; regenerate the plan instead",
+    );
+  }
+  const poolMains = poolResult.pool.mains;
 
   // Parity with planning-time vetting: the day's OTHER main frees its staple
   // grams back into the solve, so a lighter alternate can be compensated
@@ -939,27 +995,38 @@ export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Pr
     proteinFloor,
   });
 
+  // Pre-vetted candidates for this slot under the bounded semantics: mains
+  // of the SELECTED WEEKLY POOL (safety and skipped>=2 exclusion already
+  // applied by selectWeeklyPool) that are collision-free for this day. Used
+  // for the minimal-use rule and for naming valid swaps in refusals.
+  const useCountOf = (slug: string): number =>
+    surroundingRows.filter((row) =>
+      isCountedMain(row) && row.id !== target.id && row.recipeSlug === slug).length;
+  const boundedCandidates = (excludeSlug: string): readonly RecipeDish[] => poolMains
+    .filter((dish) =>
+      dish.slug !== excludeSlug &&
+      dish.slug !== target.recipeSlug &&
+      !sameDaySlugs.has(dish.slug) &&
+      !adjacentSlugs.has(dish.slug));
+  const vettedNow = (excludeSlug: string): readonly RecipeDish[] => {
+    const leverValid = boundedCandidates(excludeSlug).filter((dish) => {
+      try {
+        return resolveDish(dish).valid;
+      } catch {
+        // dishes with uncataloged ingredients cannot be suggested
+        return false;
+      }
+    });
+    const minUse = Math.min(...leverValid.map((dish) => useCountOf(dish.slug)));
+    return leverValid.filter((dish) => useCountOf(dish.slug) === minUse).slice(0, 2);
+  };
+
   const resolution = resolveDish(alternate);
   if (!resolution.valid) {
-    // The refusal names swaps that DO work right now, so the user is never
-    // stranded pointing at an alternates list that only existed at
+    // The refusal names swaps that ARE pre-vetted right now, so the user is
+    // never stranded pointing at an alternates list that only existed at
     // generation time.
-    const validNow = candidates
-      .filter((dish) =>
-        dish.role !== "side" &&
-        (dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner")) &&
-        dish.slug !== alternate.slug &&
-        dish.slug !== target.recipeSlug &&
-        !isRejectedBySafety(dish, preferences))
-      .filter((dish) => {
-        try {
-          return resolveDish(dish).valid;
-        } catch {
-          // dishes with uncataloged ingredients cannot be suggested
-          return false;
-        }
-      })
-      .slice(0, 2);
+    const validNow = vettedNow(alternate.slug);
     throw new RangeError(
       `swapping in ${alternate.name} would break the day ` +
       `(kcal ${Math.round(resolution.dayTotals.kcal)} vs target ${dailyKcalTarget}` +
@@ -968,6 +1035,45 @@ export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Pr
         ? `; currently valid swaps: ${validNow.map((dish) => `${dish.name} (${dish.slug})`).join(", ")}`
         : "; no valid swap is available right now — regenerate the day instead"),
     );
+  }
+
+  // Pool-membership rule (A2 repair): a lever-valid target must still belong
+  // to the week's selected pool. Ordered after the lever refusal so a swap
+  // that would break the day keeps its established refusal copy; either way,
+  // nothing outside the pool is ever persisted.
+  if (!poolMains.some((dish) => dish.slug === alternate.slug)) {
+    const avoided = new Set((preferences.avoidedDishSlugs ?? []).map((slug) => slug.trim().toLowerCase()));
+    throw new RangeError(
+      avoided.has(alternate.slug.trim().toLowerCase())
+        ? `${alternate.slug} is not one of this entry's pre-vetted alternates: it was skipped twice ` +
+          "or more recently and is excluded from this week's pool"
+        : `${alternate.slug} is not one of this entry's pre-vetted alternates: it is outside this ` +
+          `week's selected pool (${poolMains.map((dish) => dish.slug).join(", ")})`,
+    );
+  }
+
+  // Minimal-use rule: the planner offers alternates at the lowest weekly use
+  // count available. A target already used nearby is only a pre-vetted
+  // alternate when no less-used dish could serve this slot.
+  const targetUseCount = useCountOf(alternate.slug);
+  if (targetUseCount > 0) {
+    const lessUsed = boundedCandidates(alternate.slug)
+      .filter((dish) => useCountOf(dish.slug) < targetUseCount)
+      .filter((dish) => {
+        try {
+          return resolveDish(dish).valid;
+        } catch {
+          return false;
+        }
+      })
+      .slice(0, 2);
+    if (lessUsed.length > 0) {
+      throw new RangeError(
+        `${alternate.slug} is not one of this entry's pre-vetted alternates: it already appears ` +
+        `${targetUseCount}x in the surrounding week while less-used alternates exist — ` +
+        `currently pre-vetted: ${lessUsed.map((dish) => `${dish.name} (${dish.slug})`).join(", ")}`,
+      );
+    }
   }
 
   await ctx.repo.updateMealPlanEntryDish(target.id, {

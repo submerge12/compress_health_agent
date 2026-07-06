@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { handleSwapMeal } from "../../src/tools/handlers.js";
+import { handleMealCheckin, handleSwapMeal } from "../../src/tools/handlers.js";
 import type { MealPlanEntryRow } from "../../src/db/repository.js";
 import type { ToolContext } from "../../src/tools/context.js";
 import type { FoodCatalogRecord, MealCatalog } from "../../src/tools/nutrition-estimate.js";
@@ -109,6 +109,122 @@ describe("handleSwapMeal (V2-P5)", () => {
   });
 });
 
+describe("handleSwapMeal bounded semantics (CHA-MPV2-8: alternates-only)", () => {
+  test("rejects a safe, collision-free, lever-valid main that is NOT in the week's selected pool (A2)", async () => {
+    // black_pepper_chicken_breast is a real catalog main and lever-valid on
+    // the light default day, but the lean-tilt weekly pool (7 mains) does not
+    // select it — pool membership, not day validity, must gate the swap.
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+    const ctx = context({ updates });
+
+    await expect(handleSwapMeal(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "black_pepper_chicken_breast",
+    })).rejects.toThrow(/not one of this entry's pre-vetted alternates: it is outside this week's selected pool/);
+    expect(updates).toEqual([]);
+  });
+
+  test("rejects a dish skipped >=2 times even when otherwise valid (A2)", async () => {
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+    const ctx = context({
+      updates,
+      rangeRows: [
+        // Two skipped check-ins inside the W2 lookback window make
+        // chaoshan_beef_soup an avoidedDishSlugs signal; selectWeeklyPool
+        // excludes it from the pool, so the swap must reject it.
+        { ...row("skip-1", "lunch", 520, 32), planDate: "2026-07-02", recipeSlug: "chaoshan_beef_soup", status: "skipped" },
+        { ...row("skip-2", "lunch", 520, 32), planDate: "2026-07-04", recipeSlug: "chaoshan_beef_soup", status: "skipped" },
+      ],
+    });
+
+    await expect(handleSwapMeal(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "chaoshan_beef_soup",
+    })).rejects.toThrow(/skipped twice or more recently and is excluded from this week's pool/);
+    expect(updates).toEqual([]);
+  });
+
+  test("rejects a target already planned on an adjacent day (not a pre-vetted alternate)", async () => {
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+    const ctx = context({
+      updates,
+      rangeRows: [
+        { ...row("row-next-lunch", "lunch", 520, 32), planDate: "2026-07-09", recipeSlug: "chaoshan_beef_soup" },
+      ],
+    });
+
+    await expect(handleSwapMeal(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "chaoshan_beef_soup",
+    })).rejects.toThrow("not one of this entry's pre-vetted alternates");
+    expect(updates).toEqual([]);
+  });
+
+  test("rejects a target already planned the same day", async () => {
+    const rows = [
+      row("row-breakfast", "breakfast", 450, 28),
+      row("row-lunch", "lunch", 520, 32),
+      { ...row("row-dinner", "dinner", 560, 35), recipeSlug: "chaoshan_beef_soup" },
+    ];
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+
+    await expect(handleSwapMeal(context({ updates, rows }), {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "chaoshan_beef_soup",
+    })).rejects.toThrow(/pre-vetted alternates.*already planned on 2026-07-08/);
+    expect(updates).toEqual([]);
+  });
+
+  test("rejects a target at a higher weekly use count when a less-used alternate exists", async () => {
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+    const ctx = context({
+      updates,
+      rangeRows: [
+        // chaoshan_beef_soup already served two days ago: use count 1 in the
+        // surrounding week, while other lever-valid mains sit at 0.
+        { ...row("row-past-lunch", "lunch", 520, 32), planDate: "2026-07-06", recipeSlug: "chaoshan_beef_soup" },
+      ],
+    });
+
+    await expect(handleSwapMeal(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "chaoshan_beef_soup",
+    })).rejects.toThrow(/less-used alternates exist — currently pre-vetted:/);
+    expect(updates).toEqual([]);
+  });
+
+  test("swap round-trips through the repository layer and meal_checkin attaches to the swapped entry", async () => {
+    const updates: { entryId: string; data: Record<string, unknown> }[] = [];
+    const statusUpdates: { entryId: string; status: string }[] = [];
+    const ctx = context({ updates, statusUpdates, mutateRowsOnUpdate: true });
+
+    const swap = await handleSwapMeal(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      alternateSlug: "chaoshan_beef_soup",
+    });
+    expect(swap.entryId).toBe("row-lunch");
+    expect(updates.some((update) => update.entryId === "row-lunch")).toBe(true);
+
+    const checkin = await handleMealCheckin(ctx, {
+      date: "2026-07-08",
+      mealType: "lunch",
+      status: "followed",
+    });
+    expect(checkin.entryId).toBe("row-lunch");
+    expect(checkin.dietLogId).toBe("diet-log-1");
+    expect(statusUpdates).toEqual([{ entryId: "row-lunch", status: "followed" }]);
+    // The check-in logged the SWAPPED dish, not the original one.
+    const lunchUpdate = updates.find((update) => update.entryId === "row-lunch");
+    expect(String(lunchUpdate?.data["dishName"])).toContain(String(swap.newDish.name));
+  });
+});
+
 function row(id: string, mealType: string, kcal: number, proteinGrams: number): MealPlanEntryRow {
   return {
     id,
@@ -131,7 +247,10 @@ function row(id: string, mealType: string, kcal: number, proteinGrams: number): 
 function context(options: {
   updates: { entryId: string; data: Record<string, unknown> }[];
   rows?: MealPlanEntryRow[];
+  rangeRows?: MealPlanEntryRow[];
   rejectedSeasonings?: string[];
+  statusUpdates?: { entryId: string; status: string }[];
+  mutateRowsOnUpdate?: boolean;
 }): ToolContext {
   const rows = options.rows ?? [
     row("row-breakfast", "breakfast", 450, 28),
@@ -153,13 +272,22 @@ function context(options: {
       listUserDishes: async () => [],
       listActiveMemories: async () => [],
       listRejectedSeasoningSlugs: async () => options.rejectedSeasonings ?? [],
-      listMealPlanEntriesRange: async () => [],
+      listMealPlanEntriesRange: async (_userId: string, startDate: string, endDate: string) =>
+        (options.rangeRows ?? []).filter((item) => item.planDate >= startDate && item.planDate <= endDate),
       listDietLogsRange: async () => [],
       listMealPlanEntries: async (_userId: string, date?: string) =>
         rows.filter((item) => item.planDate === date),
       updateMealPlanEntryDish: async (entryId: string, data: Record<string, unknown>) => {
         options.updates.push({ entryId, data });
+        if (options.mutateRowsOnUpdate === true) {
+          const stored = rows.find((item) => item.id === entryId);
+          if (stored !== undefined) Object.assign(stored, data);
+        }
       },
+      updateMealPlanStatus: async (entryId: string, status: string) => {
+        options.statusUpdates?.push({ entryId, status });
+      },
+      insertDietLog: async () => ({ id: "diet-log-1" }),
     } as unknown as ToolContext["repo"],
     close: async () => undefined,
   };

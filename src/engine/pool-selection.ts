@@ -22,9 +22,20 @@ export interface WeeklyPoolMinimumCounts {
   sides?: number;
 }
 
+/**
+ * W2 preference signals the pool consumes on top of the shared preference
+ * shape. Declared here (not on RecipePreferences) so the signal can flow from
+ * candidate-loader through untouched call sites via structural typing.
+ * Precedence is fixed: safety filters > skipped>=2 exclusion > liked seeding.
+ */
+export interface WeeklyPoolPreferences extends RecipePreferences {
+  /** Dish slugs with a positive W2 signal: guaranteed >=2 rotation slots/week via pool membership. */
+  likedDishSlugs?: readonly string[];
+}
+
 export interface SelectWeeklyPoolRequest {
   candidates: readonly RecipeDish[];
-  preferences?: RecipePreferences;
+  preferences?: WeeklyPoolPreferences;
   minimumCounts?: WeeklyPoolMinimumCounts;
   weeklyFloors?: Readonly<Record<string, number>>;
   proteinFloor?: {
@@ -130,11 +141,31 @@ export function selectWeeklyPool(request: SelectWeeklyPoolRequest): SelectWeekly
     };
   }
 
-  // Adaptive mode counts what the fill can actually deliver: avoided
-  // (skipped>=2) dishes contribute at most one last-resort slot.
+  // W2 preference frequency: dishes skipped >=2 times (avoidedDishSlugs) are
+  // EXCLUDED from the pool. A soft behavior signal never blocks silently: the
+  // exclusion is a notice, and floors it starves are waived with the honest
+  // reason instead of reported as safety deficits.
   const avoidedSlugs = new Set((request.preferences?.avoidedDishSlugs ?? []).map(normalize));
-  const preferredMainCount = viableMains.filter((dish) => !avoidedSlugs.has(normalize(dish.slug))).length;
-  const achievableMains = preferredMainCount + Math.min(1, viableMains.length - preferredMainCount);
+  const skipExcludedMains = viableMains.filter((dish) => avoidedSlugs.has(normalize(dish.slug)));
+  const usableMains = viableMains.filter((dish) => !avoidedSlugs.has(normalize(dish.slug)));
+  if (skipExcludedMains.length > 0) {
+    poolNotices.push(
+      `Excluded ${skipExcludedMains.length} main(s) skipped twice or more recently: ` +
+      `${skipExcludedMains.map((dish) => dish.slug).join(", ")}. Re-enable one to bring it back this week.`,
+    );
+  }
+  if (usableMains.length === 0) {
+    return {
+      ok: false,
+      cannotSatisfy: {
+        reason: "Cannot fill the weekly main pool: every usable main was skipped twice or more recently",
+        suggestions: [
+          "re-enable one of the recently skipped dishes for this week",
+          "add new main dishes to the library",
+        ],
+      },
+    };
+  }
   const minimumCounts = strict
     ? {
       breakfasts: minimums.breakfasts ?? RECOMMENDED_COUNTS.breakfasts,
@@ -143,12 +174,12 @@ export function selectWeeklyPool(request: SelectWeeklyPoolRequest): SelectWeekly
     }
     : {
       breakfasts: Math.max(1, Math.min(RECOMMENDED_COUNTS.breakfasts, breakfastCandidates.length)),
-      mains: Math.max(1, Math.min(RECOMMENDED_COUNTS.mains, achievableMains)),
+      mains: Math.max(1, Math.min(RECOMMENDED_COUNTS.mains, usableMains.length)),
       sides: Math.min(RECOMMENDED_COUNTS.sides, sideCandidates.length),
     };
   const minimumFailure = minimumCountFailure(
     breakfastCandidates,
-    viableMains,
+    usableMains,
     sideCandidates,
     minimumCounts,
   );
@@ -157,14 +188,20 @@ export function selectWeeklyPool(request: SelectWeeklyPoolRequest): SelectWeekly
   }
 
   const allMainCandidates = request.candidates.filter(matchesMain);
-  const floorCheck = weeklyFloorCheck(viableMains, allMainCandidates, request.weeklyFloors ?? {}, strict);
+  const floorCheck = weeklyFloorCheck(
+    usableMains,
+    skipExcludedMains,
+    allMainCandidates,
+    request.weeklyFloors ?? {},
+    strict,
+  );
   if (floorCheck.failure !== undefined) {
     return { ok: false, cannotSatisfy: floorCheck.failure };
   }
 
   const fatOf = request.fatBudget === undefined ? undefined : makeFatLookup(request.fatBudget);
   const mains = selectMainPool(
-    viableMains,
+    usableMains,
     minimumCounts.mains,
     request.weeklyFloors ?? {},
     request.preferences,
@@ -172,19 +209,41 @@ export function selectWeeklyPool(request: SelectWeeklyPoolRequest): SelectWeekly
   );
   if (mains.length < minimumCounts.mains) {
     // Only reachable for strict callers: the adaptive minimum is derived from
-    // the achievable fill, while an explicit minimum can exceed what the
-    // avoided-dish (skipped>=2) cap lets the fill deliver.
+    // the usable fill, while an explicit minimum can exceed what remains after
+    // the skipped>=2 exclusion.
     return {
       ok: false,
       cannotSatisfy: {
         reason: `Cannot fill the weekly main pool: ${mains.length}/${minimumCounts.mains} usable mains` +
-          (avoidedSlugs.size > 0 ? " after limiting dishes skipped twice or more to one slot" : ""),
+          (skipExcludedMains.length > 0 ? " after excluding dishes skipped twice or more" : ""),
         suggestions: [
           "re-enable one of the recently skipped dishes for this week",
           "add new main dishes to the library",
         ],
       },
     };
+  }
+
+  // Legibility notices for liked mains the pool could not seat: preference
+  // never overrides safety or the skip signal, and a full pool stays at the
+  // rotation target.
+  const likedSlugs = new Set((request.preferences?.likedDishSlugs ?? []).map(normalize));
+  if (likedSlugs.size > 0) {
+    const seated = new Set(mains.map((dish) => normalize(dish.slug)));
+    const likedCandidates = request.candidates.filter(
+      (dish) => matchesMain(dish) && likedSlugs.has(normalize(dish.slug)),
+    );
+    for (const dish of likedCandidates) {
+      const slug = normalize(dish.slug);
+      if (seated.has(slug)) continue;
+      if (!isSafeDish(dish, request.preferences)) {
+        poolNotices.push(`Liked dish ${dish.slug} is excluded by safety filters (safety beats preference).`);
+      } else if (avoidedSlugs.has(slug)) {
+        poolNotices.push(`Liked dish ${dish.slug} was skipped twice or more recently; the skip signal wins this week.`);
+      } else if (usableMains.some((candidate) => normalize(candidate.slug) === slug)) {
+        poolNotices.push(`Liked dish ${dish.slug} did not fit the ${mains.length}-main pool this week.`);
+      }
+    }
   }
 
   // A dish already selected as a main must not also rotate as a breakfast
@@ -384,7 +443,8 @@ interface WeeklyFloorCheckResult {
 }
 
 function weeklyFloorCheck(
-  safeMains: readonly RecipeDish[],
+  usableMains: readonly RecipeDish[],
+  skipExcludedMains: readonly RecipeDish[],
   allMains: readonly RecipeDish[],
   weeklyFloors: Readonly<Record<string, number>>,
   strict: boolean,
@@ -394,8 +454,20 @@ function weeklyFloorCheck(
 
   for (const [bucket, floor] of Object.entries(weeklyFloors)) {
     if (floor <= 0) continue;
-    const safeCount = countBucket(safeMains, bucket);
-    if (safeCount >= floor) continue;
+    const usableCount = countBucket(usableMains, bucket);
+    if (usableCount >= floor) continue;
+    const skipExcludedCount = countBucket(skipExcludedMains, bucket);
+    if (usableCount + skipExcludedCount >= floor) {
+      // The deficit exists only because carriers were skipped >=2 times
+      // recently (W2 exclusion). A soft behavior signal never hard-blocks:
+      // waive with the honest reason so re-enabling a dish restores the floor.
+      waived.push({
+        bucket,
+        floor,
+        reason: `${skipExcludedCount} candidate(s) carrying ${bucket} were excluded after being skipped twice or more recently`,
+      });
+      continue;
+    }
     const preSafetyCount = countBucket(allMains, bucket);
     if (preSafetyCount === 0 && !strict) {
       // Adaptive flow: the library simply has no carrier for this bucket
@@ -408,7 +480,7 @@ function weeklyFloorCheck(
       });
       continue;
     }
-    if (safeCount === 0 && preSafetyCount > 0) {
+    if (usableCount === 0 && skipExcludedCount === 0 && preSafetyCount > 0) {
       // The bucket exists in the candidate set but every carrier was removed
       // by safety filters (allergens / strict exclusions). A safety-excluded
       // floor must never block the user; waive it and note the waiver.
@@ -419,7 +491,7 @@ function weeklyFloorCheck(
       });
       continue;
     }
-    deficits.push({ bucket, floor, actual: safeCount });
+    deficits.push({ bucket, floor, actual: usableCount });
   }
 
   if (deficits.length === 0) return { waived };
@@ -524,45 +596,38 @@ function selectMainPool(
   candidates: readonly RecipeDish[],
   minimumCount: number,
   weeklyFloors: Readonly<Record<string, number>>,
-  preferences: RecipePreferences | undefined,
+  preferences: WeeklyPoolPreferences | undefined,
   fatOf: FatLookup | undefined,
 ): readonly RecipeDish[] {
+  // Candidates arrive with safety filters and the skipped>=2 exclusion
+  // already applied; this fill only decides who gets the <=7 rotation seats.
   const fillTarget = Math.max(minimumCount, MAIN_ROTATION_TARGET);
   const selected: RecipeDish[] = [];
-  // W2 preference frequency: skipped->=2 dishes (avoidedDishSlugs) get 0-1
-  // slots — excluded from normal fill, usable only as a last resort to reach
-  // the pool minimum. Weekly floors override the soft signal: when a floor's
-  // only carriers are avoided dishes, the floor still gets its carrier
-  // (explicit quotas outrank a soft skip signal).
-  const avoided = new Set((preferences?.avoidedDishSlugs ?? []).map(normalize));
-  const isAvoided = (dish: RecipeDish): boolean => avoided.has(normalize(dish.slug));
-  const preferred = candidates.filter((dish) => !isAvoided(dish));
   const byFat = (dishes: readonly RecipeDish[]): readonly RecipeDish[] => fatOf === undefined
     ? dishes
     : [...dishes].sort((left, right) => fatOf(left) - fatOf(right));
-  const floorCandidates = [
-    ...byFat(preferred),
-    ...byFat(candidates.filter(isAvoided)),
-  ];
   for (const [bucket, floor] of Object.entries(weeklyFloors)) {
     if (floor <= 0) continue;
-    for (const candidate of floorCandidates.filter((dish) => hasBucket(dish, bucket))) {
+    for (const candidate of byFat(candidates).filter((dish) => hasBucket(dish, bucket))) {
       if (countBucket(selected, bucket) >= floor) break;
       addUnique(selected, candidate);
     }
   }
 
-  for (const candidate of rankByPreferences(preferred, preferences, fatOf)) {
-    if (selected.length >= fillTarget) break;
-    addUnique(selected, candidate);
+  // W2 liked mains are seated before the general fill: pool membership at
+  // <=7 mains guarantees >=2 rotation slots in the 14-slot week.
+  const liked = new Set((preferences?.likedDishSlugs ?? []).map(normalize));
+  if (liked.size > 0) {
+    const likedCandidates = candidates.filter((dish) => liked.has(normalize(dish.slug)));
+    for (const candidate of rankByPreferences(likedCandidates, preferences, fatOf)) {
+      if (selected.length >= fillTarget) break;
+      addUnique(selected, candidate);
+    }
   }
 
-  if (selected.length < minimumCount) {
-    for (const candidate of rankByPreferences(candidates.filter(isAvoided), preferences, fatOf)) {
-      if (selected.length >= minimumCount) break;
-      addUnique(selected, candidate);
-      break; // at most one avoided dish re-enters
-    }
+  for (const candidate of rankByPreferences(candidates, preferences, fatOf)) {
+    if (selected.length >= fillTarget) break;
+    addUnique(selected, candidate);
   }
 
   return selected;

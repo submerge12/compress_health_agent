@@ -124,18 +124,31 @@ already used by every other tool):
 
 ## Change 3 — register the new `swap_meal` write tool (V2-P5)
 
+> **AMENDED 2026-07-06 (CHA-MPV2-8, G2 decision HD-CHAMPV2-8-G2-SWAP-TOOL-SURFACE):** swap
+> semantics are now BOUNDED — the target must be one of the entry's pre-vetted alternates;
+> free-form substitution is rejected CHA-side with a clear error naming the currently
+> pre-vetted swaps. If the original Change 3 was already applied, only the `description`
+> string and the schema comment below need updating (wiring is unchanged); node 9 applies /
+> verifies this in a PI session.
+
 The rotation-planner v2 work added per-entry pre-vetted `alternates` to `generate_meal_plan` output
 (pass-through JSON, no pi-harness change) and a new write tool `swap_meal`
-(`handlers.handleSwapMeal`) that swaps a planned lunch/dinner for an alternate and re-balances the
-day's staple and protein top-ups. The handler, prompt step 6b, and the repository method all ship
-via the package; only the tool registration is pi-harness-side.
+(`handlers.handleSwapMeal`) that swaps a planned lunch/dinner to ONE OF ITS PRE-VETTED ALTERNATES
+and re-balances the day's staple and protein top-ups. The bounded semantics are enforced CHA-side
+(A2 repair, 2026-07-06): the target must belong to the WEEK'S SELECTED POOL — derived at swap time
+through the same `buildPoolRequest` → `selectWeeklyPool` wiring generation uses, which also
+carries the skipped-≥2 (`avoidedDishSlugs`) exclusion — plus safety filters, same-day/adjacent-day
+rotation collisions, minimal weekly use count, and hard day gates re-levered through the
+production path. The full dish catalog is NOT the candidate set. The handler, prompt step 6b, and
+the repository method all ship via the package; only the tool registration is pi-harness-side.
+Write scope: `meal_plan_entries` rows only, via the repository layer (`accessLevel: "write"`).
 
 ### Add the params
 ```ts
 const swapMealParams = Type.Object({
   date: Type.String(),          // YYYY-MM-DD
   mealType: Type.String(),      // "lunch" | "dinner"
-  alternateSlug: Type.String(), // a slug from the entry's alternates (or any main-dish slug)
+  alternateSlug: Type.String(), // MUST be one of the entry's pre-vetted alternates; others are rejected
 });
 ```
 
@@ -145,7 +158,7 @@ const swapMealParams = Type.Object({
   tool: {
     name: "swap_meal",
     label: "Swap Meal",
-    description: "Swap a planned lunch/dinner for an alternate dish and re-balance the day's staple and protein.",
+    description: "Swap a planned lunch/dinner to one of its pre-vetted alternates and re-balance the day's staple and protein. Non-alternate targets are rejected.",
     parameters: swapMealParams,
     async execute(_toolCallId, params) {
       return jsonResult(await handlers.handleSwapMeal(requireCtx(), params));
@@ -156,7 +169,10 @@ const swapMealParams = Type.Object({
 ```
 
 Verification: generate a plan, pick a lunch entry's alternate, call `swap_meal`, then confirm the
-entry row shows the new dish and `meal_checkin` still attaches to it ("换一个 round-trips").
+entry row shows the new dish and `meal_checkin` still attaches to it ("换一个 round-trips"). Also
+confirm the bounded rejection: calling `swap_meal` with a main that is NOT one of the entry's
+alternates (e.g. a dish already planned on the adjacent day) must return the "not one of this
+entry's pre-vetted alternates" error rather than writing.
 
 ---
 

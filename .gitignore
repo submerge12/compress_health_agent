@@ -10,6 +10,9 @@ _tmp_*
 *.stackdump
 .serve.log
 
+# AOH board raw logs (manifests go under evidence/, raw logs stay local)
+.evidence-local/
+
 # Local agent tooling (Claude Code config, skills)
 .agents/
 .claude/

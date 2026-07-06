@@ -168,7 +168,13 @@ function acceptedMealCandidates(
   return filterUsableCandidates(candidates, preferences);
 }
 
-function buildPoolRequest(
+/**
+ * The single source of pool-request wiring: generation builds its weekly
+ * pool through this, and swap_meal derives the SAME pool to enforce its
+ * alternates-only bound (CHA-MPV2-8 A2) — pool semantics live in
+ * selectWeeklyPool, never inline in a handler.
+ */
+export function buildPoolRequest(
   input: GenerateMealPlanInput,
   candidates: readonly RecipeDish[],
   useDefaultSelector: boolean,

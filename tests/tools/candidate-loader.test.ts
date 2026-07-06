@@ -345,6 +345,31 @@ describe("loadUserPreferences", () => {
     expect(prefs.preferredIngredients).not.toContain("mushroom");
     expect(prefs.preferredIngredients).not.toContain("unknown_food");
   });
+
+  test("mines followed>=2 check-ins into the likedDishSlugs pool signal (W2)", async () => {
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      planEntries: [
+        mealPlanEntry({ id: "f-1", planDate: "2026-07-02", recipeSlug: "scallion_beef", status: "followed" }),
+        mealPlanEntry({ id: "f-2", planDate: "2026-07-04", recipeSlug: "scallion_beef", status: "followed" }),
+        mealPlanEntry({ id: "f-3", planDate: "2026-07-05", recipeSlug: "boiled_chicken", status: "followed" }),
+      ],
+    }), { asOfDate: "2026-07-08" });
+
+    expect(prefs.likedDishSlugs).toContain("scallion_beef");
+    // A single follow is recency, not yet a liked-frequency signal.
+    expect(prefs.likedDishSlugs).not.toContain("boiled_chicken");
+  });
+
+  test("resolves a preference memory naming a preset dish to likedDishSlugs, not ingredients", async () => {
+    const dish = presetDishes[0];
+    if (dish === undefined) throw new Error("preset dish library is empty");
+    const prefs = await loadUserPreferences(makePreferenceContext({
+      likes: [preference(dish.name)],
+    }));
+
+    expect(prefs.likedDishSlugs).toContain(dish.slug);
+    expect(prefs.preferredIngredients).toEqual([]);
+  });
 });
 
 function mealPlanEntry(overrides: Partial<MealPlanEntryRow>): MealPlanEntryRow {

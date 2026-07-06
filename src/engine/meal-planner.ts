@@ -18,7 +18,6 @@ import {
   type Staple,
   type StaplePortion,
 } from "./meal-composition.js";
-import { scorePlan, type MealPlanScore } from "./meal-plan-scoring.js";
 import {
   ENERGY_TOLERANCE_RATIO,
   MAX_ENERGY_TOLERANCE_RATIO,
@@ -91,7 +90,6 @@ export interface WeeklyMealPlan {
   distinctDishCount: number;
   hardViolations: readonly HardViolation[];
   weeklyBudgets: WeeklyBudgets;
-  score?: MealPlanScore;
 }
 
 export type WeeklyBudgetStatus = "over" | "under" | "on_target" | "no_target";
@@ -218,20 +216,9 @@ export function generateWeeklyMealPlan(request: MealPlanRequest): WeeklyMealPlan
   if (hardViolations.length > 0) {
     throw new MealPlanInfeasibleError(buildInfeasibleResult(hardViolations));
   }
-  const withViolations = buildPlan(request.startDate, entries, hardViolations, budgetTargets);
-  return {
-    ...withViolations,
-    score: scorePlan(
-      withViolations,
-      {
-        dailyKcalTarget: request.dailyKcalTarget,
-        dailyProteinTarget: request.dailyProteinTarget,
-        dailyFatTarget: request.dailyFatTarget,
-        dailyCarbsTarget: request.dailyCarbsTarget,
-      },
-      request.preferences,
-    ),
-  };
+  // Rotation fill + the two levers are the only planner path (G2 decision
+  // CHA-MPV2-5): correctness is by construction, not by scored search.
+  return buildPlan(request.startDate, entries, hardViolations, budgetTargets);
 }
 
 export function validateWeeklyMealPlan(
@@ -313,8 +300,13 @@ function rotationAssignment(
 /**
  * V2-P4 alternates: for the lunch and dinner entries, offer up to two pool
  * mains that (a) do not collide with this day's or the adjacent days'
- * rotation slots and (b) keep the day inside the hard gates after the levers
- * re-run — so a "换一个" swap can never invalidate the day.
+ * rotation slots, (b) keep the day inside the hard gates after the levers
+ * re-run — so a "换一个" swap can never invalidate the day — and (c) sit at
+ * the lowest weekly rotation use count the pool allows, so a substitution
+ * never exceeds the <=2 uses/week rule when an under-used main exists.
+ * (A pool whose every main already holds two rotation slots — the exact-cover
+ * 7-main week — has no under-used candidates; alternates then share the
+ * pool-wide minimum instead of vanishing.)
  */
 function withMainAlternates(
   request: MealPlanRequest,
@@ -337,10 +329,18 @@ function withMainAlternates(
     adjacentSlugs.add(adjacent.dinner.slug);
   }
 
+  const useCounts = rotationUseCounts(rotationMains);
+  const countOf = (dish: RecipeDish): number => useCounts.get(dish.slug) ?? 0;
+  const byUseCount = [...rotationMains].sort((left, right) => countOf(left) - countOf(right));
+
   const alternatesFor = (slot: "lunch" | "dinner"): readonly MealPlanAlternate[] => {
     const alternates: MealPlanAlternate[] = [];
-    for (const candidate of rotationMains) {
+    let acceptedCount: number | undefined;
+    for (const candidate of byUseCount) {
       if (alternates.length >= 2) break;
+      // Ascending use-count order: once one alternate is accepted, higher-use
+      // candidates would break the minimal-substitution guarantee — stop.
+      if (acceptedCount !== undefined && countOf(candidate) > acceptedCount) break;
       if (candidate.slug === assignment.lunch.slug || candidate.slug === assignment.dinner.slug) continue;
       if (adjacentSlugs.has(candidate.slug)) continue;
       const trial = buildDayEntries(
@@ -355,6 +355,7 @@ function withMainAlternates(
       );
       if (dayMeetsHardGates(trial, request)) {
         alternates.push({ slug: candidate.slug, name: candidate.name });
+        acceptedCount = countOf(candidate);
       }
     }
     return alternates;
@@ -367,6 +368,18 @@ function withMainAlternates(
     { ...lunchEntry, ...(lunchAlternates.length === 0 ? {} : { alternates: lunchAlternates }) },
     { ...dinnerEntry, ...(dinnerAlternates.length === 0 ? {} : { alternates: dinnerAlternates }) },
   ];
+}
+
+/** Weekly rotation slot count per main (lunch walks the pool, dinner half a cycle ahead). */
+function rotationUseCounts(mains: readonly RecipeDish[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  const offset = Math.max(1, Math.ceil(mains.length / 2));
+  for (let day = 0; day < 7; day += 1) {
+    for (const dish of [atCycle(mains, day), atCycle(mains, day + offset)]) {
+      counts.set(dish.slug, (counts.get(dish.slug) ?? 0) + 1);
+    }
+  }
+  return counts;
 }
 
 function dayMeetsHardGates(dayEntries: readonly MealPlanEntry[], request: MealPlanRequest): boolean {
@@ -406,7 +419,13 @@ function atCycle<T>(items: readonly T[], index: number): T {
   return items[index % items.length] as T;
 }
 
-function buildDayEntries(
+/**
+ * The single lever path: composes one day's three entries, running the
+ * protein top-up lever and then the staple kcal lever. Primary rotation
+ * days, alternates vetting, and the re-lever tests all go through this
+ * function — a second validation implementation is a defect (CHA-MPV2-7).
+ */
+export function buildDayEntries(
   request: MealPlanRequest,
   date: string,
   dayIndex: number,

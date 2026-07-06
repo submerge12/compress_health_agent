@@ -1,0 +1,307 @@
+{
+  "scenario": "seafood-allergic synthetic fat-loss profile",
+  "profile": {
+    "dailyKcalTarget": 1800,
+    "dailyProteinTarget": 130,
+    "dailyFatTarget": 50,
+    "dailyCarbsTarget": 200
+  },
+  "startDate": "2026-07-13",
+  "status": "planned",
+  "meanAbsKcalDeviationRatio": 0.0187,
+  "dayTotals": [
+    {
+      "date": "2026-07-13",
+      "kcal": 1829,
+      "proteinGrams": 118.4,
+      "carbsGrams": 229.1,
+      "fatGrams": 54.5,
+      "sodiumMg": 490
+    },
+    {
+      "date": "2026-07-14",
+      "kcal": 1835,
+      "proteinGrams": 115.2,
+      "carbsGrams": 207,
+      "fatGrams": 69.1,
+      "sodiumMg": 515
+    },
+    {
+      "date": "2026-07-15",
+      "kcal": 1758,
+      "proteinGrams": 125.6,
+      "carbsGrams": 207.1,
+      "fatGrams": 51.2,
+      "sodiumMg": 767
+    },
+    {
+      "date": "2026-07-16",
+      "kcal": 1753,
+      "proteinGrams": 121.3,
+      "carbsGrams": 223.6,
+      "fatGrams": 45.2,
+      "sodiumMg": 438
+    },
+    {
+      "date": "2026-07-17",
+      "kcal": 1754,
+      "proteinGrams": 113.9,
+      "carbsGrams": 203.9,
+      "fatGrams": 62.6,
+      "sodiumMg": 516
+    },
+    {
+      "date": "2026-07-18",
+      "kcal": 1794,
+      "proteinGrams": 125.6,
+      "carbsGrams": 209.4,
+      "fatGrams": 55.3,
+      "sodiumMg": 738
+    },
+    {
+      "date": "2026-07-19",
+      "kcal": 1830,
+      "proteinGrams": 116.6,
+      "carbsGrams": 230.5,
+      "fatGrams": 53.1,
+      "sodiumMg": 529
+    }
+  ],
+  "weeklyBudgets": {
+    "fat": {
+      "actual": 391,
+      "target": 350,
+      "difference": 41,
+      "percentDifference": 11.7,
+      "status": "over"
+    },
+    "sodium": {
+      "actual": 3993,
+      "target": 16100,
+      "difference": -12107,
+      "percentDifference": 75.2,
+      "status": "under"
+    },
+    "carbs": {
+      "actual": 1510.6,
+      "target": 1400,
+      "difference": 110.6,
+      "percentDifference": 7.9,
+      "status": "over"
+    }
+  },
+  "waivedFloors": [
+    {
+      "bucket": "deep_sea_fish",
+      "floor": 2,
+      "reason": "all 3 candidates carrying deep_sea_fish were excluded by safety filters"
+    },
+    {
+      "bucket": "shellfish",
+      "floor": 1,
+      "reason": "all 3 candidates carrying shellfish were excluded by safety filters"
+    }
+  ],
+  "entries": [
+    {
+      "date": "2026-07-13",
+      "mealType": "breakfast",
+      "dish": "sweet_potato_yogurt_bowl",
+      "kcal": 422,
+      "proteinGrams": 23,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-13",
+      "mealType": "lunch",
+      "dish": "lean_beef_egg_plate",
+      "kcal": 688,
+      "proteinGrams": 54.1,
+      "alternates": [
+        "chaoshan_beef_soup",
+        "scallion_beef_rice"
+      ]
+    },
+    {
+      "date": "2026-07-13",
+      "mealType": "dinner",
+      "dish": "chicken_carrot_rice",
+      "kcal": 719,
+      "proteinGrams": 41.3,
+      "alternates": [
+        "chaoshan_beef_soup",
+        "scallion_beef_rice"
+      ]
+    },
+    {
+      "date": "2026-07-14",
+      "mealType": "breakfast",
+      "dish": "soymilk_egg_mantou",
+      "kcal": 416,
+      "proteinGrams": 27.7,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-14",
+      "mealType": "lunch",
+      "dish": "black_pepper_chicken_breast",
+      "kcal": 697,
+      "proteinGrams": 52.2,
+      "alternates": [
+        "scallion_beef_rice"
+      ]
+    },
+    {
+      "date": "2026-07-14",
+      "mealType": "dinner",
+      "dish": "tofu_broccoli_rice",
+      "kcal": 722,
+      "proteinGrams": 35.3,
+      "alternates": [
+        "scallion_beef_rice"
+      ]
+    },
+    {
+      "date": "2026-07-15",
+      "mealType": "breakfast",
+      "dish": "corn_mantou_egg",
+      "kcal": 496,
+      "proteinGrams": 23.5,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-15",
+      "mealType": "lunch",
+      "dish": "chaoshan_beef_soup",
+      "kcal": 593,
+      "proteinGrams": 53.3,
+      "alternates": [
+        "chicken_carrot_rice"
+      ]
+    },
+    {
+      "date": "2026-07-15",
+      "mealType": "dinner",
+      "dish": "seaweed_tofu_soup_rice",
+      "kcal": 669,
+      "proteinGrams": 48.8,
+      "alternates": [
+        "chicken_carrot_rice"
+      ]
+    },
+    {
+      "date": "2026-07-16",
+      "mealType": "breakfast",
+      "dish": "sweet_potato_yogurt_bowl",
+      "kcal": 422,
+      "proteinGrams": 23,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-16",
+      "mealType": "lunch",
+      "dish": "scallion_beef_rice",
+      "kcal": 643,
+      "proteinGrams": 44.2,
+      "alternates": [
+        "tofu_broccoli_rice"
+      ]
+    },
+    {
+      "date": "2026-07-16",
+      "mealType": "dinner",
+      "dish": "lean_beef_egg_plate",
+      "kcal": 688,
+      "proteinGrams": 54.1,
+      "alternates": [
+        "tofu_broccoli_rice"
+      ]
+    },
+    {
+      "date": "2026-07-17",
+      "mealType": "breakfast",
+      "dish": "soymilk_egg_mantou",
+      "kcal": 416,
+      "proteinGrams": 27.7,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-17",
+      "mealType": "lunch",
+      "dish": "chicken_carrot_rice",
+      "kcal": 641,
+      "proteinGrams": 34,
+      "alternates": [
+        "seaweed_tofu_soup_rice"
+      ]
+    },
+    {
+      "date": "2026-07-17",
+      "mealType": "dinner",
+      "dish": "black_pepper_chicken_breast",
+      "kcal": 697,
+      "proteinGrams": 52.2,
+      "alternates": [
+        "seaweed_tofu_soup_rice"
+      ]
+    },
+    {
+      "date": "2026-07-18",
+      "mealType": "breakfast",
+      "dish": "corn_mantou_egg",
+      "kcal": 496,
+      "proteinGrams": 23.5,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-18",
+      "mealType": "lunch",
+      "dish": "tofu_broccoli_rice",
+      "kcal": 652,
+      "proteinGrams": 28.7,
+      "alternates": [
+        "lean_beef_egg_plate"
+      ]
+    },
+    {
+      "date": "2026-07-18",
+      "mealType": "dinner",
+      "dish": "chaoshan_beef_soup",
+      "kcal": 646,
+      "proteinGrams": 73.4,
+      "alternates": [
+        "lean_beef_egg_plate"
+      ]
+    },
+    {
+      "date": "2026-07-19",
+      "mealType": "breakfast",
+      "dish": "sweet_potato_yogurt_bowl",
+      "kcal": 422,
+      "proteinGrams": 23,
+      "alternates": []
+    },
+    {
+      "date": "2026-07-19",
+      "mealType": "lunch",
+      "dish": "seaweed_tofu_soup_rice",
+      "kcal": 608,
+      "proteinGrams": 28,
+      "alternates": [
+        "lean_beef_egg_plate",
+        "black_pepper_chicken_breast"
+      ]
+    },
+    {
+      "date": "2026-07-19",
+      "mealType": "dinner",
+      "dish": "scallion_beef_rice",
+      "kcal": 800,
+      "proteinGrams": 65.6,
+      "alternates": [
+        "lean_beef_egg_plate",
+        "black_pepper_chicken_breast"
+      ]
+    }
+  ]
+}

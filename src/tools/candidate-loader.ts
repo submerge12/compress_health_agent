@@ -1,4 +1,5 @@
-import type { RecipeDish, RecipePreferences } from "../engine/recipe-engine.js";
+import type { RecipeDish } from "../engine/recipe-engine.js";
+import type { WeeklyPoolPreferences } from "../engine/pool-selection.js";
 import type { DietLogRow, UserDishRow } from "../db/repository.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { dishBucketsRoles } from "../engine/classification.js";
@@ -20,7 +21,7 @@ export interface LoadUserPreferenceOptions {
 export async function loadUserPreferences(
   ctx: ToolContext,
   options: LoadUserPreferenceOptions = {},
-): Promise<RecipePreferences> {
+): Promise<WeeklyPoolPreferences> {
   const { startDate, endDate } = recentWindow(options.asOfDate ?? todayIso(), options.lookbackDays ?? 7);
   const [dislikes, likes, tableRejectedSeasonings, planHistory, dietHistory] = await Promise.all([
     ctx.repo.listActiveMemories(ctx.userId, ["dislike"]),
@@ -39,6 +40,8 @@ export async function loadUserPreferences(
   const preferredMethods = new Set<string>();
   const recentDishSlugs = new Set<string>();
   const skippedCounts = new Map<string, number>();
+  const followedCounts = new Map<string, number>();
+  const likedDishSlugs = new Set<string>();
 
   for (const memory of dislikes) {
     const subject = memory.subject.trim();
@@ -61,6 +64,15 @@ export async function loadUserPreferences(
   for (const memory of likes) {
     const subject = memory.subject.trim();
     if (!subject) continue;
+    // A like naming a whole dish (preset slug or name) is a W2 pool-frequency
+    // signal, checked before ingredient/seasoning resolution so dish names do
+    // not degrade into their ingredients. User-dish likes reach the pool via
+    // the followed>=2 behavior path instead (no extra repo read here).
+    const asDish = resolvePresetDishSlug(subject);
+    if (asDish !== undefined) {
+      likedDishSlugs.add(asDish);
+      continue;
+    }
     const asFood = resolveFoodSlug(subject, ctx.catalog);
     if (asFood.slug !== undefined) {
       preferredIngredients.add(asFood.slug);
@@ -84,6 +96,15 @@ export async function loadUserPreferences(
     if (entry.status === "skipped") {
       skippedCounts.set(slug, (skippedCounts.get(slug) ?? 0) + 1);
     }
+    if (entry.status === "followed") {
+      followedCounts.set(slug, (followedCounts.get(slug) ?? 0) + 1);
+    }
+  }
+
+  // W2 behavior mirror of skipped>=2: a dish followed twice or more in the
+  // window is a liked-dish signal for pool frequency.
+  for (const [slug, count] of followedCounts) {
+    if (count >= 2) likedDishSlugs.add(slug);
   }
 
   for (const log of dietHistory.filter((row) => row.source === "substituted" && isWithinWindow(row.logDate, startDate, endDate))) {
@@ -104,7 +125,23 @@ export async function loadUserPreferences(
     avoidedDishSlugs: [...skippedCounts]
       .filter(([, count]) => count >= 2)
       .map(([slug]) => slug),
+    likedDishSlugs: [...likedDishSlugs],
   };
+}
+
+function resolvePresetDishSlug(subject: string): string | undefined {
+  const normalized = normalizeDishText(subject);
+  if (!normalized) return undefined;
+  for (const dish of presetDishes) {
+    if (normalizeDishText(dish.slug) === normalized || normalizeDishText(dish.name) === normalized) {
+      return dish.slug;
+    }
+  }
+  return undefined;
+}
+
+function normalizeDishText(value: string): string {
+  return value.trim().toLowerCase().replace(/[-\s]+/g, "_");
 }
 
 function isBehaviorStatus(status: string): boolean {

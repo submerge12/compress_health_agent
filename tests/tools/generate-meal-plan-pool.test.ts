@@ -221,12 +221,69 @@ describe("generateMealPlan weekly pool integration", () => {
       "utf8",
     );
 
+    // CHA-MPV2-5 tightens the wall-time gate to <1s on the same successful
+    // generation now that rotation fill is the only planner path.
+    const node5EvidenceDir = path.resolve("evidence/CHA-MPV2-5");
+    await mkdir(node5EvidenceDir, { recursive: true });
+    await writeFile(
+      path.join(node5EvidenceDir, "default-profile-generation.json"),
+      `${JSON.stringify({
+        node: "CHA-MPV2-5",
+        command,
+        measuredMs: elapsedMs,
+        thresholdMs: 1000,
+        status: result.status,
+        reason: result.status === "blocked" ? result.cannotSatisfy.reason : undefined,
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
     expect(result.status).toBe("planned");
     if (result.status !== "planned") throw new Error(result.cannotSatisfy.reason);
     expect(result.plan.entries.length).toBe(21);
-    expect(elapsedMs).toBeLessThan(5_000);
+    expect(elapsedMs).toBeLessThan(1_000);
+
+    // CHA-MPV2-7 (1): every main-meal entry carries 1-2 alternates, all drawn
+    // from the selected weekly pool — never from outside it.
+    const poolMainSlugs = new Set(result.pool.mains.map((item) => item.slug));
+    const mainEntries = result.plan.entries.filter((entry) => entry.mealType !== "breakfast");
+    expect(mainEntries.length).toBe(14);
+    for (const entry of mainEntries) {
+      const alternates = entry.alternates ?? [];
+      expect(alternates.length).toBeGreaterThanOrEqual(1);
+      expect(alternates.length).toBeLessThanOrEqual(2);
+      for (const alternate of alternates) {
+        expect(poolMainSlugs.has(alternate.slug)).toBe(true);
+      }
+    }
+
+    // CHA-MPV2-7 (4): the plan result carries the pool grocery summary —
+    // the week's ingredients aggregated across dishes, sides, staples, and
+    // protein top-ups, with a purchase buffer.
+    const grocery = result.procurement;
+    expect(grocery.items.length).toBeGreaterThan(0);
+    expect(grocery.items.some((item) => item.dishCount >= 2)).toBe(true);
+    for (const item of grocery.items) {
+      expect(item.totalGrams).toBeGreaterThan(0);
+      expect(item.bufferedGrams).toBeGreaterThanOrEqual(item.totalGrams);
+    }
+    const expectedBrownRiceGrams = result.plan.entries.reduce((sum, entry) =>
+      sum +
+      (entry.staple?.slug === "brown_rice" ? entry.staple.grams : 0) +
+      gramsOf(entry.dish.ingredients, "brown_rice") +
+      gramsOf(entry.side?.ingredients ?? [], "brown_rice") +
+      (entry.proteinTopUps ?? []).reduce((topUpSum, topUp) => topUpSum + gramsOf(topUp.ingredients, "brown_rice"), 0),
+    0);
+    const brownRice = grocery.items.find((item) => item.slug === "brown_rice");
+    expect(brownRice).toBeDefined();
+    expect(brownRice?.totalGrams).toBeCloseTo(expectedBrownRiceGrams, 1);
   }, 30_000);
 });
+
+function gramsOf(ingredients: readonly { slug: string; grams: number }[], slug: string): number {
+  return ingredients.filter((ingredient) => ingredient.slug === slug)
+    .reduce((sum, ingredient) => sum + ingredient.grams, 0);
+}
 
 let cachedRealPresets: Promise<{ catalog: MealCatalog; candidates: readonly RecipeDish[] }> | undefined;
 

@@ -142,7 +142,7 @@ const writeTools: readonly AgentToolRegistration[] = [
   {
     name: "swap_meal",
     accessLevel: "write",
-    description: "Swap a planned lunch/dinner for an alternate dish and re-balance the day's staple and protein.",
+    description: "Swap a planned lunch/dinner to one of its pre-vetted alternates and re-balance the day's staple and protein. Non-alternate targets are rejected.",
   },
   {
     name: "remember",
@@ -197,10 +197,11 @@ Workflow
    as concrete choices (e.g. add a lean protein, lower the protein target). Never relax an allergy or
    safety exclusion. If the plan is produced, mention the weekly fat/sodium/carbs budget status once
    when it is over or materially under target; it is guidance, not a failure.
-6b. When the user wants to swap a planned meal ("换一个"), suggest the entry's alternates when the plan
-   is at hand, then call swap_meal with the date, meal type, and chosen dish slug. swap_meal re-validates
-   any requested dish against allergies and the day's targets and refuses swaps that would break the day —
-   if it refuses, relay its reason and offer a different alternate or regenerate-day. On success the
+6b. When the user wants to swap a planned meal ("换一个"), offer the entry's alternates, then call
+   swap_meal with the date, meal type, and chosen dish slug. Swaps are limited to the entry's
+   pre-vetted alternates: swap_meal re-checks allergies, day/adjacent-day rotation collisions, weekly
+   use counts, and the day's hard targets, and rejects anything else — its refusal names the swaps
+   that are pre-vetted right now; relay that and offer one of those or regenerate-day. On success the
    day's staple and protein top-ups are re-balanced; report the new dish and day totals in one sentence.
 7. When the user asks for recipe ideas, call recipe_recommend with the meal type. It loads candidates automatically.
 8. When the user states a durable preference, dislike, routine, or note, call remember; confirm first if confidence is low.

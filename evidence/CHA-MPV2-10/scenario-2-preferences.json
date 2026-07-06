@@ -1,0 +1,47 @@
+{
+  "scenario": "W2 preference signals in the full journey",
+  "profile": {
+    "dailyKcalTarget": 1800,
+    "dailyProteinTarget": 130,
+    "dailyFatTarget": 50,
+    "dailyCarbsTarget": 200
+  },
+  "startDate": "2026-07-13",
+  "likedSlug": "braised_chicken_thigh_rice",
+  "avoidedSlug": "chaoshan_beef_soup",
+  "likedUses": 2,
+  "avoidedPresent": false,
+  "mains": [
+    {
+      "slug": "pan_seared_bream_rice",
+      "uses": 2
+    },
+    {
+      "slug": "braised_chicken_thigh_rice",
+      "uses": 2
+    },
+    {
+      "slug": "steamed_bream_rice",
+      "uses": 2
+    },
+    {
+      "slug": "broccoli_shrimp_rice",
+      "uses": 2
+    },
+    {
+      "slug": "onion_beef_rice",
+      "uses": 2
+    },
+    {
+      "slug": "garlic_noodle_napa_shrimp_rice",
+      "uses": 2
+    },
+    {
+      "slug": "scallion_beef_rice",
+      "uses": 2
+    }
+  ],
+  "poolNotices": [
+    "Excluded 1 main(s) skipped twice or more recently: chaoshan_beef_soup. Re-enable one to bring it back this week."
+  ]
+}
