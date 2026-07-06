@@ -4,10 +4,15 @@ import { logExercise } from "../../src/tools/log-exercise.js";
 import { logMeal } from "../../src/tools/log-meal.js";
 import { logWater } from "../../src/tools/log-water.js";
 import { logWeight } from "../../src/tools/log-weight.js";
-import { nutritionEstimate } from "../../src/tools/nutrition-estimate.js";
+import {
+  assertNutritionEstimateResolved,
+  nutritionEstimate,
+  parseMealItems,
+} from "../../src/tools/nutrition-estimate.js";
+import type { MealCatalog } from "../../src/tools/nutrition-estimate.js";
 import { createInMemoryHealthRepository } from "../../src/tools/store.js";
 
-const catalog = {
+const catalog: MealCatalog = {
   foods: [
     {
       slug: "chicken_breast",
@@ -15,6 +20,7 @@ const catalog = {
       aliases: ["鸡胸肉"],
       defaultGrams: 120,
       defaultUnit: "serving",
+      weightType: "raw",
       kcalPer100g: 165,
       proteinGramsPer100g: 31,
       carbsGramsPer100g: 0,
@@ -27,6 +33,7 @@ const catalog = {
       aliases: ["糙米"],
       defaultGrams: 150,
       defaultUnit: "bowl",
+      weightType: "cooked",
       kcalPer100g: 112,
       proteinGramsPer100g: 2.6,
       carbsGramsPer100g: 23,
@@ -39,6 +46,7 @@ const catalog = {
       aliases: ["西兰花"],
       defaultGrams: 100,
       defaultUnit: "serving",
+      weightType: "raw",
       kcalPer100g: 35,
       proteinGramsPer100g: 2.4,
       carbsGramsPer100g: 7.2,
@@ -51,6 +59,25 @@ const catalog = {
     { foodSlug: "brown_rice", unit: "bowl", grams: 150, aliases: ["碗"] },
     { foodSlug: "broccoli", unit: "serving", grams: 100, aliases: ["份"] },
   ],
+};
+
+const dryCatalog: MealCatalog = {
+  foods: [
+    {
+      slug: "brown_rice",
+      name: "brown rice",
+      aliases: ["rice"],
+      defaultGrams: 100,
+      defaultUnit: "serving",
+      weightType: "dry",
+      kcalPer100g: 348,
+      proteinGramsPer100g: 7.7,
+      carbsGramsPer100g: 75,
+      fatGramsPer100g: 2.7,
+      sodiumMgPer100g: 1,
+    },
+  ],
+  naturalUnits: [{ foodSlug: "brown_rice", unit: "bowl", grams: 150 }],
 };
 
 describe("logging tools", () => {
@@ -201,8 +228,100 @@ describe("logging tools", () => {
     ]);
   });
 
-  test("nutritionEstimate_whenFoodIsUnknown_throwsRangeError", () => {
-    expect(() => nutritionEstimate({ description: "mystery food" }, catalog)).toThrow(RangeError);
+  test("nutritionEstimate_whenDryWeightBasisIsUnclear_warnsAndLogMealStillWrites", () => {
+    const repository = createInMemoryHealthRepository();
+
+    const estimate = nutritionEstimate({ description: "1 bowl brown rice" }, dryCatalog);
+
+    expect(estimate.basisWarnings).toEqual([
+      expect.objectContaining({
+        slug: "brown_rice",
+        expectedWeightType: "dry",
+      }),
+    ]);
+    const row = logMeal(
+      { date: "2026-06-17", mealType: "lunch", description: "1 bowl brown rice" },
+      repository,
+      dryCatalog,
+    );
+    expect(row).toMatchObject({
+      items: [{ slug: "brown_rice", grams: 150 }],
+      basisWarnings: [
+        expect.objectContaining({
+          slug: "brown_rice",
+          expectedWeightType: "dry",
+        }),
+      ],
+    });
+    expect(repository.listDietLogs("2026-06-17")).toHaveLength(1);
+  });
+
+  test("nutritionResolution_whenWeightBasisIsUnclear_isSoftByDefaultAndStrictWhenRequested", () => {
+    const estimate = nutritionEstimate({ description: "1 bowl brown rice" }, dryCatalog);
+
+    expect(() => assertNutritionEstimateResolved(estimate)).not.toThrow();
+    expect(() => assertNutritionEstimateResolved(estimate, { requireWeightBasis: true }))
+      .toThrow("meal description needs weight basis confirmation before logging");
+    expect(parseMealItems("1 bowl brown rice", dryCatalog)).toEqual([
+      { slug: "brown_rice", grams: 150 },
+    ]);
+    expect(() => parseMealItems("1 bowl brown rice", dryCatalog, { requireWeightBasis: true }))
+      .toThrow("description needs weight basis confirmation");
+  });
+
+  test("nutritionEstimate_whenCookedWeightIsLoggedAgainstDryFood_warnsAboutBasisMismatch", () => {
+    const estimate = nutritionEstimate({ description: "80g cooked brown rice" }, dryCatalog);
+
+    expect(estimate.basisWarnings).toEqual([
+      expect.objectContaining({
+        slug: "brown_rice",
+        expectedWeightType: "dry",
+      }),
+    ]);
+  });
+
+  test("nutritionEstimate_whenFoodIsUnknown_returnsFallbackEstimateWithUncertainty", () => {
+    const result = nutritionEstimate({ description: "mystery food" }, catalog);
+
+    expect(result.items).toEqual([]);
+    expect(result.kcal).toBeGreaterThan(0);
+    expect(result.uncertain).toBe(true);
+    expect(result.fallbackEstimates).toEqual([
+      expect.objectContaining({
+        segment: "mystery food",
+        grams: expect.any(Number),
+        confidence: "low",
+      }),
+    ]);
+    expect(result.unmatched).toEqual([
+      {
+        segment: "mystery food",
+        candidates: expect.any(Array),
+      },
+    ]);
+    expect(() => assertNutritionEstimateResolved(result)).not.toThrow();
+  });
+
+  test("logMeal_whenFoodIsUnknown_stillWritesConservativeFallbackLog", () => {
+    const repository = createInMemoryHealthRepository();
+
+    const row = logMeal(
+      { date: "2026-06-17", mealType: "lunch", description: "mystery food 200g" },
+      repository,
+      catalog,
+    );
+
+    expect(row.kcal).toBeGreaterThan(0);
+    expect(row.items).toEqual([]);
+    expect(row.uncertain).toBe(true);
+    expect(row.fallbackEstimates).toEqual([
+      expect.objectContaining({
+        segment: "mystery food 200g",
+        grams: 200,
+        confidence: "low",
+      }),
+    ]);
+    expect(repository.listDietLogs("2026-06-17")).toHaveLength(1);
   });
 
   test("logWater_whenCupPhraseProvided_logsDefaultCupAmount", () => {

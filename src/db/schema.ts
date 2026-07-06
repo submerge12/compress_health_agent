@@ -3,14 +3,18 @@ import {
   boolean,
   date,
   doublePrecision,
+  index,
   integer,
   jsonb,
-  pgTable,
+  pgSchema,
   text,
   timestamp,
   unique,
-  uuid
+  uuid,
+  vector
 } from "drizzle-orm/pg-core";
+
+import { getEmbeddingDimensions } from "../embeddings/client.js";
 
 const timestamps = () => ({
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -39,8 +43,11 @@ const nutritionColumns = () => ({
 });
 
 const emptyArrayJson = sql`'[]'::jsonb`;
+const embeddingDimensions = getEmbeddingDimensions();
 
-export const users = pgTable("users", {
+export const compass = pgSchema("compass_health");
+
+export const users = compass.table("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   externalId: text("external_id").notNull().unique(),
   email: text("email").unique(),
@@ -55,7 +62,7 @@ const userId = () =>
     .notNull()
     .references(() => users.id, { onDelete: "cascade" });
 
-export const bmrProfiles = pgTable("bmr_profiles", {
+export const bmrProfiles = compass.table("bmr_profiles", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   sex: text("sex").notNull(),
@@ -74,7 +81,7 @@ export const bmrProfiles = pgTable("bmr_profiles", {
   ...timestamps()
 });
 
-export const dailyActivityPlans = pgTable("daily_activity_plans", {
+export const dailyActivityPlans = compass.table("daily_activity_plans", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   planDate: date("plan_date").notNull(),
@@ -88,7 +95,7 @@ export const dailyActivityPlans = pgTable("daily_activity_plans", {
   ...timestamps()
 });
 
-export const dietLogs = pgTable("diet_logs", {
+export const dietLogs = compass.table("diet_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -102,7 +109,7 @@ export const dietLogs = pgTable("diet_logs", {
   ...timestamps()
 });
 
-export const waterLogs = pgTable("water_logs", {
+export const waterLogs = compass.table("water_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -112,7 +119,7 @@ export const waterLogs = pgTable("water_logs", {
   ...timestamps()
 });
 
-export const exerciseLogs = pgTable("exercise_logs", {
+export const exerciseLogs = compass.table("exercise_logs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   logDate: date("log_date").notNull(),
@@ -125,7 +132,7 @@ export const exerciseLogs = pgTable("exercise_logs", {
   ...timestamps()
 });
 
-export const physicalConditions = pgTable("physical_conditions", {
+export const physicalConditions = compass.table("physical_conditions", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   measuredAt: timestamp("measured_at", { withTimezone: true }).notNull().defaultNow(),
@@ -138,7 +145,7 @@ export const physicalConditions = pgTable("physical_conditions", {
   ...timestamps()
 });
 
-export const mealPlanEntries = pgTable("meal_plan_entries", {
+export const mealPlanEntries = compass.table("meal_plan_entries", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   planDate: date("plan_date").notNull(),
@@ -152,18 +159,40 @@ export const mealPlanEntries = pgTable("meal_plan_entries", {
   ...timestamps()
 });
 
-export const foodItems = pgTable("food_items", {
+export const foodItems = compass.table("food_items", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
   nameZh: text("name_zh"),
   category: text("category"),
+  executionBuckets: jsonb("execution_buckets").$type<string[]>().notNull().default(emptyArrayJson),
+  roles: jsonb("roles").$type<string[]>().notNull().default(emptyArrayJson),
+  weeklyFloor: integer("weekly_floor").notNull().default(0),
+  allergenTags: jsonb("allergen_tags").$type<string[]>().notNull().default(emptyArrayJson),
+  weightType: text("weight_type").notNull().default("raw"),
+  frequencyHint: text("frequency_hint"),
+  cookingDifficulty: text("cooking_difficulty"),
+  availability: text("availability"),
+  specialHandlingTags: jsonb("special_handling_tags").$type<string[]>().notNull().default(emptyArrayJson),
   source: text("source").notNull().default("csv"),
+  embedding: vector("embedding", { dimensions: embeddingDimensions }),
+  embeddingText: text("embedding_text"),
+  embeddingModel: text("embedding_model"),
   ...nutritionColumns(),
   ...timestamps()
 });
 
-export const seasonings = pgTable("seasonings", {
+export const foodAliases = compass.table("food_aliases", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  slug: text("slug").notNull(),
+  alias: text("alias").notNull(),
+  locale: text("locale"),
+  ...timestamps()
+}, (t) => [
+  unique().on(t.slug, t.alias),
+]);
+
+export const seasonings = compass.table("seasonings", {
   id: uuid("id").primaryKey().defaultRandom(),
   slug: text("slug").notNull().unique(),
   name: text("name").notNull(),
@@ -178,7 +207,7 @@ export const seasonings = pgTable("seasonings", {
   ...timestamps()
 });
 
-export const naturalUnits = pgTable("natural_units", {
+export const naturalUnits = compass.table("natural_units", {
   id: uuid("id").primaryKey().defaultRandom(),
   foodItemId: uuid("food_item_id").references(() => foodItems.id, { onDelete: "cascade" }),
   foodSlug: text("food_slug").notNull(),
@@ -191,7 +220,7 @@ export const naturalUnits = pgTable("natural_units", {
   unique().on(t.foodSlug, t.unitName),
 ]);
 
-export const cookingRecords = pgTable("cooking_records", {
+export const cookingRecords = compass.table("cooking_records", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   dishName: text("dish_name").notNull(),
@@ -206,7 +235,30 @@ export const cookingRecords = pgTable("cooking_records", {
   ...timestamps()
 });
 
-export const mealCompositions = pgTable("meal_compositions", {
+export const userDishes = compass.table("user_dishes", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  slug: text("slug").notNull(),
+  name: text("name").notNull(),
+  mealCategory: text("meal_category").notNull(),
+  role: text("role").notNull().default("main"),
+  sideKind: text("side_kind"),
+  selfContained: boolean("self_contained").notNull().default(true),
+  ingredientsJson: jsonb("ingredients_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  seasoningsJson: jsonb("seasonings_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  method: text("method"),
+  caloriesKcal: doublePrecision("calories_kcal").notNull().default(0),
+  proteinGrams: doublePrecision("protein_g").notNull().default(0),
+  carbsGrams: doublePrecision("carbs_g").notNull().default(0),
+  fatGrams: doublePrecision("fat_g").notNull().default(0),
+  sodiumMg: doublePrecision("sodium_mg").notNull().default(0),
+  source: text("source").notNull().default("user"),
+  ...timestamps()
+}, (t) => [
+  unique().on(t.userId, t.slug),
+]);
+
+export const mealCompositions = compass.table("meal_compositions", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   mealPlanEntryId: uuid("meal_plan_entry_id").references(() => mealPlanEntries.id, { onDelete: "cascade" }),
@@ -221,7 +273,7 @@ export const mealCompositions = pgTable("meal_compositions", {
   ...timestamps()
 });
 
-export const userSeasoningPreferences = pgTable("user_seasoning_preferences", {
+export const userSeasoningPreferences = compass.table("user_seasoning_preferences", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
   seasoningId: uuid("seasoning_id")
@@ -233,3 +285,28 @@ export const userSeasoningPreferences = pgTable("user_seasoning_preferences", {
   notes: text("notes"),
   ...timestamps()
 });
+
+export const memoryRecords = compass.table("memory_records", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  kind: text("kind").notNull(),
+  subject: text("subject").notNull(),
+  content: text("content").notNull(),
+  contentNorm: text("content_norm").notNull().default(""),
+  sourceText: text("source_text"),
+  confidence: doublePrecision("confidence").notNull().default(1),
+  status: text("status").notNull().default("active"),
+  supersededBy: uuid("superseded_by"),
+  validFrom: timestamp("valid_from", { withTimezone: true }).notNull().defaultNow(),
+  validTo: timestamp("valid_to", { withTimezone: true }),
+  lastConfirmedAt: timestamp("last_confirmed_at", { withTimezone: true }).defaultNow(),
+  timesReferenced: integer("times_referenced").notNull().default(0),
+  embedding: vector("embedding", { dimensions: embeddingDimensions }),
+  embeddingModel: text("embedding_model"),
+  ...timestamps()
+}, (t) => [
+  index("memory_records_user_status_idx").on(t.userId, t.status),
+  index("memory_records_user_kind_subject_idx").on(t.userId, t.kind, t.subject),
+  index("memory_records_content_norm_trgm_idx").using("gin", t.contentNorm.op("gin_trgm_ops")),
+  index("memory_records_embedding_hnsw_idx").using("hnsw", t.embedding.op("vector_cosine_ops")),
+]);

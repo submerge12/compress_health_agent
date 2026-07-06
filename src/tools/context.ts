@@ -4,15 +4,20 @@ import postgres from "postgres";
 import * as schema from "../db/schema.js";
 import { createRepository, type Repository } from "../db/repository.js";
 import { loadMealCatalog, loadSeasoningRecords } from "../db/catalog.js";
+import { createEmbeddingClient, getEmbeddingConfig, type EmbeddingClient } from "../embeddings/client.js";
 import type { MealCatalog } from "./nutrition-estimate.js";
+import type { SeasoningLike } from "./slug-resolver.js";
 import type { NutritionRecord } from "../engine/types.js";
 
 export interface ToolContext {
   userId: string;
   locale: "zh" | "en";
   repo: Repository;
+  embeddingClient?: EmbeddingClient;
   catalog: MealCatalog;
   seasoningRecords: NutritionRecord[];
+  /** Seasoning slugs + display names, for resolving free-text preferences to slugs. */
+  seasoningCatalog?: readonly SeasoningLike[];
   close: () => Promise<void>;
 }
 
@@ -28,7 +33,11 @@ export async function initToolContext(options: InitContextOptions): Promise<Tool
 
   const pool = postgres(url, { max: 5, prepare: false, idle_timeout: 20, connect_timeout: 10 });
   const db = drizzle(pool, { schema });
-  const repo = createRepository(db);
+  const embeddingClient = createOptionalEmbeddingClient();
+  const repo = createRepository(db, {
+    ...(embeddingClient !== undefined ? { embeddingClient } : {}),
+    embeddingModel: process.env.EMBEDDING_MODEL,
+  });
 
   const user = await repo.findOrCreateUser(options.externalUserId, {
     locale: options.locale ?? "zh",
@@ -53,8 +62,24 @@ export async function initToolContext(options: InitContextOptions): Promise<Tool
     userId: user.id,
     locale: (options.locale ?? user.locale ?? "zh") as "zh" | "en",
     repo,
+    ...(embeddingClient !== undefined ? { embeddingClient } : {}),
     catalog,
     seasoningRecords,
+    seasoningCatalog: seasoningRows.map((s) => ({ slug: s.slug, name: s.name })),
     close: () => pool.end({ timeout: 5 }).then(() => undefined),
   };
+}
+
+function createOptionalEmbeddingClient(): EmbeddingClient | undefined {
+  if (process.env.NODE_ENV === "test" || process.env.VITEST === "true") {
+    return undefined;
+  }
+  try {
+    return createEmbeddingClient(getEmbeddingConfig());
+  } catch (error) {
+    if (error instanceof Error && /EMBEDDING_(?:BASE_URL|API_KEY|MODEL) is required/.test(error.message)) {
+      return undefined;
+    }
+    throw error;
+  }
 }

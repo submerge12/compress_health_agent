@@ -89,8 +89,11 @@ export interface NutritionEntry {
   grams: number;
 }
 
+export type NutritionWeightType = "raw" | "cooked" | "dry";
+
 export interface NutritionRecord {
   slug: string;
+  weightType?: NutritionWeightType;
   kcalPer100g: number;
   proteinGramsPer100g: number;
   carbsGramsPer100g: number;
@@ -113,6 +116,7 @@ export interface NutritionAggregateInput {
   seasonings?: readonly NutritionEntry[];
   foodRecords: readonly NutritionRecord[];
   seasoningRecords?: readonly NutritionRecord[];
+  requireWeightType?: boolean;
 }
 
 export interface NutritionAggregate {

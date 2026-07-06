@@ -1,3 +1,10 @@
+import type { Language } from "./i18n.js";
+import { initToolContext, type ToolContext } from "./tools/context.js";
+import {
+  handleProactiveCheck,
+  type ProactiveCheckResult,
+} from "./tools/handlers.js";
+
 export type ToolAccessLevel = "read-only" | "write" | "destructive";
 
 export interface AgentToolRegistration {
@@ -7,28 +14,58 @@ export interface AgentToolRegistration {
 }
 
 export interface ScheduledTaskRegistration {
-  name: string;
-  toolName: string;
-  schedule: string;
-  description: string;
+  id: string;
+  agentProfile: "compass-health";
+  taskType: "proactive_check";
+  schedule: {
+    cron: string;
+  };
 }
 
-export interface AgentProfileCompatible {
+export interface AgentPolicy {
+  defaults: {
+    "read-only": "allow" | "deny";
+    write: "allow" | "deny";
+    destructive: "allow" | "deny";
+    network: "allow" | "deny";
+  };
+}
+
+export interface AgentModelRegistration {
+  provider: "deepseek";
+  modelId: string;
+}
+
+export type AgentCleanup = () => Promise<void>;
+export type AgentProactiveCheck = () => Promise<ProactiveCheckResult | string>;
+
+export interface CompassHealthProfileSpec {
   name: "compass-health";
-  systemPrompt: {
-    zh: string;
-    en: string;
+  description: string;
+  systemPrompt: string;
+  model: AgentModelRegistration;
+  thinkingLevel: "low" | "medium" | "high";
+  policy: AgentPolicy;
+  context: {
+    compactionInstructions: string;
   };
-  model: {
-    provider: string;
-    model: string;
-    temperature: number;
-  };
-  tools: readonly AgentToolRegistration[];
   scheduledTasks: readonly ScheduledTaskRegistration[];
 }
 
+export interface AgentProfileCompatible extends CompassHealthProfileSpec {
+  tools: readonly AgentToolRegistration[];
+  proactiveCheck: AgentProactiveCheck;
+  install: () => Promise<AgentCleanup>;
+  skills: readonly unknown[];
+  templates: readonly unknown[];
+}
+
 const readOnlyTools: readonly AgentToolRegistration[] = [
+  {
+    name: "get_profile",
+    accessLevel: "read-only",
+    description: "Read the user's saved profile and calorie/macro targets; returns null if none exists yet.",
+  },
   {
     name: "nutrition_estimate",
     accessLevel: "read-only",
@@ -48,6 +85,16 @@ const readOnlyTools: readonly AgentToolRegistration[] = [
     name: "weekly_report",
     accessLevel: "read-only",
     description: "Aggregate the last 7 days into a weekly nutrition report.",
+  },
+  {
+    name: "recall",
+    accessLevel: "read-only",
+    description: "Recall durable user preferences, dislikes, routines, and notes.",
+  },
+  {
+    name: "propose_dish",
+    accessLevel: "read-only",
+    description: "Review a proposed user dish with resolved ingredients and computed nutrition without saving it.",
   },
 ];
 
@@ -92,46 +139,207 @@ const writeTools: readonly AgentToolRegistration[] = [
     accessLevel: "write",
     description: "Record whether a planned meal was followed, substituted, or skipped.",
   },
+  {
+    name: "swap_meal",
+    accessLevel: "write",
+    description: "Swap a planned lunch/dinner for an alternate dish and re-balance the day's staple and protein.",
+  },
+  {
+    name: "remember",
+    accessLevel: "write",
+    description: "Store a durable user preference, dislike, routine, or note.",
+  },
+  {
+    name: "save_dish",
+    accessLevel: "write",
+    description: "Persist an approved user dish so it becomes a meal-plan candidate.",
+  },
 ];
 
-export const profile: AgentProfileCompatible = {
+export const systemPrompt = `
+You are Compass Health, a bilingual (Chinese/English) health and nutrition assistant.
+
+Identity
+- Help users track meals, water, exercise, and weight.
+- Generate personalised weekly meal plans and analyse nutrition trends.
+- Offer gentle, specific, actionable guidance to support long-term healthy habits.
+- Respond in the language the user writes in. Default to Chinese.
+
+Hard Rules
+- Always log before advising - data first, opinion second.
+- Never prescribe medication, diagnose conditions, or override medical advice.
+- Keep sodium awareness: flag meals above 800 mg Na per serving and daily totals above 2300 mg.
+- Respect the user's ingredient whitelist, rejected seasonings, and cooking-style preferences.
+- When a meal description is ambiguous, estimate conservatively and note the uncertainty.
+- If a tool result contains needsConfirmation, ask the user to pick a candidate before logging.
+
+Workflow
+1. At the start of each conversation, call get_profile (and recall for active preferences/dislikes)
+   before assuming the user is new.
+   - If get_profile returns a profile, treat the user as returning: greet them, restate their daily
+     kcal/protein targets, and do NOT re-ask the physical profile.
+   - Only if get_profile returns null is the user new. Then ask for sex, age, height, weight,
+     activity level, and goal, and call set_profile. After set_profile, run Slim onboarding (below).
+2. When a meal plan exists, route planned meals through meal_checkin first. If the user followed
+   the plan, do not ask them to redescribe the meal: meal_checkin logs the planned nutrition.
+   If they substituted, ask only what changed. If they skipped, one word is enough.
+   Free-text log_meal is for off-plan meals, snacks, restaurant meals, or days without a plan.
+   If a log_meal result includes basisWarnings, briefly tell the user which item's raw/cooked/dry
+   basis was assumed and that they can correct it. For water or exercise, use the matching tool.
+3. At the end of the day (or on request), call daily_summary to show progress against targets.
+4. When asked for a weekly review, call weekly_report with the last 7 days. After presenting it,
+   Ask at most one forward-looking question that would improve next week's plan, and save the answer
+   with remember before the next generate_meal_plan.
+5. For meal-plan check-ins, call meal_checkin with the user's status (followed / substituted / skipped).
+6. When the user asks for a meal plan, call generate_meal_plan. It loads dishes and targets automatically.
+   If the result contains cannotSatisfy, do NOT pretend a plan was made: tell the user which hard
+   constraint could not be met (cannotSatisfy.reason) and offer the listed cannotSatisfy.suggestions
+   as concrete choices (e.g. add a lean protein, lower the protein target). Never relax an allergy or
+   safety exclusion. If the plan is produced, mention the weekly fat/sodium/carbs budget status once
+   when it is over or materially under target; it is guidance, not a failure.
+6b. When the user wants to swap a planned meal ("换一个"), suggest the entry's alternates when the plan
+   is at hand, then call swap_meal with the date, meal type, and chosen dish slug. swap_meal re-validates
+   any requested dish against allergies and the day's targets and refuses swaps that would break the day —
+   if it refuses, relay its reason and offer a different alternate or regenerate-day. On success the
+   day's staple and protein top-ups are re-balanced; report the new dish and day totals in one sentence.
+7. When the user asks for recipe ideas, call recipe_recommend with the meal type. It loads candidates automatically.
+8. When the user states a durable preference, dislike, routine, or note, call remember; confirm first if confidence is low.
+9. Before personalised recommendations or plans, call recall for relevant active memories.
+10. When the user wants to add a dish, call propose_dish first, show the reviewed dish, and call save_dish only after explicit approval.
+
+Slim onboarding (new users)
+Required setup is physical profile plus allergies, medical restrictions, religious restrictions,
+and foods they absolutely cannot eat. Default everything else and learn likes and dislikes from check-ins,
+substitutions, weekly reviews, and explicit user statements.
+
+Allergies first
+- Before preferences, ask carefully about allergies, medical restrictions, religious restrictions,
+  and foods they absolutely cannot eat.
+- If phrasing is ambiguous, such as "seafood doesn't work for me", ask whether this is an allergy /
+  medical restriction or a dislike before saving anything.
+- Save strict exclusions with remember(kind "dislike"), one memory per ingredient or seasoning.
+  These hard-filter future recommendations and meal plans.
+
+Optional preference tuning
+- Do not run a full preference interview by default. Offer it only when the user asks to adjust
+  preferences, or when repeated check-ins show an unresolved pattern worth confirming.
+- Use a low-burden chat flow, not a GUI or a long questionnaire. Ask one short question at a time and
+  offer "use defaults for me" whenever the user wants to skip preference work.
+- Use plain question headers only: staples, proteins, vegetables, fruits, fats, flavors.
+- Under each header, show a short list of real foods or flavors. Categories are not selectable data;
+  the user picks actual foods, seasonings, cooking methods, or flavor styles.
+- Save liked foods with remember(kind "preference"). Save disliked foods/seasonings with
+  remember(kind "dislike"). Use one memory per item, subject = that single food or seasoning.
+- do not force fruit or vegetables. Offer them as optional additions with gentle, no-blame wording.
+
+Cooking and dish pool
+- Ask how often they cook, what equipment they have, and which dishes they already make.
+- Save habits with remember(kind "routine"). For specific dishes they cook often, offer to add them
+  as meal-plan candidates via propose_dish, then save_dish only after explicit approval.
+- For combined preferences such as "I hate boiled chicken breast", do not automatically hard-exclude
+  chicken breast. Treat cooking method and flavor at the dish level: save the method/flavor
+  preference or dislike, then recommend seasoned or differently cooked dish variants.
+
+Returning users: do not repeat this interview. Use recall to load existing answers and only ask
+about a category with no stored memory, or when the user wants to change one.
+
+Proactive rules
+- Scheduled proactive messages must ask exactly one question: the current meal check-in.
+- Midnight summaries should report daily_summary automatically. Piggyback a weight prompt at most weekly.
+- Never stack check-in, thaw, weight, and preference questions in one proactive message.
+
+Output Format
+- Respond directly and concisely.
+- Use tables for nutrition breakdowns when comparing multiple items.
+- Include remaining kcal and protein when summarising daily progress.
+`.trim();
+
+let installedToolContext: ToolContext | null = null;
+
+export async function createToolContextFromEnv(): Promise<ToolContext> {
+  return initToolContext({
+    externalUserId: process.env["COMPASS_HEALTH_USER_ID"] ?? "default-user",
+    locale: localeFromEnv(process.env["COMPASS_HEALTH_LOCALE"]),
+    databaseUrl: process.env["COMPASS_HEALTH_DATABASE_URL"] ?? process.env["DATABASE_URL"],
+    timezone: process.env["COMPASS_HEALTH_TIMEZONE"],
+  });
+}
+
+export async function installCompassHealthAgent(): Promise<AgentCleanup> {
+  const ctx = await createToolContextFromEnv();
+  installedToolContext = ctx;
+
+  return async () => {
+    if (installedToolContext === ctx) {
+      installedToolContext = null;
+    }
+    await ctx.close();
+  };
+}
+
+export async function proactiveCheck(): Promise<ProactiveCheckResult | string> {
+  if (!installedToolContext) {
+    return "Compass Health agent not initialized.";
+  }
+  return handleProactiveCheck(installedToolContext);
+}
+
+export const compassHealthProfileSpec: CompassHealthProfileSpec = {
   name: "compass-health",
-  systemPrompt: {
-    zh: "你是 Compass Health，一个双语健康饮食助手。你帮助用户记录饮食、饮水、运动和体重，生成一周餐单，分析营养趋势，并用温和、具体、可执行的建议支持长期改变。",
-    en: "You are Compass Health, a bilingual health and nutrition assistant. Help users log meals, water, exercise, and weight, generate weekly meal plans, analyze nutrition trends, and offer gentle, specific, actionable guidance.",
-  },
+  description: "Bilingual health and nutrition agent: meal logging, calorie tracking, weekly meal plans.",
+  systemPrompt,
   model: {
-    provider: "openai",
-    model: "default-health-agent",
-    temperature: 0.2,
+    provider: "deepseek",
+    modelId: "deepseek-v4-pro",
   },
-  tools: [...readOnlyTools, ...writeTools],
+  thinkingLevel: "medium",
+  policy: {
+    defaults: {
+      "read-only": "allow",
+      write: "allow",
+      destructive: "deny",
+      network: "deny",
+    },
+  },
+  context: {
+    compactionInstructions:
+      "Preserve the user's profile (sex, age, height, weight, goal), today's logged meals and their nutrition, daily targets, and any pending meal-plan check-ins.",
+  },
   scheduledTasks: [
     {
-      name: "meal_checkin_breakfast",
-      toolName: "meal_checkin",
-      schedule: "30 8 * * *",
-      description: "Prompt the user to confirm breakfast against the meal plan.",
+      id: "compass-health:meal_checkin_breakfast",
+      agentProfile: "compass-health",
+      taskType: "proactive_check",
+      schedule: { cron: "30 8 * * *" },
     },
     {
-      name: "meal_checkin_lunch",
-      toolName: "meal_checkin",
-      schedule: "30 12 * * *",
-      description: "Prompt the user to confirm lunch against the meal plan.",
+      id: "compass-health:meal_checkin_lunch",
+      agentProfile: "compass-health",
+      taskType: "proactive_check",
+      schedule: { cron: "30 12 * * *" },
     },
     {
-      name: "meal_checkin_dinner",
-      toolName: "meal_checkin",
-      schedule: "30 18 * * *",
-      description: "Prompt the user to confirm dinner against the meal plan.",
+      id: "compass-health:meal_checkin_dinner",
+      agentProfile: "compass-health",
+      taskType: "proactive_check",
+      schedule: { cron: "30 18 * * *" },
     },
     {
-      name: "midnight_daily_summary",
-      toolName: "daily_summary",
-      schedule: "0 0 * * *",
-      description: "Send the previous day's nutrition summary at local midnight.",
+      id: "compass-health:midnight_daily_summary",
+      agentProfile: "compass-health",
+      taskType: "proactive_check",
+      schedule: { cron: "0 0 * * *" },
     },
   ],
+};
+
+export const profile: AgentProfileCompatible = {
+  ...compassHealthProfileSpec,
+  tools: [...readOnlyTools, ...writeTools],
+  proactiveCheck,
+  install: installCompassHealthAgent,
+  skills: [],
+  templates: [],
 };
 
 export function validateAgentProfile(candidate: AgentProfileCompatible): true {
@@ -147,15 +355,45 @@ export function validateAgentProfile(candidate: AgentProfileCompatible): true {
     throw new Error("Destructive tools are not allowed for compass-health.");
   }
 
+  if (candidate.policy.defaults.destructive !== "deny") {
+    throw new Error("Destructive access must be denied for compass-health.");
+  }
+
+  if (candidate.policy.defaults.network !== "deny") {
+    throw new Error("Network access must be denied for compass-health.");
+  }
+
+  const scheduledTaskIds = new Set<string>();
   for (const task of candidate.scheduledTasks) {
-    if (!seen.has(task.toolName)) {
-      throw new Error(`Scheduled task references unknown tool: ${task.toolName}`);
+    if (scheduledTaskIds.has(task.id)) {
+      throw new Error(`Duplicate scheduled task id: ${task.id}`);
+    }
+    scheduledTaskIds.add(task.id);
+
+    if (task.agentProfile !== candidate.name) {
+      throw new Error(`Scheduled task agentProfile must be ${candidate.name}: ${task.id}`);
+    }
+
+    if (task.taskType !== "proactive_check") {
+      throw new Error(`Scheduled task must use taskType proactive_check: ${task.id}`);
+    }
+
+    if (!task.schedule.cron.trim()) {
+      throw new Error(`Scheduled task must define a cron schedule: ${task.id}`);
     }
   }
 
-  if (candidate.model.temperature < 0 || candidate.model.temperature > 1) {
-    throw new Error("Model temperature must be between 0 and 1.");
+  if (typeof candidate.install !== "function") {
+    throw new Error("Agent install hook must be a function.");
+  }
+
+  if (typeof candidate.proactiveCheck !== "function") {
+    throw new Error("Agent proactiveCheck hook must be a function.");
   }
 
   return true;
+}
+
+function localeFromEnv(value: string | undefined): Language {
+  return value === "en" ? "en" : "zh";
 }

@@ -3,7 +3,13 @@ import { profile } from "./agent.js";
 import { initToolContext, type ToolContext } from "./tools/context.js";
 import * as handlers from "./tools/handlers.js";
 
-export { profile } from "./agent.js";
+export {
+  profile,
+  compassHealthProfileSpec,
+  createToolContextFromEnv,
+  systemPrompt,
+  type CompassHealthProfileSpec,
+} from "./agent.js";
 export { initToolContext, type ToolContext } from "./tools/context.js";
 export * as handlers from "./tools/handlers.js";
 
@@ -18,6 +24,8 @@ function cast<T>(input: Record<string, unknown>): T {
 const toolRegistry: Record<string, ToolHandler> = {
   set_profile: (ctx, input) =>
     handlers.handleSetProfile(ctx, cast(input)),
+  get_profile: (ctx, input) =>
+    handlers.handleGetProfile(ctx, cast(input)),
   nutrition_estimate: (ctx, input) =>
     handlers.handleNutritionEstimate(ctx, cast(input)),
   log_meal: (ctx, input) =>
@@ -32,14 +40,24 @@ const toolRegistry: Record<string, ToolHandler> = {
     handlers.handleDailySummary(ctx, cast(input)),
   weekly_report: (ctx, input) =>
     handlers.handleWeeklyReport(ctx, cast(input)),
+  propose_dish: (ctx, input) =>
+    handlers.handleProposeDish(ctx, cast(input)),
+  recall: (ctx, input) =>
+    handlers.handleRecall(ctx, cast(input)),
   recipe_recommend: (ctx, input) =>
     handlers.handleSmartRecipeRecommend(ctx, cast(input)),
   generate_meal_plan: (ctx, input) =>
     handlers.handleSmartGenerateMealPlan(ctx, cast(input)),
   meal_checkin: (ctx, input) =>
     handlers.handleMealCheckin(ctx, cast(input)),
+  swap_meal: (ctx, input) =>
+    handlers.handleSwapMeal(ctx, cast(input)),
   update_cooking_record: (ctx, input) =>
     handlers.handleUpdateCookingRecord(ctx, cast(input)),
+  remember: (ctx, input) =>
+    handlers.handleRemember(ctx, cast(input)),
+  save_dish: (ctx, input) =>
+    handlers.handleSaveDish(ctx, cast(input)),
 };
 
 export function getToolHandler(name: string): ToolHandler | undefined {

@@ -1,6 +1,16 @@
+import {
+  allergenTagsForFood,
+  allergenTagsForSeasoning,
+  expandedAllergenTags,
+} from "./food-taxonomy.js";
+
 export type MealType = "breakfast" | "lunch" | "dinner";
 
 export type RecipeSource = "preset" | "cooking_record" | "user";
+
+export type DishRole = "main" | "side";
+
+export type SideKind = "vegetable" | "soup";
 
 export interface RecipeNutrition {
   kcal: number;
@@ -23,15 +33,31 @@ export interface RecipeDish {
   ingredients: readonly RecipeIngredient[];
   seasonings: readonly string[];
   source: RecipeSource;
+  role?: DishRole;
+  sideKind?: SideKind;
+  selfContained?: boolean;
   method?: string;
   notes?: string;
   lastServedAt?: string | null;
+  buckets?: readonly string[];
+  roles?: readonly string[];
+  weeklyFloors?: Readonly<Record<string, number>>;
+  allergenTags?: readonly string[];
+  specialHandlingTags?: readonly string[];
+  frequencyHints?: Readonly<Record<string, string>>;
+  cookingDifficulties?: readonly string[];
+  availabilityTags?: readonly string[];
 }
 
 export interface RecipePreferences {
   rejectedSeasonings?: readonly string[];
+  rejectedIngredients?: readonly string[];
+  allergens?: readonly string[];
   preferredIngredients?: readonly string[];
+  preferredSeasonings?: readonly string[];
   preferredMethods?: readonly string[];
+  recentDishSlugs?: readonly string[];
+  avoidedDishSlugs?: readonly string[];
 }
 
 export interface RecipeTarget {
@@ -68,8 +94,14 @@ export function recommendRecipes(request: RecipeRecommendationRequest): RankedRe
   validateRecommendationRequest(request);
   const context = buildScoreContext(request);
   return request.candidates
+    .filter((dish) => dish.role !== "side")
     .filter((dish) => matchesMealType(dish, request.mealType))
     .filter((dish) => !hasRejectedSeasoning(dish, context.preferences.rejectedSeasonings ?? []))
+    .filter((dish) => !hasRejectedIngredient(
+      dish,
+      context.preferences.rejectedIngredients ?? [],
+      context.preferences.allergens ?? [],
+    ))
     .map((dish) => rankDish(dish, request.target.kcal, context))
     .sort(compareRankedOptions)
     .slice(0, request.limit ?? request.candidates.length);
@@ -81,6 +113,21 @@ export function hasRejectedSeasoning(
 ): boolean {
   const rejected = new Set(rejectedSeasonings.map(normalizeToken));
   return dish.seasonings.some((seasoning) => rejected.has(normalizeToken(seasoning)));
+}
+
+export function hasRejectedIngredient(
+  dish: RecipeDish,
+  rejectedIngredients: readonly string[],
+  allergens: readonly string[] = [],
+): boolean {
+  const rejectedExact = new Set(rejectedIngredients.map(normalizeToken));
+  const rejectedAllergenTags = expandedAllergenTags(allergens);
+  return dish.ingredients.some((ingredient) =>
+    rejectedExact.has(normalizeToken(ingredient.slug))
+  ) ||
+    dish.ingredients.some((ingredient) => hasAnyTag(allergenTagsForFood(ingredient.slug, undefined), rejectedAllergenTags)) ||
+    hasAnyTag(dish.allergenTags ?? [], rejectedAllergenTags) ||
+    dish.seasonings.some((seasoning) => hasAnyTag(allergenTagsForSeasoning(seasoning), rejectedAllergenTags));
 }
 
 function validateRecommendationRequest(request: RecipeRecommendationRequest): void {
@@ -140,8 +187,10 @@ function scoreNutrients(dish: RecipeDish, targetKcal: number, targetProteinGrams
 
 function scoreRecencyPenalty(dish: RecipeDish, context: ScoreContext): number {
   const explicitPenalty = context.recentDishSlugs.has(dish.slug) ? 45 : 0;
+  const avoided = new Set((context.preferences.avoidedDishSlugs ?? []).map(normalizeToken));
+  const avoidedPenalty = avoided.has(normalizeToken(dish.slug)) ? 60 : 0;
   const servedPenalty = scoreLastServedPenalty(dish.lastServedAt, context.asOfDate);
-  return explicitPenalty + servedPenalty;
+  return explicitPenalty + avoidedPenalty + servedPenalty;
 }
 
 function scoreLastServedPenalty(lastServedAt: string | null | undefined, asOfDate?: string): number {
@@ -157,7 +206,7 @@ function scoreVarietyBonus(dish: RecipeDish, context: ScoreContext): number {
   const overlapsRecentIngredient = dish.ingredients.some((ingredient) =>
     context.recentIngredientSlugs.has(ingredient.slug),
   );
-  return (overlapsRecentIngredient ? 0 : 5) + (dish.source === "cooking_record" ? 2 : 0);
+  return (overlapsRecentIngredient ? 0 : 5) + (dish.source === "user" ? 2 : 0);
 }
 
 function scorePreferenceBonus(dish: RecipeDish, preferences: RecipePreferences): number {
@@ -165,8 +214,9 @@ function scorePreferenceBonus(dish: RecipeDish, preferences: RecipePreferences):
     dish.ingredients.map((ingredient) => ingredient.slug),
     preferences.preferredIngredients ?? [],
   );
+  const seasoningBonus = countMatches(dish.seasonings, preferences.preferredSeasonings ?? []);
   const methodBonus = dish.method === undefined ? 0 : countMatches([dish.method], preferences.preferredMethods ?? []);
-  return ingredientBonus * 2 + methodBonus * 2;
+  return ingredientBonus * 2 + seasoningBonus * 2 + methodBonus * 2;
 }
 
 function explainScore(recencyPenalty: number, varietyBonus: number): readonly string[] {
@@ -188,6 +238,10 @@ function compareRankedOptions(left: RankedRecipeOption, right: RankedRecipeOptio
 function countMatches(values: readonly string[], preferredValues: readonly string[]): number {
   const preferred = new Set(preferredValues.map(normalizeToken));
   return values.filter((value) => preferred.has(normalizeToken(value))).length;
+}
+
+function hasAnyTag(values: readonly string[], rejectedTags: ReadonlySet<string>): boolean {
+  return values.some((value) => rejectedTags.has(normalizeToken(value)));
 }
 
 function daysBetween(startDate: string, endDate: string): number {

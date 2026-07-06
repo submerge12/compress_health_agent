@@ -21,14 +21,14 @@ export interface RecipeRecommendResult {
 
 export function recipeRecommend(input: RecipeRecommendInput): RecipeRecommendResult {
   validateRecipeRecommendInput(input);
-  const candidates = input.candidates.filter((dish) => dish.nutrition.kcal <= input.maxKcal);
+  const candidates = input.candidates.filter((dish) => dish.role !== "side" && dish.nutrition.kcal <= input.maxKcal);
   if (candidates.length === 0) return { options: [], summary: "No matching recipes under the kcal limit." };
   const options = recommendRecipes({
     candidates,
     mealType: input.mealType,
     target: { kcal: input.maxKcal },
     preferences: input.preferences,
-    recentDishSlugs: input.recentDishSlugs,
+    recentDishSlugs: input.recentDishSlugs ?? input.preferences?.recentDishSlugs,
     limit: 3,
   });
   return { options, summary: formatRecommendationSummary(options) };

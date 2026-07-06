@@ -1,0 +1,251 @@
+{
+  "doc": "docs/reference-menu-eval-set.md",
+  "persona": {
+    "description": "23M / 173cm / 70kg, HB x1.2 activity, -300 slow-loss deficit, no pork",
+    "startDate": "2026-07-06",
+    "dailyKcalTarget": 1771,
+    "dailyProteinTarget": 140,
+    "dailyFatTarget": 49,
+    "dailyCarbsTarget": 192,
+    "proteinFloorGrams": 112,
+    "weeklyFatBudgetGrams": 343,
+    "weeklyCarbsBudgetGrams": 1344
+  },
+  "planner": {
+    "status": "planned",
+    "elapsedMs": 32.5,
+    "entryCount": 21,
+    "distinctDishCount": 10,
+    "hardViolations": [],
+    "waivedFloors": [],
+    "weeklyBudgets": {
+      "fat": {
+        "actual": 353.5,
+        "target": 343,
+        "difference": 10.5,
+        "percentDifference": 3.1,
+        "status": "over"
+      },
+      "sodium": {
+        "actual": 5441,
+        "target": 16100,
+        "difference": -10659,
+        "percentDifference": 66.2,
+        "status": "under"
+      },
+      "carbs": {
+        "actual": 1479,
+        "target": 1344,
+        "difference": 135,
+        "percentDifference": 10,
+        "status": "over"
+      }
+    }
+  },
+  "gates": {
+    "G1_safety": {
+      "pass": true,
+      "detail": "no forbidden ingredients planned"
+    },
+    "G2_energy_band": {
+      "pass": true,
+      "detail": "all days within 1558-1984 kcal"
+    },
+    "G3_protein_floor": {
+      "pass": true,
+      "detail": "all days >= 112 g"
+    },
+    "G4_rotation": {
+      "pass": true,
+      "detail": "no main 2 days running; all mains <= 2x/week"
+    },
+    "G5_completeness": {
+      "pass": true,
+      "detail": "7 days x breakfast/lunch/dinner"
+    },
+    "G6_natural_unit_lattice": {
+      "pass": true,
+      "detail": "staple grams seen: [30, 60, 90]; off-lattice: 0/14 (half-bowl = 30 g dry)"
+    }
+  },
+  "budgets": {
+    "B1_fat": {
+      "pass": false,
+      "actual": 353.5,
+      "budget": 343,
+      "utilizationPercent": 103.1
+    },
+    "B2_sodium": {
+      "pass": true,
+      "actual": 5441,
+      "budget": 16100,
+      "utilizationPercent": 33.8
+    },
+    "B3_carbs": {
+      "pass": true,
+      "actual": 1479,
+      "budget": 1344,
+      "deviationPercent": 10
+    },
+    "B4_weekly_avg_kcal": {
+      "pass": true,
+      "actualAvg": 1767,
+      "target": 1771,
+      "deviationPercent": -0.2
+    },
+    "B5_advisory_noise": {
+      "coverageItemsByType": {
+        "protein_average": 1,
+        "weekly_budget": 2
+      }
+    }
+  },
+  "structure": {
+    "S1_pool_shape": {
+      "pass": true,
+      "breakfasts": [
+        "sweet_potato_yogurt_bowl",
+        "soymilk_egg_mantou",
+        "corn_mantou_egg"
+      ],
+      "mains": [
+        "chaoshan_beef_soup",
+        "scallion_beef_rice",
+        "steamed_bream_rice",
+        "pan_seared_bream_rice",
+        "garlic_noodle_napa_shrimp_rice",
+        "onion_beef_rice",
+        "broccoli_shrimp_rice"
+      ],
+      "sides": [
+        "garlic_broccoli_side",
+        "shiitake_bok_choy_side",
+        "bok_choy_side"
+      ],
+      "fatBudgetNotice": null
+    },
+    "S4_alternates": {
+      "entriesWithAlternates": 14,
+      "mainEntries": 14,
+      "pass": true
+    },
+    "S6_unattributed_fat": {
+      "avgUnattributedFatGramsPerDay": 17.2,
+      "shareOfDailyFatCeilingPercent": 35.1,
+      "dishesOverThreeGrams": 5
+    },
+    "worstDivergences": [
+      {
+        "slug": "onion_beef_rice",
+        "unattributedFatGrams": 15.5,
+        "unattributedKcal": 300,
+        "missingIngredients": []
+      },
+      {
+        "slug": "scallion_beef_rice",
+        "unattributedFatGrams": 13.1,
+        "unattributedKcal": 302,
+        "missingIngredients": []
+      },
+      {
+        "slug": "garlic_noodle_napa_shrimp_rice",
+        "unattributedFatGrams": 11.1,
+        "unattributedKcal": 276,
+        "missingIngredients": []
+      },
+      {
+        "slug": "sweet_potato_yogurt_bowl",
+        "unattributedFatGrams": 6.6,
+        "unattributedKcal": 18,
+        "missingIngredients": []
+      },
+      {
+        "slug": "pan_seared_bream_rice",
+        "unattributedFatGrams": 3.7,
+        "unattributedKcal": 215,
+        "missingIngredients": []
+      },
+      {
+        "slug": "chaoshan_beef_soup",
+        "unattributedFatGrams": 2.7,
+        "unattributedKcal": 183,
+        "missingIngredients": []
+      },
+      {
+        "slug": "broccoli_shrimp_rice",
+        "unattributedFatGrams": 2.7,
+        "unattributedKcal": 240,
+        "missingIngredients": []
+      },
+      {
+        "slug": "steamed_bream_rice",
+        "unattributedFatGrams": 1.5,
+        "unattributedKcal": 182,
+        "missingIngredients": []
+      }
+    ]
+  },
+  "dailyTotals": [
+    {
+      "date": "2026-07-06",
+      "kcal": 1728,
+      "proteinGrams": 127.1,
+      "carbsGrams": 222.7,
+      "fatGrams": 40.6,
+      "sodiumMg": 558
+    },
+    {
+      "date": "2026-07-07",
+      "kcal": 1820,
+      "proteinGrams": 128.8,
+      "carbsGrams": 207.1,
+      "fatGrams": 56.6,
+      "sodiumMg": 997
+    },
+    {
+      "date": "2026-07-08",
+      "kcal": 1733,
+      "proteinGrams": 127.7,
+      "carbsGrams": 193.8,
+      "fatGrams": 54.5,
+      "sodiumMg": 906
+    },
+    {
+      "date": "2026-07-09",
+      "kcal": 1750,
+      "proteinGrams": 127.5,
+      "carbsGrams": 227.9,
+      "fatGrams": 40.6,
+      "sodiumMg": 556
+    },
+    {
+      "date": "2026-07-10",
+      "kcal": 1805,
+      "proteinGrams": 122.5,
+      "carbsGrams": 199.6,
+      "fatGrams": 61,
+      "sodiumMg": 828
+    },
+    {
+      "date": "2026-07-11",
+      "kcal": 1789,
+      "proteinGrams": 122.1,
+      "carbsGrams": 205.4,
+      "fatGrams": 57.2,
+      "sodiumMg": 987
+    },
+    {
+      "date": "2026-07-12",
+      "kcal": 1744,
+      "proteinGrams": 127.9,
+      "carbsGrams": 222.5,
+      "fatGrams": 43,
+      "sodiumMg": 609
+    }
+  ],
+  "notes": [
+    "Baseline is recorded, not asserted: gate failures here quantify the v1->v2 gap.",
+    "G6 checks the staple lever output against the half-bowl (30 g dry) lattice; dish-internal portions are fixed servings until template scaling lands.",
+    "Month-scale W2 trajectory (skips/likes/swaps) requires repository interactions and is not part of this static baseline."
+  ]
+}

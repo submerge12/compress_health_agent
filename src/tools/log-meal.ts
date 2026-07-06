@@ -1,8 +1,10 @@
 import type { DietLog, HealthRepository } from "./store.js";
 import {
+  assertNutritionEstimateResolved,
+  type FallbackEstimateDiagnostic,
   type MealCatalog,
-  parseMealItems,
   nutritionEstimate,
+  type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
 
 export interface LogMealInput {
@@ -11,23 +13,30 @@ export interface LogMealInput {
   description: string;
 }
 
+export type LogMealResult = DietLog & {
+  basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
+};
+
 const MEAL_TYPES = new Set(["breakfast", "lunch", "dinner", "snack"]);
 
 export function logMeal(
   input: LogMealInput,
   repository: HealthRepository,
   catalog: MealCatalog,
-): DietLog {
+): LogMealResult {
   const fields = requireInputObject(input, "input");
   const date = requireIsoDate(fields.date);
   const mealType = requireMealType(fields.mealType);
   const description = requireText(fields.description, "description");
   const estimate = nutritionEstimate({ description }, catalog);
-  return repository.insertDietLog({
+  assertNutritionEstimateResolved(estimate);
+  const row = repository.insertDietLog({
     date,
     mealType,
     description,
-    items: parseMealItems(description, catalog),
+    items: estimate.items,
     kcal: estimate.kcal,
     proteinGrams: estimate.proteinGrams,
     carbsGrams: estimate.carbsGrams,
@@ -35,6 +44,12 @@ export function logMeal(
     sodiumMg: estimate.sodiumMg,
     micronutrients: estimate.micronutrients,
   });
+  return {
+    ...row,
+    ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+    ...(estimate.fallbackEstimates !== undefined ? { fallbackEstimates: estimate.fallbackEstimates } : {}),
+    ...(estimate.uncertain === true ? { uncertain: true } : {}),
+  };
 }
 
 function requireMealType(value: unknown): string {

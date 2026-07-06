@@ -1,9 +1,17 @@
 import { readFile } from "node:fs/promises";
 
+import { sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as dbSchema from "./schema.js";
-import { foodItems, naturalUnits, seasonings } from "./schema.js";
+import { foodAliases, foodItems, naturalUnits, seasonings } from "./schema.js";
+import {
+  allergenTagsForFood,
+  frequencyHintForFood,
+  inferWeightType,
+  specialHandlingTagsForFood,
+  type FoodWeightType,
+} from "../engine/food-taxonomy.js";
 
 export type CsvRow = Record<string, string>;
 
@@ -33,7 +41,22 @@ export interface FoodItemSeed extends NutritionSeed {
   name: string;
   nameZh?: string;
   category?: string;
+  executionBuckets: string[];
+  roles: string[];
+  weeklyFloor: number;
+  allergenTags: string[];
+  weightType: FoodWeightType;
+  frequencyHint?: string;
+  cookingDifficulty?: string;
+  availability?: string;
+  specialHandlingTags: string[];
   source: string;
+}
+
+export interface FoodAliasSeed {
+  slug: string;
+  alias: string;
+  locale?: string;
 }
 
 export interface SeasoningSeed {
@@ -71,8 +94,16 @@ export interface SeedCsvPaths {
 
 export interface SeedCounts {
   foodItems: number;
+  foodAliases: number;
   seasonings: number;
   naturalUnits: number;
+}
+
+export interface FoodLibraryDedupeResult {
+  foodItems: FoodItemSeed[];
+  aliases: FoodAliasSeed[];
+  skippedFoodItems: FoodItemSeed[];
+  skippedCount: number;
 }
 
 export type SeedDatabase = PostgresJsDatabase<typeof dbSchema>;
@@ -192,6 +223,25 @@ function booleanValue(row: CsvRow, aliases: string[], fallback: boolean): boolea
   return ["1", "true", "yes", "y"].includes(value.toLowerCase());
 }
 
+function listValue(row: CsvRow, aliases: string[]): string[] | undefined {
+  const value = optionalText(row, aliases);
+  if (value === undefined) return undefined;
+  return value
+    .split(/[|;,]/)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function weightTypeValue(row: CsvRow, aliases: string[], fallback: FoodWeightType): FoodWeightType {
+  const value = optionalText(row, aliases);
+  if (value === undefined) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized !== "raw" && normalized !== "cooked" && normalized !== "dry") {
+    throw new Error(`CSV value for ${aliases[0] ?? "weight_type"} must be raw, cooked, or dry`);
+  }
+  return normalized;
+}
+
 function nutritionFromRow(row: CsvRow): NutritionSeed {
   return {
     caloriesKcal: numberValue(row, ["energy_kcal", "calories_kcal", "kcal"], 0),
@@ -217,15 +267,82 @@ function nutritionFromRow(row: CsvRow): NutritionSeed {
 
 function toFoodItemSeed(row: CsvRow): FoodItemSeed {
   const slug = requiredText(row, ["slug", "food_slug"], "food slug");
+  const name = optionalText(row, ["name_en", "name", "food_name"]) ?? slug;
+  const nameZh = optionalText(row, ["name_zh", "zh_name"]);
+  const category = optionalText(row, ["category_en", "category", "group"]) ??
+    optionalText(row, ["category_zh", "category_code"]);
+  const allergenSignal = [
+    name,
+    nameZh,
+    optionalText(row, ["category_zh"]),
+    optionalText(row, ["category_code"]),
+  ].filter((value): value is string => value !== undefined).join(" ");
+  const defaults = defaultFoodClassification(slug, category);
 
   return {
     slug,
-    name: optionalText(row, ["name_en", "name", "food_name"]) ?? slug,
-    nameZh: optionalText(row, ["name_zh", "zh_name"]),
-    category: optionalText(row, ["category_en", "category", "group"]),
+    name,
+    nameZh,
+    category,
+    executionBuckets: listValue(row, ["execution_buckets", "buckets"]) ?? defaults.executionBuckets,
+    roles: listValue(row, ["roles", "execution_roles"]) ?? defaults.roles,
+    weeklyFloor: numberValue(row, ["weekly_floor"], defaults.weeklyFloor),
+    allergenTags: listValue(row, ["allergen_tags", "allergens"]) ?? allergenTagsForFood(slug, category, allergenSignal),
+    weightType: weightTypeValue(row, ["weight_type", "weightType"], inferWeightType(slug, category)),
+    frequencyHint: optionalText(row, ["frequency_hint", "frequency"]) ?? frequencyHintForFood(slug),
+    cookingDifficulty: optionalText(row, ["cooking_difficulty", "difficulty"]),
+    availability: optionalText(row, ["availability"]),
+    specialHandlingTags: listValue(row, ["special_handling_tags", "special_tags"]) ??
+      specialHandlingTagsForFood(slug, category),
     source: optionalText(row, ["source", "basis"]) ?? "csv",
     ...nutritionFromRow(row)
   };
+}
+
+function defaultFoodClassification(
+  slug: string,
+  category: string | undefined,
+): Pick<FoodItemSeed, "executionBuckets" | "roles" | "weeklyFloor"> {
+  if (slug === "dried_shrimp") {
+    return { executionBuckets: ["seasoning"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "konjac") {
+    return { executionBuckets: ["filler"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "chicken_liver") {
+    return { executionBuckets: ["organ_meat"], roles: ["iron", "b12", "vitamin_a"], weeklyFloor: 0 };
+  }
+  if (["beef_tenderloin", "pork_lean"].includes(slug)) {
+    return { executionBuckets: ["red_meat"], roles: ["iron", "zinc", "b12"], weeklyFloor: 2 };
+  }
+  if (["chicken_breast", "chicken_thigh"].includes(slug)) {
+    return { executionBuckets: ["lean_white_meat"], roles: ["b12"], weeklyFloor: 0 };
+  }
+  if (["salmon", "cod", "mackerel", "sardine", "hairtail", "sea_bream"].includes(slug)) {
+    return { executionBuckets: ["deep_sea_fish"], roles: ["omega3", "vitamin_d"], weeklyFloor: 2 };
+  }
+  if (["shrimp_jiweixia"].includes(slug)) {
+    return { executionBuckets: ["shellfish"], roles: ["zinc", "b12"], weeklyFloor: 1 };
+  }
+  if (slug === "tofu" || slug === "soy_milk") {
+    return { executionBuckets: ["soy_product"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "legume") {
+    return { executionBuckets: ["legume"], roles: [], weeklyFloor: 0 };
+  }
+  if (slug === "egg" || category === "egg") {
+    return { executionBuckets: ["egg"], roles: ["b12"], weeklyFloor: 0 };
+  }
+  if (category === "dairy") {
+    return { executionBuckets: ["dairy"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "vegetable" || category === "mushroom" || category === "seaweed") {
+    return { executionBuckets: ["vegetable"], roles: [], weeklyFloor: 0 };
+  }
+  if (category === "grain" || category === "bread" || category === "tuber" || category === "starch") {
+    return { executionBuckets: ["staple"], roles: [], weeklyFloor: 0 };
+  }
+  return { executionBuckets: [], roles: [], weeklyFloor: 0 };
 }
 
 function toSeasoningSeed(row: CsvRow): SeasoningSeed {
@@ -276,6 +393,97 @@ export function loadFoodItemsFromCsv(csv: string): FoodItemSeed[] {
     .sort((left: FoodItemSeed, right: FoodItemSeed) => left.slug.localeCompare(right.slug));
 }
 
+export function loadFoodAliasesFromCsv(csv: string): FoodAliasSeed[] {
+  return parseCsv(csv).flatMap(toFoodAliasSeeds);
+}
+
+/**
+ * Collapse rows sharing one slug into a single row (keep-first), unioning
+ * allergen tags from the dropped duplicates. A batch INSERT ... ON CONFLICT DO
+ * UPDATE fails with "cannot affect row a second time" when the same conflict
+ * key appears twice in one statement, so every insert batch must be
+ * slug-unique.
+ */
+export function dedupeRowsBySlug(rows: readonly FoodItemSeed[]): FoodItemSeed[] {
+  const bySlug = new Map<string, FoodItemSeed>();
+  for (const row of rows) {
+    const existing = bySlug.get(row.slug);
+    if (existing === undefined) {
+      bySlug.set(row.slug, row);
+      continue;
+    }
+    const mergedAllergenTags = [...new Set([...existing.allergenTags, ...row.allergenTags])].sort();
+    if (mergedAllergenTags.length !== existing.allergenTags.length) {
+      bySlug.set(row.slug, { ...existing, allergenTags: mergedAllergenTags });
+    }
+  }
+  return [...bySlug.values()];
+}
+
+export function dedupeFoodLibraryRows(
+  curatedRows: readonly FoodItemSeed[],
+  curatedAliases: readonly FoodAliasSeed[],
+  libraryRows: readonly FoodItemSeed[],
+): FoodLibraryDedupeResult {
+  const labelsBySlug = new Map<string, Set<string>>();
+  const labelOwners = new Map<string, string | null>();
+
+  const registerLabel = (slug: string, label: string | undefined): void => {
+    const key = labelKey(label);
+    if (key === undefined) return;
+    const existingOwner = labelOwners.get(key);
+    if (existingOwner === undefined) {
+      labelOwners.set(key, slug);
+    } else if (existingOwner !== slug) {
+      labelOwners.set(key, null);
+    }
+
+    const labels = labelsBySlug.get(slug) ?? new Set<string>();
+    labels.add(key);
+    labelsBySlug.set(slug, labels);
+  };
+
+  for (const row of curatedRows) {
+    for (const label of foodLabels(row, true)) {
+      registerLabel(row.slug, label);
+    }
+  }
+  for (const alias of curatedAliases) {
+    registerLabel(alias.slug, alias.alias);
+  }
+
+  const kept: FoodItemSeed[] = [];
+  const aliases: FoodAliasSeed[] = [];
+  const skippedFoodItems: FoodItemSeed[] = [];
+  let skippedCount = 0;
+
+  for (const row of libraryRows) {
+    const owner = findLibraryOwner(row, labelOwners);
+    if (owner === undefined) {
+      kept.push(row);
+      continue;
+    }
+
+    skippedCount += 1;
+    skippedFoodItems.push(row);
+    const knownLabels = labelsBySlug.get(owner) ?? new Set<string>();
+    labelsBySlug.set(owner, knownLabels);
+
+    for (const alias of foodLabels(row, false)) {
+      const key = labelKey(alias);
+      if (key === undefined || knownLabels.has(key)) continue;
+      knownLabels.add(key);
+      aliases.push({
+        slug: owner,
+        alias,
+        locale: aliasLocale(alias),
+      });
+    }
+  }
+
+  return { foodItems: kept, aliases, skippedFoodItems, skippedCount };
+}
+
 export function loadSeasoningsFromCsv(csv: string): SeasoningSeed[] {
   return parseCsv(csv)
     .map(toSeasoningSeed)
@@ -297,15 +505,18 @@ export async function readCsvFile(path: string): Promise<string> {
 
 export async function seedReferenceData(database: SeedDatabase, csv: SeedCsvBundle): Promise<SeedCounts> {
   const foodRows = csv.foodItems === undefined ? [] : loadFoodItemsFromCsv(csv.foodItems);
+  const foodAliasRows = csv.foodItems === undefined ? [] : loadFoodAliasesFromCsv(csv.foodItems);
   const seasoningRows = csv.seasonings === undefined ? [] : loadSeasoningsFromCsv(csv.seasonings);
   const unitRows = csv.naturalUnits === undefined ? [] : loadNaturalUnitsFromCsv(csv.naturalUnits);
 
   await insertFoodItems(database, foodRows);
+  await insertFoodAliases(database, foodAliasRows);
   await insertSeasonings(database, seasoningRows);
   await insertNaturalUnits(database, unitRows);
 
   return {
     foodItems: foodRows.length,
+    foodAliases: foodAliasRows.length,
     seasonings: seasoningRows.length,
     naturalUnits: unitRows.length
   };
@@ -324,7 +535,51 @@ async function insertFoodItems(database: SeedDatabase, rows: FoodItemSeed[]): Pr
     return;
   }
 
-  await database.insert(foodItems).values(rows).onConflictDoNothing();
+  await database.insert(foodItems).values(rows).onConflictDoUpdate({
+    target: foodItems.slug,
+    set: {
+      name: sql.raw("excluded.name"),
+      nameZh: sql.raw("excluded.name_zh"),
+      category: sql.raw("excluded.category"),
+      executionBuckets: sql.raw("excluded.execution_buckets"),
+      roles: sql.raw("excluded.roles"),
+      weeklyFloor: sql.raw("excluded.weekly_floor"),
+      allergenTags: sql.raw("excluded.allergen_tags"),
+      weightType: sql.raw("excluded.weight_type"),
+      frequencyHint: sql.raw("excluded.frequency_hint"),
+      cookingDifficulty: sql.raw("excluded.cooking_difficulty"),
+      availability: sql.raw("excluded.availability"),
+      specialHandlingTags: sql.raw("excluded.special_handling_tags"),
+      source: sql.raw("excluded.source"),
+      caloriesKcal: sql.raw("excluded.calories_kcal"),
+      proteinGrams: sql.raw("excluded.protein_grams"),
+      carbsGrams: sql.raw("excluded.carbs_grams"),
+      fatGrams: sql.raw("excluded.fat_grams"),
+      fiberGrams: sql.raw("excluded.fiber_grams"),
+      sugarGrams: sql.raw("excluded.sugar_grams"),
+      sodiumMg: sql.raw("excluded.sodium_mg"),
+      potassiumMg: sql.raw("excluded.potassium_mg"),
+      calciumMg: sql.raw("excluded.calcium_mg"),
+      ironMg: sql.raw("excluded.iron_mg"),
+      magnesiumMg: sql.raw("excluded.magnesium_mg"),
+      zincMg: sql.raw("excluded.zinc_mg"),
+      vitaminAMcg: sql.raw("excluded.vitamin_a_mcg"),
+      vitaminCMg: sql.raw("excluded.vitamin_c_mg"),
+      vitaminDMcg: sql.raw("excluded.vitamin_d_mcg"),
+      vitaminB12Mcg: sql.raw("excluded.vitamin_b12_mcg"),
+      folateMcg: sql.raw("excluded.folate_mcg"),
+      cholesterolMg: sql.raw("excluded.cholesterol_mg"),
+      updatedAt: sql`now()`,
+    },
+  });
+}
+
+export async function insertFoodAliases(database: SeedDatabase, rows: FoodAliasSeed[]): Promise<void> {
+  if (rows.length === 0) {
+    return;
+  }
+
+  await database.insert(foodAliases).values(rows).onConflictDoNothing();
 }
 
 async function insertSeasonings(database: SeedDatabase, rows: SeasoningSeed[]): Promise<void> {
@@ -341,4 +596,70 @@ async function insertNaturalUnits(database: SeedDatabase, rows: NaturalUnitSeed[
   }
 
   await database.insert(naturalUnits).values(rows).onConflictDoNothing();
+}
+
+function toFoodAliasSeeds(row: CsvRow): FoodAliasSeed[] {
+  const aliases = listValue(row, ["aliases", "food_aliases"]) ?? [];
+  if (aliases.length === 0) return [];
+
+  const slug = requiredText(row, ["slug", "food_slug"], "food slug");
+  const seen = new Set<string>();
+  const rows: FoodAliasSeed[] = [];
+  for (const alias of aliases) {
+    const key = labelKey(alias);
+    if (key === undefined || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({
+      slug,
+      alias,
+      locale: aliasLocale(alias),
+    });
+  }
+  return rows;
+}
+
+function foodLabels(row: FoodItemSeed, includeSlug: boolean): string[] {
+  return uniqueText([
+    includeSlug ? row.slug : undefined,
+    includeSlug ? row.slug.replace(/_/g, " ") : undefined,
+    row.name,
+    row.nameZh,
+  ]);
+}
+
+function findLibraryOwner(
+  row: FoodItemSeed,
+  labelOwners: ReadonlyMap<string, string | null>,
+): string | undefined {
+  for (const label of foodLabels(row, true)) {
+    const owner = labelOwners.get(labelKey(label) ?? "");
+    if (owner !== undefined && owner !== null) {
+      return owner;
+    }
+  }
+  return undefined;
+}
+
+function uniqueText(values: readonly (string | undefined)[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = value?.trim();
+    const key = labelKey(trimmed);
+    if (trimmed === undefined || key === undefined || seen.has(key)) continue;
+    seen.add(key);
+    result.push(trimmed);
+  }
+  return result;
+}
+
+function labelKey(value: string | undefined): string | undefined {
+  const key = value?.normalize("NFKC").trim().toLocaleLowerCase().replace(/\s+/g, " ");
+  return key ? key : undefined;
+}
+
+function aliasLocale(value: string): string | undefined {
+  if (/\p{Script=Han}/u.test(value)) return "zh";
+  if (/[a-z]/i.test(value)) return "en";
+  return undefined;
 }

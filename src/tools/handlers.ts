@@ -10,16 +10,22 @@ import type {
 import { calculateCaloriePlan } from "../engine/calorie.js";
 import type { CalorieProfile, CaloriePlan } from "../engine/types.js";
 import {
+  assertNutritionEstimateResolved,
+  FALLBACK_FOOD_SLUG,
   nutritionEstimate,
-  parseMealItems,
+  nutritionEstimateWithSemanticFallback,
+  type FallbackEstimateDiagnostic,
   type NutritionEstimateInput,
   type NutritionEstimateResult,
+  type SemanticNutritionResolutionOptions,
+  type WeightBasisDiagnostic,
 } from "./nutrition-estimate.js";
 import {
   generateWeeklyReport,
   type WeeklyReport,
   type WeeklyReportDay,
 } from "./weekly-report.js";
+import { dailyThresholdWarnings } from "./daily-thresholds.js";
 import {
   recipeRecommend,
   type RecipeRecommendInput,
@@ -27,6 +33,7 @@ import {
 } from "./recipe-recommend.js";
 import {
   generateMealPlan as generateMealPlanCore,
+  type GenerateMealPlanDependencies,
   type GenerateMealPlanResult,
   type GenerateMealPlanInput,
 } from "./generate-meal-plan.js";
@@ -35,8 +42,46 @@ import {
   type UpdateCookingRecordInput,
   type UpdateCookingRecordResult,
 } from "./update-cooking-record.js";
+import {
+  proposeDish,
+  userDishRowFromResolvedDish,
+  type ProposeDishInput,
+  type ResolvedDish,
+} from "./add-dish.js";
 import type { MealPlanEntry, MealType } from "../engine/meal-planner.js";
+import {
+  DEFAULT_STAPLE,
+  STAPLES,
+  addNutrition,
+  dishNutrition,
+  solveProteinTopUps,
+  solveStaplePortionsForDay,
+  stapleNutrition,
+  type ProteinTopUpPortion,
+  type StaplePortion,
+} from "../engine/meal-composition.js";
+import {
+  hasRejectedIngredient,
+  hasRejectedSeasoning,
+  type RecipeDish,
+  type RecipeNutrition,
+} from "../engine/recipe-engine.js";
+import {
+  ENERGY_TOLERANCE_RATIO,
+  MAX_ENERGY_TOLERANCE_RATIO,
+  PROTEIN_FLOOR_RATIO,
+} from "../engine/scoring-weights.js";
 import { loadCandidateDishes, loadUserPreferences } from "./candidate-loader.js";
+import { renderTemplate, type Language } from "../i18n.js";
+
+export {
+  handleRemember,
+  handleRecall,
+  type RecallInput,
+  type RecallResult,
+  type RememberInput,
+  type RememberResult,
+} from "./memory.js";
 
 // ── Shared validation ──
 
@@ -109,13 +154,32 @@ export async function handleSetProfile(ctx: ToolContext, input: SetProfileInput)
   return { profile, plan };
 }
 
+// ── 0b. Get Profile (read-only) ──
+
+export interface GetProfileResult {
+  profile: BmrProfileRow | null;
+}
+
+/**
+ * Read the user's saved physical profile and computed targets. Returns
+ * { profile: null } when the user has no profile yet, so the agent can tell a
+ * returning user (skip onboarding) from a new one.
+ */
+export async function handleGetProfile(
+  ctx: ToolContext,
+  _input: Record<string, unknown>,
+): Promise<GetProfileResult> {
+  const profile = await ctx.repo.getLatestBmrProfile(ctx.userId);
+  return { profile: profile ?? null };
+}
+
 // ── 1. Nutrition Estimate (read-only) ──
 
 export async function handleNutritionEstimate(
   ctx: ToolContext,
   input: NutritionEstimateInput,
 ): Promise<NutritionEstimateResult> {
-  return nutritionEstimate(input, ctx.catalog);
+  return estimateNutrition(ctx, input);
 }
 
 // ── 2. Log Meal ──
@@ -126,21 +190,27 @@ export interface LogMealInput {
   description: string;
 }
 
-export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Promise<DietLogRow> {
+export type LogMealResult = DietLogRow & {
+  basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
+};
+
+export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Promise<LogMealResult> {
   const date = requireIsoDate(input.date);
   const mealType = requireMealType(input.mealType);
   const description = requireText(input.description, "description");
 
-  const estimate = nutritionEstimate({ description }, ctx.catalog);
-  const items = parseMealItems(description, ctx.catalog);
+  const estimate = await estimateNutrition(ctx, { description });
+  assertNutritionEstimateResolved(estimate);
 
-  return ctx.repo.insertDietLog({
+  const row = await ctx.repo.insertDietLog({
     userId: ctx.userId,
     logDate: date,
     mealType,
     description,
     source: "agent",
-    ingredientsJson: items.map((i) => ({ slug: i.slug, grams: i.grams })),
+    ingredientsJson: ingredientsJsonFromEstimate(estimate),
     seasoningsJson: [],
     caloriesKcal: estimate.kcal,
     proteinGrams: estimate.proteinGrams,
@@ -148,6 +218,12 @@ export async function handleLogMeal(ctx: ToolContext, input: LogMealInput): Prom
     fatGrams: estimate.fatGrams,
     sodiumMg: estimate.sodiumMg,
   });
+  return {
+    ...row,
+    ...(estimate.basisWarnings !== undefined ? { basisWarnings: estimate.basisWarnings } : {}),
+    ...(estimate.fallbackEstimates !== undefined ? { fallbackEstimates: estimate.fallbackEstimates } : {}),
+    ...(estimate.uncertain === true ? { uncertain: true } : {}),
+  };
 }
 
 // ── 3. Log Water ──
@@ -297,8 +373,7 @@ export async function handleDailySummary(ctx: ToolContext, input: DailySummaryIn
     sodiumMg: sum(dietLogs.map((l) => l.sodiumMg)),
   };
 
-  const warnings: string[] = [];
-  if (eaten.sodiumMg > 2300) warnings.push("sodium_over_2300mg");
+  const warnings = dailyThresholdWarnings(eaten, target);
 
   return {
     date,
@@ -360,7 +435,12 @@ export async function handleWeeklyReport(ctx: ToolContext, input: WeeklyReportIn
     });
   }
 
-  return generateWeeklyReport({ days, sodiumLimitMg: input.sodiumLimitMg });
+  return generateWeeklyReport({
+    days,
+    sodiumLimitMg: input.sodiumLimitMg,
+    dailyFatTarget: bmrProfile?.fatTargetGrams,
+    dailyCarbsTarget: bmrProfile?.carbsTargetGrams,
+  });
 }
 
 // ── 8. Recipe Recommend (read-only) ──
@@ -377,14 +457,26 @@ export async function handleRecipeRecommend(
 export async function handleGenerateMealPlan(
   ctx: ToolContext,
   input: Omit<GenerateMealPlanInput, "store">,
+  dependencies: GenerateMealPlanDependencies | undefined = undefined,
 ): Promise<GenerateMealPlanResult> {
   const entries: MealPlanEntry[] = [];
   const store = {
     insertMealPlanEntry: (entry: MealPlanEntry) => { entries.push(entry); },
   };
-  const result = generateMealPlanCore({ ...input, store });
+  const result = generateMealPlanCore({ ...input, catalog: ctx.catalog, store }, dependencies);
 
-  for (const entry of entries) {
+  let occupiedSlots = new Set<string>();
+  if (entries.length > 0) {
+    // Regeneration supersedes: clear not-yet-actioned entries in the plan
+    // window so duplicate rows cannot accumulate. Check-in history is kept —
+    // and slots it occupies must not receive a second (planned) row.
+    const endDate = addDaysIso(input.startDate, 6);
+    await ctx.repo.deletePlannedMealPlanEntriesRange?.(ctx.userId, input.startDate, endDate);
+    const remaining = await ctx.repo.listMealPlanEntriesRange?.(ctx.userId, input.startDate, endDate) ?? [];
+    occupiedSlots = new Set(remaining.map((row) => `${row.planDate}|${row.mealType}`));
+  }
+
+  for (const entry of entries.filter((entry) => !occupiedSlots.has(`${entry.date}|${entry.mealType}`))) {
     await ctx.repo.insertMealPlanEntry({
       userId: ctx.userId,
       planDate: entry.date,
@@ -392,8 +484,16 @@ export async function handleGenerateMealPlan(
       dishName: entry.dish.name,
       recipeSlug: entry.dish.slug,
       status: "planned",
-      ingredientsJson: (entry.dish.ingredients ?? []).map((i) => ({ slug: i.slug, grams: i.grams })),
-      seasoningsJson: (entry.dish.seasonings ?? []).map((s) => ({ slug: s })),
+      ingredientsJson: [
+        ...(entry.dish.ingredients ?? []),
+        ...(entry.side?.ingredients ?? []),
+        ...(entry.proteinTopUps ?? []).flatMap((topUp) => topUp.ingredients),
+        ...(entry.staple === undefined ? [] : [entry.staple]),
+      ].map((i) => ({ slug: i.slug, grams: i.grams })),
+      seasoningsJson: [
+        ...(entry.dish.seasonings ?? []),
+        ...(entry.side?.seasonings ?? []),
+      ].map((s) => ({ slug: s })),
       caloriesKcal: entry.nutrition.kcal,
       proteinGrams: entry.nutrition.proteinGrams,
       carbsGrams: entry.nutrition.carbsGrams,
@@ -420,6 +520,9 @@ export interface MealCheckinResult {
   entryId: string;
   status: MealCheckinStatus;
   dietLogId?: string;
+  basisWarnings?: WeightBasisDiagnostic[];
+  fallbackEstimates?: FallbackEstimateDiagnostic[];
+  uncertain?: boolean;
 }
 
 export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInput): Promise<MealCheckinResult> {
@@ -443,10 +546,21 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
   let carbs = entry.carbsGrams;
   let fat = entry.fatGrams;
   let sodium = entry.sodiumMg;
+  let ingredientsJson = entry.ingredientsJson;
+  let seasoningsJson = entry.seasoningsJson;
+  let basisWarnings: WeightBasisDiagnostic[] | undefined;
+  let fallbackEstimates: FallbackEstimateDiagnostic[] | undefined;
+  let uncertain: boolean | undefined;
 
   if (status === "substituted" && input.actualDescription) {
     description = input.actualDescription;
-    const estimate = nutritionEstimate({ description }, ctx.catalog);
+    const estimate = await estimateNutrition(ctx, { description });
+    assertNutritionEstimateResolved(estimate);
+    ingredientsJson = ingredientsJsonFromEstimate(estimate);
+    seasoningsJson = [];
+    basisWarnings = estimate.basisWarnings;
+    fallbackEstimates = estimate.fallbackEstimates;
+    uncertain = estimate.uncertain;
     kcal = estimate.kcal;
     protein = estimate.proteinGrams;
     carbs = estimate.carbsGrams;
@@ -460,8 +574,8 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
     mealType,
     description,
     source: status === "followed" ? "planned" : "substituted",
-    ingredientsJson: entry.ingredientsJson,
-    seasoningsJson: entry.seasoningsJson,
+    ingredientsJson,
+    seasoningsJson,
     caloriesKcal: kcal,
     proteinGrams: protein,
     carbsGrams: carbs,
@@ -469,7 +583,176 @@ export async function handleMealCheckin(ctx: ToolContext, input: MealCheckinInpu
     sodiumMg: sodium,
   });
 
-  return { entryId: entry.id, status, dietLogId: dietLog.id };
+  return {
+    entryId: entry.id,
+    status,
+    dietLogId: dietLog.id,
+    ...(basisWarnings !== undefined ? { basisWarnings } : {}),
+    ...(fallbackEstimates !== undefined ? { fallbackEstimates } : {}),
+    ...(uncertain === true ? { uncertain: true } : {}),
+  };
+}
+
+function ingredientsJsonFromEstimate(estimate: NutritionEstimateResult): Record<string, unknown>[] {
+  return [
+    ...estimate.items.map((item) => ({ slug: item.slug, grams: item.grams })),
+    ...(estimate.fallbackEstimates ?? []).map((fallback) => ({
+      slug: FALLBACK_FOOD_SLUG,
+      segment: fallback.segment,
+      grams: fallback.grams,
+      estimateSource: "fallback",
+      confidence: fallback.confidence,
+    })),
+  ];
+}
+
+function semanticNutritionOptions(ctx: ToolContext): SemanticNutritionResolutionOptions | undefined {
+  if (ctx.embeddingClient === undefined) return undefined;
+  return {
+    embeddingClient: ctx.embeddingClient,
+    semanticSearch: ctx.repo,
+  };
+}
+
+async function estimateNutrition(
+  ctx: ToolContext,
+  input: NutritionEstimateInput,
+): Promise<NutritionEstimateResult> {
+  const semanticOptions = semanticNutritionOptions(ctx);
+  if (semanticOptions === undefined) {
+    return nutritionEstimate(input, ctx.catalog);
+  }
+  return nutritionEstimateWithSemanticFallback(input, ctx.catalog, semanticOptions);
+}
+
+// ── 10b. Proactive Check (scheduled check-ins and summaries) ──
+
+type ProactiveMealType = "breakfast" | "lunch" | "dinner";
+type ProactiveCheckKind = "daily_summary" | "meal_checkin" | "missing_plan";
+
+export interface ProactiveCheckInput {
+  now?: Date | string;
+  locale?: Language;
+}
+
+export interface ProactiveThawIngredient {
+  slug: string;
+  grams?: number;
+  category: string;
+  name?: string;
+}
+
+export interface ProactiveThawItem {
+  entryId: string;
+  planDate: string;
+  mealType: string;
+  dishName: string;
+  ingredients: ProactiveThawIngredient[];
+}
+
+export interface ProactiveCheckResult {
+  kind: ProactiveCheckKind;
+  locale: Language;
+  date: string;
+  message: string;
+  mealType?: ProactiveMealType;
+  plannedMeal?: {
+    entryId: string;
+    dishName: string;
+    kcal: number;
+    proteinGrams: number;
+  };
+  thawItems: ProactiveThawItem[];
+}
+
+const THAW_CATEGORIES = new Set(["meat", "poultry", "seafood"]);
+const PROACTIVE_MEAL_ORDER: Record<ProactiveMealType, number> = {
+  breakfast: 0,
+  lunch: 1,
+  dinner: 2,
+};
+
+export async function handleProactiveCheck(
+  ctx: ToolContext,
+  input: ProactiveCheckInput = {},
+): Promise<ProactiveCheckResult> {
+  const now = requireDate(input.now);
+  const locale = input.locale ?? ctx.locale;
+  const hour = now.getHours();
+
+  if (hour >= 23 || hour < 1) {
+    const date = localDateIso(addDays(now, -1));
+    const summary = await handleDailySummary(ctx, { date });
+    return {
+      kind: "daily_summary",
+      locale,
+      date,
+      message: renderTemplate(locale, "proactiveDailySummary", {
+        date,
+        kcal: summary.eaten.kcal,
+        targetKcal: summary.target.kcal,
+        remainingKcal: summary.remaining.kcal,
+        waterMl: summary.water.totalMl,
+        targetWaterMl: summary.water.targetMl,
+        exerciseMinutes: summary.exercise.durationMinutes,
+        targetExerciseMinutes: summary.exercise.targetMinutes,
+        kcalBurned: summary.exercise.kcalBurned,
+      }),
+      thawItems: [],
+    };
+  }
+
+  const date = localDateIso(now);
+  const mealType = mealTypeForHour(hour);
+  const todayEntries = await ctx.repo.listMealPlanEntries(ctx.userId, date);
+  const planned = todayEntries.find((entry) => entry.mealType === mealType && entry.status === "planned");
+
+  if (!planned) {
+    return {
+      kind: "missing_plan",
+      locale,
+      date,
+      mealType,
+      message: renderTemplate(locale, "proactiveMissingPlan", {
+        date,
+        mealType: localizedMealType(mealType, locale),
+      }),
+      thawItems: [],
+    };
+  }
+
+  const upcomingPlanned = todayEntries.filter((entry) =>
+    entry.status === "planned" &&
+    isLaterSameDayMeal(entry.mealType, mealType)
+  );
+
+  if (mealType === "dinner") {
+    const tomorrow = localDateIso(addDays(now, 1));
+    const tomorrowEntries = await ctx.repo.listMealPlanEntries(ctx.userId, tomorrow);
+    upcomingPlanned.push(...tomorrowEntries.filter((entry) => entry.status === "planned"));
+  }
+
+  const thawItems = buildThawItems(ctx, upcomingPlanned);
+  const checkinMessage = renderTemplate(locale, "proactiveMealCheckin", {
+    mealType: localizedMealType(mealType, locale),
+    dishName: planned.dishName,
+    kcal: planned.caloriesKcal,
+    proteinGrams: planned.proteinGrams,
+  });
+  return {
+    kind: "meal_checkin",
+    locale,
+    date,
+    mealType,
+    plannedMeal: {
+      entryId: planned.id,
+      dishName: planned.dishName,
+      kcal: planned.caloriesKcal,
+      proteinGrams: planned.proteinGrams,
+    },
+    thawItems,
+    message: checkinMessage,
+  };
 }
 
 // ── 11. Update Cooking Record ──
@@ -488,6 +771,18 @@ export async function handleUpdateCookingRecord(
 
 // ── 12. Smart Generate Meal Plan (auto-loads candidates & targets) ──
 
+export async function handleProposeDish(ctx: ToolContext, input: ProposeDishInput): Promise<ResolvedDish> {
+  return proposeDish(input, {
+    catalog: ctx.catalog,
+    seasoningRecords: ctx.seasoningRecords,
+  });
+}
+
+export async function handleSaveDish(ctx: ToolContext, input: ResolvedDish) {
+  const row = userDishRowFromResolvedDish(ctx.userId, input, ctx.catalog);
+  return { dish: await ctx.repo.upsertUserDish(row) };
+}
+
 export interface SmartGenerateMealPlanInput {
   startDate?: string;
 }
@@ -495,6 +790,7 @@ export interface SmartGenerateMealPlanInput {
 export async function handleSmartGenerateMealPlan(
   ctx: ToolContext,
   input: SmartGenerateMealPlanInput,
+  dependencies: GenerateMealPlanDependencies | undefined = undefined,
 ): Promise<GenerateMealPlanResult> {
   const startDate = input.startDate
     ? requireIsoDate(input.startDate)
@@ -503,7 +799,7 @@ export async function handleSmartGenerateMealPlan(
   const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
-    loadUserPreferences(ctx),
+    loadUserPreferences(ctx, { asOfDate: startDate }),
   ]);
 
   const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
@@ -511,9 +807,371 @@ export async function handleSmartGenerateMealPlan(
   return handleGenerateMealPlan(ctx, {
     startDate,
     dailyKcalTarget,
+    dailyProteinTarget: bmrProfile?.proteinTargetGrams,
+    dailyFatTarget: bmrProfile?.fatTargetGrams,
+    dailyCarbsTarget: bmrProfile?.carbsTargetGrams,
     presetDishes: candidates,
     preferences,
+  }, dependencies);
+}
+
+// ── 12b. Swap Meal (V2-P5: "换一个") ──
+
+export interface SwapMealInput {
+  date: string;
+  mealType: string;
+  alternateSlug: string;
+}
+
+export interface SwapMealResult {
+  entryId: string;
+  date: string;
+  mealType: string;
+  previousDishSlug: string | null;
+  newDish: { slug: string; name: string };
+  sideSlug?: string;
+  stapleGrams?: number;
+  proteinTopUps: readonly string[];
+  dayTotals: RecipeNutrition;
+  withinEnergyBand: boolean;
+  meetsProteinFloor: boolean;
+}
+
+/**
+ * Swap a planned lunch/dinner main and re-run the levers for that one meal.
+ * The swap path enforces the same safety filters as planning, preserves the
+ * entry's staple type and (for non-self-contained mains) its side, and
+ * RE-VETS the whole day: if the requested dish cannot keep the day inside
+ * the hard kcal band and protein floor, the swap is refused rather than
+ * persisted. The entry keeps its `planned` status so check-ins still attach.
+ */
+export async function handleSwapMeal(ctx: ToolContext, input: SwapMealInput): Promise<SwapMealResult> {
+  const date = requireIsoDate(input.date);
+  const mealType = requireText(input.mealType, "mealType").toLowerCase();
+  if (mealType !== "lunch" && mealType !== "dinner") {
+    throw new RangeError("mealType must be lunch or dinner");
+  }
+  const alternateSlug = requireText(input.alternateSlug, "alternateSlug");
+  if (ctx.catalog.foods.length === 0) {
+    throw new RangeError("swap_meal requires the food catalog to re-balance the day");
+  }
+
+  const [bmrProfile, candidates, preferences, allRows] = await Promise.all([
+    ctx.repo.getLatestBmrProfile(ctx.userId),
+    loadCandidateDishes(ctx),
+    loadUserPreferences(ctx, { asOfDate: date }),
+    ctx.repo.listMealPlanEntries(ctx.userId, date),
+  ]);
+
+  const plannedOfType = allRows.filter((row) => row.mealType === mealType && row.status === "planned");
+  if (plannedOfType.length === 0) {
+    throw new RangeError(`no planned ${mealType} meal-plan entry found on ${date}`);
+  }
+  if (plannedOfType.length > 1) {
+    throw new RangeError(
+      `multiple planned ${mealType} entries found on ${date}; regenerate the plan to supersede stale entries before swapping`,
+    );
+  }
+  const target = plannedOfType[0] as MealPlanEntryRow;
+
+  const alternate = candidates.find((dish) =>
+    dish.slug === alternateSlug &&
+    dish.role !== "side" &&
+    (dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner"))
+  );
+  if (alternate === undefined) {
+    throw new RangeError(`unknown alternate main dish: ${alternateSlug}`);
+  }
+  if (isRejectedBySafety(alternate, preferences)) {
+    throw new RangeError(
+      `${alternateSlug} conflicts with saved allergies or exclusions and cannot be swapped in`,
+    );
+  }
+
+  const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
+  const proteinFloor = bmrProfile?.proteinTargetGrams === undefined
+    ? undefined
+    : Math.round(bmrProfile.proteinTargetGrams * PROTEIN_FLOOR_RATIO);
+
+  const rowIngredientSlugs = new Set(
+    (target.ingredientsJson ?? []).map((item) => String(item["slug"] ?? "")),
+  );
+  // Keep the plan's staple food: recover its type from the stored row rather
+  // than silently switching the user to the default staple.
+  const staple = STAPLES.find((candidate) => rowIngredientSlugs.has(candidate.slug)) ?? DEFAULT_STAPLE;
+
+  // Parity with planning-time vetting: the day's OTHER main frees its staple
+  // grams back into the solve, so a lighter alternate can be compensated
+  // across both meals exactly as it was when the alternate was vetted.
+  const counterpartRows = allRows.filter((row) =>
+    row.mealType === (mealType === "lunch" ? "dinner" : "lunch") && row.status === "planned");
+  const counterpart = counterpartRows.length === 1 ? counterpartRows[0] : undefined;
+  const counterpartStaple = counterpart === undefined ? undefined : stapleFromRow(counterpart);
+  const resolveCounterpart = counterpart !== undefined && counterpartStaple !== undefined;
+  const counterpartWithoutStaple = !resolveCounterpart || counterpart === undefined || counterpartStaple === undefined
+    ? undefined
+    : subtractNutrition(rowNutrition(counterpart), stapleNutrition(counterpartStaple, ctx.catalog));
+
+  // Day context beyond the two re-levered meals (skipped meals excluded).
+  const baseNutrition = allRows
+    .filter((row) =>
+      row.id !== target.id &&
+      (!resolveCounterpart || row.id !== counterpart?.id) &&
+      row.status !== "skipped")
+    .reduce<RecipeNutrition>((total, row) => addNutrition(total, rowNutrition(row)), ZERO_NUTRITION);
+  const fixedBeyondMeals = counterpartWithoutStaple === undefined
+    ? baseNutrition
+    : addNutrition(baseNutrition, counterpartWithoutStaple);
+  const mainMealCount = counterpartWithoutStaple === undefined ? 1 : 2;
+
+  const safeSides = candidates.filter((dish) =>
+    dish.role === "side" && !isRejectedBySafety(dish, preferences));
+  const resolveDish = (dish: RecipeDish): SwapDayResolution => resolveSwapDay({
+    dish,
+    catalog: ctx.catalog,
+    preferences,
+    rowIngredientSlugs,
+    safeSides,
+    fixedBeyondMeals,
+    mainMealCount,
+    staple,
+    dailyKcalTarget,
+    proteinFloor,
   });
+
+  const resolution = resolveDish(alternate);
+  if (!resolution.valid) {
+    // The refusal names swaps that DO work right now, so the user is never
+    // stranded pointing at an alternates list that only existed at
+    // generation time.
+    const validNow = candidates
+      .filter((dish) =>
+        dish.role !== "side" &&
+        (dish.mealTypes === undefined || dish.mealTypes.includes("lunch") || dish.mealTypes.includes("dinner")) &&
+        dish.slug !== alternate.slug &&
+        dish.slug !== target.recipeSlug &&
+        !isRejectedBySafety(dish, preferences))
+      .filter((dish) => {
+        try {
+          return resolveDish(dish).valid;
+        } catch {
+          // dishes with uncataloged ingredients cannot be suggested
+          return false;
+        }
+      })
+      .slice(0, 2);
+    throw new RangeError(
+      `swapping in ${alternate.name} would break the day ` +
+      `(kcal ${Math.round(resolution.dayTotals.kcal)} vs target ${dailyKcalTarget}` +
+      `${proteinFloor === undefined ? "" : `, protein ${resolution.dayTotals.proteinGrams}g vs ${proteinFloor}g floor`})` +
+      (validNow.length > 0
+        ? `; currently valid swaps: ${validNow.map((dish) => `${dish.name} (${dish.slug})`).join(", ")}`
+        : "; no valid swap is available right now — regenerate the day instead"),
+    );
+  }
+
+  await ctx.repo.updateMealPlanEntryDish(target.id, {
+    dishName: resolution.side === undefined
+      ? alternate.name
+      : `${alternate.name} + ${resolution.side.name}`,
+    recipeSlug: alternate.slug,
+    ingredientsJson: [
+      ...alternate.ingredients,
+      ...(resolution.side?.ingredients ?? []),
+      ...resolution.topUps.flatMap((topUp) => topUp.ingredients),
+      ...(resolution.swappedStaple === undefined ? [] : [resolution.swappedStaple]),
+    ].map((ingredient) => ({ slug: ingredient.slug, grams: ingredient.grams })),
+    seasoningsJson: [
+      ...alternate.seasonings,
+      ...(resolution.side?.seasonings ?? []),
+    ].map((seasoning) => ({ slug: seasoning })),
+    caloriesKcal: resolution.swappedMealNutrition.kcal,
+    proteinGrams: resolution.swappedMealNutrition.proteinGrams,
+    carbsGrams: resolution.swappedMealNutrition.carbsGrams,
+    fatGrams: resolution.swappedMealNutrition.fatGrams,
+    sodiumMg: resolution.swappedMealNutrition.sodiumMg,
+  });
+
+  if (
+    resolveCounterpart &&
+    counterpart !== undefined &&
+    counterpartStaple !== undefined &&
+    counterpartWithoutStaple !== undefined &&
+    resolution.counterpartStaple !== undefined &&
+    resolution.counterpartStaple.grams !== counterpartStaple.grams
+  ) {
+    const counterpartNutrition = addNutrition(
+      counterpartWithoutStaple,
+      stapleNutrition(resolution.counterpartStaple, ctx.catalog),
+    );
+    await ctx.repo.updateMealPlanEntryDish(counterpart.id, {
+      dishName: counterpart.dishName,
+      recipeSlug: counterpart.recipeSlug,
+      ingredientsJson: [
+        ...(counterpart.ingredientsJson ?? []).filter((item) => String(item["slug"] ?? "") !== counterpartStaple.slug),
+        { slug: resolution.counterpartStaple.slug, grams: resolution.counterpartStaple.grams },
+      ],
+      seasoningsJson: counterpart.seasoningsJson,
+      caloriesKcal: counterpartNutrition.kcal,
+      proteinGrams: counterpartNutrition.proteinGrams,
+      carbsGrams: counterpartNutrition.carbsGrams,
+      fatGrams: counterpartNutrition.fatGrams,
+      sodiumMg: counterpartNutrition.sodiumMg,
+    });
+  }
+
+  return {
+    entryId: target.id,
+    date,
+    mealType,
+    previousDishSlug: target.recipeSlug,
+    newDish: { slug: alternate.slug, name: alternate.name },
+    ...(resolution.side === undefined ? {} : { sideSlug: resolution.side.slug }),
+    ...(resolution.swappedStaple === undefined ? {} : { stapleGrams: resolution.swappedStaple.grams }),
+    proteinTopUps: resolution.topUps.map((topUp) => topUp.slug),
+    dayTotals: resolution.dayTotals,
+    withinEnergyBand:
+      Math.abs(resolution.dayTotals.kcal - dailyKcalTarget) <= dailyKcalTarget * ENERGY_TOLERANCE_RATIO,
+    meetsProteinFloor: proteinFloor === undefined || resolution.dayTotals.proteinGrams >= proteinFloor,
+  };
+}
+
+interface SwapDayResolution {
+  valid: boolean;
+  dayTotals: RecipeNutrition;
+  side?: RecipeDish;
+  topUps: readonly ProteinTopUpPortion[];
+  swappedStaple?: StaplePortion;
+  counterpartStaple?: StaplePortion;
+  swappedMealNutrition: RecipeNutrition;
+}
+
+function resolveSwapDay(input: {
+  dish: RecipeDish;
+  catalog: ToolContext["catalog"];
+  preferences: Awaited<ReturnType<typeof loadUserPreferences>>;
+  rowIngredientSlugs: ReadonlySet<string>;
+  safeSides: readonly RecipeDish[];
+  fixedBeyondMeals: RecipeNutrition;
+  mainMealCount: number;
+  staple: (typeof STAPLES)[number];
+  dailyKcalTarget: number;
+  proteinFloor: number | undefined;
+}): SwapDayResolution {
+  // Preserve the vegetable side for non-self-contained mains: recover the
+  // original from the stored row, else attach any safe side candidate.
+  let side: RecipeDish | undefined;
+  if (input.dish.selfContained === false) {
+    side = input.safeSides.find((candidate) =>
+      candidate.ingredients.length > 0 &&
+      candidate.ingredients.every((ingredient) => input.rowIngredientSlugs.has(ingredient.slug))) ??
+      input.safeSides[0];
+  }
+
+  let mealBase = dishNutrition(input.dish, input.catalog);
+  if (side !== undefined) mealBase = addNutrition(mealBase, dishNutrition(side, input.catalog));
+  const dayFixed = addNutrition(input.fixedBeyondMeals, mealBase);
+
+  let topUps: readonly ProteinTopUpPortion[] = [];
+  if (input.proteinFloor !== undefined && input.proteinFloor > 0) {
+    const minStaple = stapleNutrition(
+      { slug: input.staple.slug, grams: input.staple.minGrams * input.mainMealCount },
+      input.catalog,
+    );
+    if (dayFixed.proteinGrams + minStaple.proteinGrams < input.proteinFloor) {
+      topUps = solveProteinTopUps({
+        proteinFloorGrams: input.proteinFloor - minStaple.proteinGrams,
+        fixedNutrition: dayFixed,
+        remainingKcalBudget:
+          input.dailyKcalTarget * (1 + ENERGY_TOLERANCE_RATIO) - dayFixed.kcal - minStaple.kcal,
+        catalog: input.catalog,
+        preferences: input.preferences,
+      }).addOns;
+    }
+  }
+  const topUpNutrition = topUps.reduce<RecipeNutrition | undefined>(
+    (total, topUp) => total === undefined ? topUp.nutrition : addNutrition(total, topUp.nutrition),
+    undefined,
+  );
+  const fixedWithTopUps = topUpNutrition === undefined ? dayFixed : addNutrition(dayFixed, topUpNutrition);
+
+  const stapleSolve = solveStaplePortionsForDay({
+    dailyKcalTarget: input.dailyKcalTarget,
+    fixedNutrition: fixedWithTopUps,
+    mainMealCount: input.mainMealCount,
+    staple: input.staple,
+    catalog: input.catalog,
+    energyToleranceRatio: ENERGY_TOLERANCE_RATIO,
+  });
+  const portions = stapleSolve.portions as readonly (StaplePortion | undefined)[];
+  const counterpartStaple = input.mainMealCount === 2 ? portions[0] : undefined;
+  const swappedStaple = input.mainMealCount === 2 ? portions[1] : portions[0];
+
+  let swappedMealNutrition = mealBase;
+  if (topUpNutrition !== undefined) swappedMealNutrition = addNutrition(swappedMealNutrition, topUpNutrition);
+  if (swappedStaple !== undefined) {
+    swappedMealNutrition = addNutrition(swappedMealNutrition, stapleNutrition(swappedStaple, input.catalog));
+  }
+  let dayTotals = addNutrition(input.fixedBeyondMeals, swappedMealNutrition);
+  if (counterpartStaple !== undefined) {
+    dayTotals = addNutrition(dayTotals, stapleNutrition(counterpartStaple, input.catalog));
+  }
+
+  const withinHardBand =
+    Math.abs(dayTotals.kcal - input.dailyKcalTarget) <= input.dailyKcalTarget * MAX_ENERGY_TOLERANCE_RATIO;
+  const meetsFloor = input.proteinFloor === undefined || dayTotals.proteinGrams >= input.proteinFloor;
+  return {
+    valid: withinHardBand && meetsFloor,
+    dayTotals,
+    ...(side === undefined ? {} : { side }),
+    topUps,
+    ...(swappedStaple === undefined ? {} : { swappedStaple }),
+    ...(counterpartStaple === undefined ? {} : { counterpartStaple }),
+    swappedMealNutrition,
+  };
+}
+
+const ZERO_NUTRITION: RecipeNutrition = { kcal: 0, proteinGrams: 0, carbsGrams: 0, fatGrams: 0, sodiumMg: 0 };
+
+function rowNutrition(row: MealPlanEntryRow): RecipeNutrition {
+  return {
+    kcal: row.caloriesKcal,
+    proteinGrams: row.proteinGrams,
+    carbsGrams: row.carbsGrams,
+    fatGrams: row.fatGrams,
+    sodiumMg: row.sodiumMg,
+  };
+}
+
+function subtractNutrition(left: RecipeNutrition, right: RecipeNutrition): RecipeNutrition {
+  return {
+    kcal: left.kcal - right.kcal,
+    proteinGrams: left.proteinGrams - right.proteinGrams,
+    carbsGrams: left.carbsGrams - right.carbsGrams,
+    fatGrams: left.fatGrams - right.fatGrams,
+    sodiumMg: Math.max(0, left.sodiumMg - right.sodiumMg),
+  };
+}
+
+function stapleFromRow(row: MealPlanEntryRow): StaplePortion | undefined {
+  const stapleSlugs = new Set(STAPLES.map((staple) => staple.slug));
+  for (const item of row.ingredientsJson ?? []) {
+    const slug = String(item["slug"] ?? "");
+    const grams = Number(item["grams"] ?? 0);
+    if (stapleSlugs.has(slug) && Number.isFinite(grams) && grams > 0) {
+      return { slug, grams };
+    }
+  }
+  return undefined;
+}
+
+function isRejectedBySafety(dish: RecipeDish, preferences: {
+  rejectedIngredients?: readonly string[];
+  rejectedSeasonings?: readonly string[];
+  allergens?: readonly string[];
+}): boolean {
+  return hasRejectedIngredient(dish, preferences.rejectedIngredients ?? [], preferences.allergens ?? []) ||
+    hasRejectedSeasoning(dish, preferences.rejectedSeasonings ?? []);
 }
 
 // ── 13. Smart Recipe Recommend (auto-loads candidates) ──
@@ -532,10 +1190,11 @@ export async function handleSmartRecipeRecommend(
     throw new RangeError("mealType must be breakfast, lunch, or dinner");
   }
 
+  const asOfDate = localDateIso(new Date());
   const [bmrProfile, candidates, preferences] = await Promise.all([
     ctx.repo.getLatestBmrProfile(ctx.userId),
     loadCandidateDishes(ctx),
-    loadUserPreferences(ctx),
+    loadUserPreferences(ctx, { asOfDate }),
   ]);
 
   const dailyTarget = bmrProfile?.targetKcal ?? 2000;
@@ -547,15 +1206,116 @@ export async function handleSmartRecipeRecommend(
     maxKcal,
     candidates: [...candidates],
     preferences,
+    recentDishSlugs: preferences.recentDishSlugs,
   });
 }
 
 // ── Helpers ──
 
+function requireDate(value: Date | string | undefined): Date {
+  const date = value === undefined ? new Date() : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new RangeError("now must be a valid date");
+  }
+  return date;
+}
+
+function localDateIso(date: Date): string {
+  return [
+    date.getFullYear(),
+    pad2(date.getMonth() + 1),
+    pad2(date.getDate()),
+  ].join("-");
+}
+
+function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+function mealTypeForHour(hour: number): ProactiveMealType {
+  if (hour < 10) return "breakfast";
+  if (hour < 14) return "lunch";
+  return "dinner";
+}
+
+function localizedMealType(mealType: ProactiveMealType, locale: Language): string {
+  if (locale === "en") return mealType;
+  const labels: Record<ProactiveMealType, string> = {
+    breakfast: "早餐",
+    lunch: "午餐",
+    dinner: "晚餐",
+  };
+  return labels[mealType];
+}
+
+function isLaterSameDayMeal(candidateMealType: string, currentMealType: ProactiveMealType): boolean {
+  if (!isProactiveMealType(candidateMealType)) return false;
+  return PROACTIVE_MEAL_ORDER[candidateMealType] > PROACTIVE_MEAL_ORDER[currentMealType];
+}
+
+function isProactiveMealType(value: string): value is ProactiveMealType {
+  return value === "breakfast" || value === "lunch" || value === "dinner";
+}
+
+function buildThawItems(ctx: ToolContext, entries: MealPlanEntryRow[]): ProactiveThawItem[] {
+  const catalogBySlug = new Map(ctx.catalog.foods.map((food) => [food.slug, food]));
+  const thawItems: ProactiveThawItem[] = [];
+
+  for (const entry of entries) {
+    const ingredients = entry.ingredientsJson
+      .map((ingredient) => thawIngredientFor(ingredient, catalogBySlug))
+      .filter((ingredient): ingredient is ProactiveThawIngredient => ingredient !== undefined);
+
+    if (ingredients.length > 0) {
+      thawItems.push({
+        entryId: entry.id,
+        planDate: entry.planDate,
+        mealType: entry.mealType,
+        dishName: entry.dishName,
+        ingredients,
+      });
+    }
+  }
+
+  return thawItems;
+}
+
+function thawIngredientFor(
+  ingredient: Record<string, unknown>,
+  catalogBySlug: ReadonlyMap<string, { category?: string | null; name?: string }>,
+): ProactiveThawIngredient | undefined {
+  const slug = ingredient["slug"];
+  if (typeof slug !== "string") return undefined;
+
+  const food = catalogBySlug.get(slug);
+  const category = food?.category?.toLowerCase();
+  if (category === undefined || !THAW_CATEGORIES.has(category)) return undefined;
+
+  const grams = ingredient["grams"];
+  return {
+    slug,
+    category,
+    ...(typeof grams === "number" && Number.isFinite(grams) ? { grams } : {}),
+    ...(food?.name ? { name: food.name } : {}),
+  };
+}
+
 function tomorrow(): string {
   const d = new Date();
   d.setDate(d.getDate() + 1);
   return d.toISOString().slice(0, 10);
+}
+
+function addDaysIso(dateIso: string, days: number): string {
+  const date = new Date(`${dateIso}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
 }
 
 function sum(values: number[]): number {

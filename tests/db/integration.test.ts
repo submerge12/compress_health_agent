@@ -33,6 +33,8 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     await db.delete(schema.exerciseLogs).where(eq(schema.exerciseLogs.userId, userId));
     await db.delete(schema.physicalConditions).where(eq(schema.physicalConditions.userId, userId));
     await db.delete(schema.mealPlanEntries).where(eq(schema.mealPlanEntries.userId, userId));
+    await db.delete(schema.memoryRecords).where(eq(schema.memoryRecords.userId, userId));
+    await db.delete(schema.userDishes).where(eq(schema.userDishes.userId, userId));
     await db.delete(schema.bmrProfiles).where(eq(schema.bmrProfiles.userId, userId));
     await db.delete(schema.users).where(eq(schema.users.id, userId));
     await pool.end({ timeout: 3 });
@@ -43,6 +45,22 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     expect(user).toBeDefined();
     expect(user!.externalId).toBe("test-integration-user");
     expect(user!.locale).toBe("zh");
+  });
+
+  it("creates agent-owned tables in the compass_health schema", async () => {
+    const rows = await pool.unsafe<{ table_schema: string; table_name: string }[]>(`
+      SELECT table_schema, table_name
+      FROM information_schema.tables
+      WHERE table_schema IN ('compass_health', 'public')
+        AND table_name IN ('users', 'memory_records', 'food_items')
+      ORDER BY table_schema, table_name
+    `);
+
+    expect(rows).toEqual(expect.arrayContaining([
+      { table_schema: "compass_health", table_name: "food_items" },
+      { table_schema: "compass_health", table_name: "memory_records" },
+      { table_schema: "compass_health", table_name: "users" },
+    ]));
   });
 
   it("findOrCreateUser returns same user on repeat", async () => {
@@ -116,7 +134,9 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
   it("loads meal catalog from seeded data", async () => {
     const catalog = await loadMealCatalog(db);
     expect(catalog.foods.length).toBeGreaterThanOrEqual(32);
-    expect(catalog.naturalUnits.length).toBe(35);
+    expect(catalog.naturalUnits.length).toBeGreaterThanOrEqual(35);
+    // Cooking-oil spoon units (5 g) arrived with the explicit-oil-grams work.
+    expect(catalog.naturalUnits.some((u) => u.foodSlug === "olive_oil")).toBe(true);
 
     const chicken = catalog.foods.find((f) => f.slug === "chicken_breast");
     expect(chicken).toBeDefined();
@@ -150,5 +170,240 @@ describe.skipIf(!isDbAvailable)("database integration", () => {
     const entries = await repo.listMealPlanEntries(userId, "2026-06-17");
     const updated = entries.find((e) => e.id === entry.id);
     expect(updated?.status).toBe("followed");
+  });
+
+  it("upserts and lists user dishes for the candidate library", async () => {
+    const created = await repo.upsertUserDish({
+      userId,
+      slug: "test_onion_beef",
+      name: "test onion beef",
+      mealCategory: "main",
+      role: "main",
+      sideKind: null,
+      selfContained: true,
+      ingredientsJson: [{ slug: "beef_tenderloin", grams: 150 }],
+      seasoningsJson: [{ slug: "light_soy_sauce" }],
+      method: "stir_fry",
+      caloriesKcal: 680,
+      proteinGrams: 42,
+      carbsGrams: 62,
+      fatGrams: 20,
+      sodiumMg: 640,
+      source: "user",
+    });
+
+    const updated = await repo.upsertUserDish({
+      ...created,
+      name: "test onion beef updated",
+      caloriesKcal: 700,
+    });
+    const rows = await repo.listUserDishes(userId);
+
+    expect(updated.id).toBe(created.id);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        slug: "test_onion_beef",
+        name: "test onion beef updated",
+        mealCategory: "main",
+        caloriesKcal: 700,
+      }),
+    ]);
+  });
+
+  it("upserts, supersedes, recalls, and retracts memory records", async () => {
+    const first = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+
+    const confirmed = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+    expect(confirmed.id).toBe(first.id);
+    expect(confirmed.timesReferenced).toBe(first.timesReferenced + 1);
+
+    const changed = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "cilantro",
+      content: "现在可以吃少量香菜",
+      sourceText: "现在可以吃一点香菜",
+      confidence: 1,
+    });
+    expect(changed.id).not.toBe(first.id);
+
+    const recalled = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 5 });
+    expect(recalled).toEqual([
+      expect.objectContaining({
+        id: changed.id,
+        subject: "cilantro",
+        status: "active",
+      }),
+    ]);
+
+    await repo.retractMemory(userId, changed.id);
+    await repo.confirmMemory(userId, first.id);
+    const afterRetract = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 5 });
+    expect(afterRetract).toEqual([]);
+  });
+
+  it("recalls short Chinese queries through pg_trgm across the full memory table", async () => {
+    const oldRelevant = await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "pgtrgm-cilantro",
+      content: "不吃香菜",
+      sourceText: "不吃香菜",
+      confidence: 1,
+    });
+    const oldDate = new Date("2020-01-01T00:00:00.000Z");
+    await db.update(schema.memoryRecords)
+      .set({ validFrom: oldDate, lastConfirmedAt: oldDate, updatedAt: oldDate })
+      .where(eq(schema.memoryRecords.id, oldRelevant.id));
+
+    for (let i = 0; i < 30; i += 1) {
+      await repo.upsertMemory({
+        userId,
+        kind: "dislike",
+        subject: `pgtrgm-noise-${i}`,
+        content: `最近的不相关记忆 ${i} 喜欢米饭`,
+        confidence: 1,
+      });
+    }
+
+    const recalled = await repo.recallMemories(userId, "香菜", { kinds: ["dislike"], limit: 3 });
+
+    expect(recalled[0]).toEqual(expect.objectContaining({
+      id: oldRelevant.id,
+      subject: "pgtrgm-cilantro",
+      contentNorm: "不吃香菜",
+    }));
+
+    const explain = await pool.begin(async (tx) => {
+      await tx.unsafe("SET LOCAL pg_trgm.similarity_threshold = 0.08");
+      await tx.unsafe("SET LOCAL enable_seqscan = off");
+      return tx.unsafe("EXPLAIN SELECT id FROM compass_health.memory_records WHERE content_norm % '香菜'");
+    });
+
+    const plan = explain.map((row) => row["QUERY PLAN"]).join("\n");
+    expect(plan).toMatch(/Bitmap Index Scan|Index Scan/);
+    expect(plan).toContain("memory_records_content_norm_trgm_idx");
+  });
+
+  it("recalls a fuzzy non-substring Chinese query via trigram similarity", async () => {
+    await repo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "pgtrgm-fuzzy-cilantro",
+      content: "我不吃香菜",
+      sourceText: "我不吃香菜",
+      confidence: 1,
+    });
+
+    const query = "不吃香莱";
+    expect("我不吃香菜").not.toContain(query);
+
+    const recalled = await repo.recallMemories(userId, query, { kinds: ["dislike"], limit: 3 });
+
+    expect(recalled.some((memory) => memory.subject === "pgtrgm-fuzzy-cilantro")).toBe(true);
+  });
+
+  it("hybrid recall returns semantic memories that trigram recall misses", async () => {
+    const vector = (axis: number): number[] => {
+      const values = Array.from({ length: 1024 }, () => 0);
+      values[axis] = 1;
+      return values;
+    };
+    const embeddings = new Map<string, number[]>([
+      ["Avoids capsaicin heat.", vector(0)],
+      ["Prefers plain rice.", vector(1)],
+      ["mild dinner ideas", vector(0)],
+    ]);
+    const semanticRepo = createRepository(db, {
+      embeddingClient: {
+        embed: async (texts) => texts.map((text) => embeddings.get(text) ?? vector(2)),
+      },
+      embeddingModel: "mock-memory-embedding",
+    });
+
+    await semanticRepo.upsertMemory({
+      userId,
+      kind: "dislike",
+      subject: "capsaicin",
+      content: "Avoids capsaicin heat.",
+      confidence: 1,
+    });
+    await semanticRepo.upsertMemory({
+      userId,
+      kind: "preference",
+      subject: "rice",
+      content: "Prefers plain rice.",
+      confidence: 1,
+    });
+
+    const lexicalOnly = await repo.recallMemories(userId, "mild dinner ideas", { limit: 5 });
+    expect(lexicalOnly.some((memory) => memory.subject === "capsaicin")).toBe(false);
+
+    const recalled = await semanticRepo.recallMemories(userId, "mild dinner ideas", { limit: 5 });
+    expect(recalled[0]).toEqual(expect.objectContaining({
+      subject: "capsaicin",
+      content: "Avoids capsaicin heat.",
+    }));
+  });
+
+  it("hybrid recall dedups by subject and keeps the most recent semantic match", async () => {
+    const vector = Array.from({ length: 1024 }, (_, index) => index === 0 ? 1 : 0);
+    const semanticRepo = createRepository(db, {
+      embeddingClient: {
+        embed: async (texts) => texts.map(() => vector),
+      },
+      embeddingModel: "mock-memory-embedding",
+    });
+    const oldMemory = await semanticRepo.upsertMemory({
+      userId,
+      kind: "preference",
+      subject: "spice",
+      content: "Uses light chili oil.",
+      confidence: 1,
+    });
+    const newMemory = await semanticRepo.upsertMemory({
+      userId,
+      kind: "note",
+      subject: "spice",
+      content: "Keeps dinners gentle.",
+      confidence: 1,
+    });
+    await db.update(schema.memoryRecords)
+      .set({
+        validFrom: new Date("2020-01-01T00:00:00.000Z"),
+        lastConfirmedAt: new Date("2020-01-01T00:00:00.000Z"),
+        updatedAt: new Date("2020-01-01T00:00:00.000Z"),
+      })
+      .where(eq(schema.memoryRecords.id, oldMemory.id));
+    await db.update(schema.memoryRecords)
+      .set({
+        validFrom: new Date("2026-07-01T00:00:00.000Z"),
+        lastConfirmedAt: new Date("2026-07-01T00:00:00.000Z"),
+        updatedAt: new Date("2026-07-01T00:00:00.000Z"),
+      })
+      .where(eq(schema.memoryRecords.id, newMemory.id));
+
+    const recalled = await semanticRepo.recallMemories(userId, "gentle dinner", { limit: 5 });
+    const spiceRows = recalled.filter((memory) => memory.subject === "spice");
+
+    expect(spiceRows).toHaveLength(1);
+    expect(spiceRows[0]).toEqual(expect.objectContaining({
+      id: newMemory.id,
+      content: "Keeps dinners gentle.",
+    }));
   });
 });

@@ -7,3 +7,13 @@ coverage/
 _tmp_*
 .ai/
 .codex-test-tmp/
+*.stackdump
+.serve.log
+
+# Local agent tooling (Claude Code config, skills)
+.agents/
+.claude/
+skills-lock.json
+
+# pi-harness local session data (created when running the CLI)
+.pi-harness/

@@ -25,11 +25,16 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "dev:repl": "tsx src/dev-repl.ts",
     "start": "tsx src/index.ts",
+    "serve:display": "tsx src/server/serve.ts",
+    "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
     "db:push": "drizzle-kit push",
-    "db:seed": "tsx src/db/run-seed.ts"
+    "db:seed": "tsx src/db/run-seed.ts",
+    "db:embed-catalog": "tsx src/db/embed-catalog.ts",
+    "db:embed-memories": "tsx src/db/embed-memories.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
