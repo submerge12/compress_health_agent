@@ -8,6 +8,7 @@ _tmp_*
 .ai/
 .codex-test-tmp/
 *.stackdump
+.serve.log
 
 # Local agent tooling (Claude Code config, skills)
 .agents/
