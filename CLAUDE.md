@@ -28,6 +28,14 @@ types, no hard pi-harness dependency).
 - **Reference implementation to mirror:** `G:\travel-assistant\src\profile\`
 - Tip: to consult the framework, run `/add-dir G:\pi-harness` (or read its absolute paths directly).
 
+### Harness-facing contract branch
+`codex/pi-harness-alignment` on `origin` is the branch pi-harness's optional CI job
+("Compass Health integration") builds against. Whenever a handler that pi-harness consumes
+is added, renamed, or has its signature changed (the `dist/tools/handlers.d.ts` surface,
+`compassHealthProfileSpec`, `createToolContextFromEnv`, `ToolContext.close`), push the
+alignment branch in the same change-set: `git push origin <branch>:codex/pi-harness-alignment`
+(after secret scan + `CI=true pnpm install --frozen-lockfile` + build + typecheck + tests).
+
 ### Boundaries
 - EDIT this repo. **NEVER modify `G:\pi-harness`** from here — it is the read-only framework.
 - Follow THIS repo's own conventions (pnpm, its existing TS config), not pi-harness's.
