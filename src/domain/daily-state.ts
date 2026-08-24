@@ -75,6 +75,24 @@ export interface DailyStateReadModel {
   dietActualKcal: number;
   waterTotalMl: number;
   exerciseMinutes: number;
+  training: {
+    recommendation: string | null;
+    sessionId: string | null;
+    status: string | null;
+    plannedExercises: number;
+    completedExercises: number;
+    plannedSets: number;
+    completedSets: number;
+    substitutions: Array<{ replacementForId: string | null; slug: string }>;
+    painEvents: Array<{ valueJson: Record<string, unknown> }>;
+  };
+  body: {
+    weight: Record<string, unknown> | null;
+    sleep: Record<string, unknown> | null;
+    fatigue: Record<string, unknown> | null;
+    recovery: Record<string, unknown> | null;
+    pain: Array<{ valueJson: Record<string, unknown> }>;
+  };
   projection: { status: string; builtAt: string };
 }
 
@@ -198,6 +216,59 @@ export function createDailyStateService(db: Db, repo: Repository) {
       db.select().from(schema.activePlanAssignments).where(eq(schema.activePlanAssignments.userId, userId)),
     ]);
 
+    // Structured training for the day (WO-HS-05): sessions + per-exercise
+    // completion + set totals, so DailyState.training reflects reality even
+    // when the coarse exercise_logs row is absent.
+    const daySessions = await db.select().from(schema.trainingSessions).where(and(
+      eq(schema.trainingSessions.userId, userId),
+      eq(schema.trainingSessions.sessionDate, localDate),
+    )).orderBy(asc(schema.trainingSessions.createdAt));
+    const primarySession = daySessions.find((s) => s.status !== "cancelled") ?? null;
+    let trainingExercises: Array<typeof schema.trainingSessionExercises.$inferSelect> = [];
+    if (primarySession !== null) {
+      trainingExercises = await db.select().from(schema.trainingSessionExercises)
+        .where(eq(schema.trainingSessionExercises.sessionId, primarySession.id))
+        .orderBy(asc(schema.trainingSessionExercises.orderIndex));
+    }
+    const setCounts = await Promise.all(trainingExercises.map(async (ex) => {
+      const rows = await db.select({ n: sql<number>`count(*)::int` })
+        .from(schema.trainingSetLogs)
+        .where(eq(schema.trainingSetLogs.sessionExerciseId, ex.id));
+      return { exerciseId: ex.id, doneSets: rows[0]?.n ?? 0 };
+    }));
+    const plannedSets = trainingExercises
+      .filter((ex) => ex.status !== "replaced")
+      .reduce((sum, ex) => sum + ex.targetSets, 0);
+    const completedSets = setCounts.reduce((sum, s) => sum + s.doneSets, 0);
+
+    const sleepObservation = observations.find((o) => o.kind === "sleep");
+
+    const trainingBlock = {
+      recommendation: null as string | null,
+      sessionId: primarySession?.id ?? null,
+      status: primarySession?.status ?? null,
+      plannedExercises: trainingExercises.filter((ex) => ex.status !== "replaced").length,
+      completedExercises: trainingExercises.filter((ex) =>
+        ex.status === "done" || (ex.status === "pending" &&
+          (setCounts.find((s) => s.exerciseId === ex.id)?.doneSets ?? 0) >= ex.targetSets)).length,
+      plannedSets,
+      completedSets,
+      substitutions: trainingExercises
+        .filter((ex) => ex.replacementForId !== null)
+        .map((ex) => ({ replacementForId: ex.replacementForId, slug: ex.exerciseSlug })),
+      painEvents: observations
+        .filter((o) => o.kind === "pain")
+        .map((o) => ({ valueJson: o.valueJson })),
+    };
+
+    const bodyBlock = {
+      weight: observations.find((o) => o.kind === "weight")?.valueJson ?? null,
+      sleep: sleepObservation?.valueJson ?? null,
+      fatigue: observations.find((o) => o.kind === "fatigue")?.valueJson ?? null,
+      recovery: observations.find((o) => o.kind === "recovery")?.valueJson ?? null,
+      pain: trainingBlock.painEvents,
+    };
+
     return {
       schemaVersion: "daily-health-state.v1",
       userId,
@@ -217,6 +288,8 @@ export function createDailyStateService(db: Db, repo: Repository) {
       dietActualKcal: dietLogs.reduce((sum, log) => sum + Number(log.caloriesKcal), 0),
       waterTotalMl: waterLogs.reduce((sum, log) => sum + log.amountMl, 0),
       exerciseMinutes: exerciseLogs.reduce((sum, log) => sum + log.durationMinutes, 0),
+      training: trainingBlock,
+      body: bodyBlock,
       projection: { status: "fresh", builtAt: new Date().toISOString() },
     };
   }
