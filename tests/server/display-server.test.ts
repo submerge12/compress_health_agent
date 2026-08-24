@@ -273,3 +273,66 @@ function record(
     sodiumMgPer100g,
   };
 }
+
+describe("display server identity (M01 service-auth)", () => {
+  let server: Server | undefined;
+
+  afterEach(() => {
+    server?.close();
+    server = undefined;
+  });
+
+  async function boot(options: Parameters<typeof createDisplayServer>[1]): Promise<string> {
+    const base = context({});
+    server = createDisplayServer(base, options);
+    await new Promise<void>((resolve) => server?.listen(0, "127.0.0.1", resolve));
+    const { port } = server?.address() as AddressInfo;
+    return `http://127.0.0.1:${port}`;
+  }
+
+  test("X-External-User-ID resolves a per-request user under service auth", async () => {
+    const resolved: string[] = [];
+    const base = await boot({
+      bearerToken: "svc",
+      resolveUserId: async (externalUserId) => {
+        resolved.push(externalUserId);
+        return `internal-${externalUserId}`;
+      },
+    });
+    const response = await fetch(`${base}/api/health`, {
+      headers: { Authorization: "Bearer svc", "X-External-User-ID": "compass-health:7" },
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, userId: "internal-compass-health:7" });
+    expect(resolved).toEqual(["compass-health:7"]);
+  });
+
+  test("X-External-User-ID is rejected without service auth (localhost-trusted mode stays single-user)", async () => {
+    const base = await boot({});
+    const response = await fetch(`${base}/api/health`, {
+      headers: { "X-External-User-ID": "attacker" },
+    });
+    expect(response.status).toBe(400);
+    const payload = (await response.json()) as { error: string };
+    expect(payload.error).toContain("service auth");
+  });
+
+  test("inbound X-Request-ID is echoed back for cross-service correlation", async () => {
+    const base = await boot({});
+    const response = await fetch(`${base}/api/health`, {
+      headers: { "X-Request-ID": "req-abc-123" },
+    });
+    expect(response.headers.get("x-request-id")).toBe("req-abc-123");
+  });
+
+  test("per-request user scope reaches handlers: plan rows filter by resolved user", async () => {
+    const base = await boot({
+      bearerToken: "svc",
+      resolveUserId: async () => "user-id",
+    });
+    const response = await fetch(`${base}/api/plan?start=2026-07-08&days=1`, {
+      headers: { Authorization: "Bearer svc", "X-External-User-ID": "any" },
+    });
+    expect(response.status).toBe(200);
+  });
+});

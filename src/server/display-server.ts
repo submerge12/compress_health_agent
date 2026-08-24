@@ -32,6 +32,13 @@ export interface DisplayServerOptions {
   corsOrigin?: string;
   /** When set, every /api request must carry `Authorization: Bearer <token>`. */
   bearerToken?: string;
+  /**
+   * Service-auth identity resolution (M01): map a trusted `X-External-User-ID`
+   * header to an internal user id (find-or-create). Only honored when
+   * `bearerToken` is configured, so localhost-trusted mode stays single-user.
+   * Callers other than the authenticated BFF cannot reach this path.
+   */
+  resolveUserId?: (externalUserId: string) => Promise<string>;
 }
 
 const DEFAULT_CORS_ORIGIN = "http://localhost:5500";
@@ -161,7 +168,13 @@ async function dispatch(
   response.setHeader("Access-Control-Allow-Origin", corsOrigin);
   response.setHeader("Vary", "Origin");
   response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  response.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-External-User-ID, X-Request-ID, X-Journey-ID");
+  const inboundRequestId = Array.isArray(request.headers["x-request-id"])
+    ? request.headers["x-request-id"][0]
+    : request.headers["x-request-id"];
+  if (typeof inboundRequestId === "string" && inboundRequestId !== "") {
+    response.setHeader("X-Request-ID", inboundRequestId);
+  }
 
   if (request.method === "OPTIONS") {
     response.statusCode = 204;
@@ -173,6 +186,24 @@ async function dispatch(
     const header = request.headers.authorization ?? "";
     if (header !== `Bearer ${options.bearerToken}`) {
       sendJson(response, 401, { error: "missing or invalid bearer token" });
+      return;
+    }
+  }
+
+  let routeCtx = ctx;
+  const externalUserHeader = Array.isArray(request.headers["x-external-user-id"])
+    ? request.headers["x-external-user-id"][0]
+    : request.headers["x-external-user-id"];
+  if (typeof externalUserHeader === "string" && externalUserHeader !== "") {
+    if (options.bearerToken === undefined || options.resolveUserId === undefined) {
+      sendJson(response, 400, { error: "per-request identity requires service auth (COMPASS_DISPLAY_TOKEN)" });
+      return;
+    }
+    try {
+      const userId = await options.resolveUserId(externalUserHeader);
+      routeCtx = { ...ctx, userId };
+    } catch (error) {
+      sendJson(response, 400, { error: `cannot resolve external user: ${error instanceof Error ? error.message : "unknown"}` });
       return;
     }
   }
@@ -195,7 +226,7 @@ async function dispatch(
   }
 
   try {
-    sendJson(response, 200, await route(ctx, url.searchParams, body));
+    sendJson(response, 200, await route(routeCtx, url.searchParams, body));
   } catch (error) {
     // Handlers signal user-facing validation/refusal via RangeError; its
     // message (e.g. a swap refusal naming valid swaps) is UI copy.

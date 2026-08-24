@@ -12,12 +12,27 @@ const bearerToken = process.env["COMPASS_DISPLAY_TOKEN"];
 const server = createDisplayServer(ctx, {
   ...(corsOrigin === undefined ? {} : { corsOrigin }),
   ...(bearerToken === undefined ? {} : { bearerToken }),
+  ...(bearerToken === undefined
+    ? {}
+    : {
+        // Service-auth mode (M01): the FastAPI BFF sends X-External-User-ID per
+        // request; find-or-create the matching internal user here.
+        resolveUserId: (externalUserId: string) =>
+          ctx.repo
+            .findOrCreateUser(externalUserId, {
+              locale: ctx.locale,
+              timezone: process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai",
+            })
+            .then((user) => user.id),
+      }),
 });
 
 server.listen(port, host, () => {
   console.log(`Compass Health display API listening on http://${host}:${port} (user ${ctx.userId})`);
   if (bearerToken === undefined) {
     console.log("No COMPASS_DISPLAY_TOKEN set: localhost-trusted mode.");
+  } else {
+    console.log("Service-auth mode: X-External-User-ID resolved per request (BFF).");
   }
 });
 
