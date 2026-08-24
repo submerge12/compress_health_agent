@@ -15,6 +15,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
 import { THREE_SPLIT_DAYS, DEFAULT_CYCLE } from "./three-split.js";
+import { NotOwnedError } from "./ownership.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 type SessionRow = typeof schema.trainingSessions.$inferSelect;
@@ -196,7 +197,7 @@ export function createTrainingService(db: Db) {
     const [session] = await db.select().from(schema.trainingSessions)
       .where(and(eq(schema.trainingSessions.id, sessionId), eq(schema.trainingSessions.userId, userId)))
       .limit(1);
-    if (!session) throw new RangeError("session not found");
+    if (!session) throw new NotOwnedError("training_session");
     return session;
   }
 
@@ -235,7 +236,18 @@ export function createTrainingService(db: Db) {
     source?: string;
     idempotencyKey?: string;
   }): Promise<{ log: typeof schema.trainingSetLogs.$inferSelect; replayed: boolean }> {
-    const session = await requireOwnedSession(input.userId, input.sessionId);
+    const [session, ownedExercise] = await (async () => {
+      const s = await requireOwnedSession(input.userId, input.sessionId);
+      // WO-HS-02: full ownership chain — the exercise must belong to THIS session.
+      const [exercise] = await db.select().from(schema.trainingSessionExercises)
+        .where(and(
+          eq(schema.trainingSessionExercises.id, input.sessionExerciseId),
+          eq(schema.trainingSessionExercises.sessionId, input.sessionId),
+        ))
+        .limit(1);
+      if (!exercise) throw new NotOwnedError("session_exercise");
+      return [s, exercise] as const;
+    })();
     if (session.status !== "in_progress") {
       throw new SessionStateError(session.status, "record_set");
     }
@@ -247,6 +259,9 @@ export function createTrainingService(db: Db) {
       if (existing) return { log: existing, replayed: true };
     }
 
+    // WO-HS-03: onConflictDoNothing + explicit replay detection. A duplicate
+    // (exercise, setNumber) without a key returns the ORIGINAL row untouched -
+    // a flaky-network retry must never overwrite logged values.
     const inserted = await db.insert(schema.trainingSetLogs).values({
       sessionExerciseId: input.sessionExerciseId,
       setNumber: input.setNumber,
@@ -258,21 +273,20 @@ export function createTrainingService(db: Db) {
       painJson: input.pain ?? [],
       source: input.source ?? "ui",
       idempotencyKey: input.idempotencyKey ?? null,
-    }).onConflictDoUpdate({
+    }).onConflictDoNothing({
       target: [schema.trainingSetLogs.sessionExerciseId, schema.trainingSetLogs.setNumber],
-      set: {
-        loadValue: input.loadValue ?? null,
-        loadUnit: input.loadUnit ?? null,
-        reps: input.reps ?? null,
-        rir: input.rir ?? null,
-        targetMuscleFeel: input.targetMuscleFeel ?? null,
-        painJson: input.pain ?? [],
-        updatedAt: new Date(),
-      },
     }).returning();
-    if (!inserted[0]) throw new Error("set log upsert returned no row");
 
-    // A retry without an explicit key but same (exercise,set) is also a replay.
+    if (inserted[0] === undefined) {
+      const [existing] = await db.select().from(schema.trainingSetLogs)
+        .where(and(
+          eq(schema.trainingSetLogs.sessionExerciseId, input.sessionExerciseId),
+          eq(schema.trainingSetLogs.setNumber, input.setNumber),
+        ))
+        .limit(1);
+      if (!existing) throw new Error("set insert conflicted but original row vanished");
+      return { log: existing, replayed: true };
+    }
     return { log: inserted[0], replayed: false };
   }
 

@@ -5,6 +5,7 @@
  * the parent is never modified (plan §14.4, J07).
  */
 import { and, desc, eq, sql } from "drizzle-orm";
+import { NotOwnedError } from "./ownership.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -36,7 +37,7 @@ export function createReflectionEngine(db: Db) {
         eq(schema.trainingSessions.userId, input.userId),
       ))
       .limit(1);
-    if (!session) throw new RangeError("session not found");
+    if (!session) throw new NotOwnedError("training_session");
     if (session.status === "in_progress") {
       throw new RangeError("finish the session before reflecting");
     }

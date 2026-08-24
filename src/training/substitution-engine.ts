@@ -7,6 +7,7 @@
  * explain retained/lost. Active block constraints always win.
  */
 import { and, eq, sql } from "drizzle-orm";
+import { NotOwnedError } from "./ownership.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -42,10 +43,18 @@ export function createSubstitutionEngine(db: Db) {
    * transferred, never added to.
    */
   async function propose(userId: string, sessionId: string, sessionExerciseId: string): Promise<SubstitutionProposal> {
-    const [original] = await db.select().from(schema.trainingSessionExercises)
-      .where(eq(schema.trainingSessionExercises.id, sessionExerciseId))
+    // WO-HS-02: verify user -> session -> exercise before touching anything.
+    const [session] = await db.select().from(schema.trainingSessions)
+      .where(and(eq(schema.trainingSessions.id, sessionId), eq(schema.trainingSessions.userId, userId)))
       .limit(1);
-    if (!original) throw new RangeError("session exercise not found");
+    if (!session) throw new NotOwnedError("training_session");
+    const [original] = await db.select().from(schema.trainingSessionExercises)
+      .where(and(
+        eq(schema.trainingSessionExercises.id, sessionExerciseId),
+        eq(schema.trainingSessionExercises.sessionId, sessionId),
+      ))
+      .limit(1);
+    if (!original) throw new NotOwnedError("session_exercise");
 
     const [definition] = await db.select().from(schema.exerciseDefinitions)
       .where(eq(schema.exerciseDefinitions.slug, original.exerciseSlug))
@@ -127,6 +136,11 @@ export function createSubstitutionEngine(db: Db) {
     journeyId?: string;
   }): Promise<{ replacementId: string }> {
     const { proposal } = input;
+    // WO-HS-02: the calling user must own the session being mutated.
+    const [ownedSession] = await db.select().from(schema.trainingSessions)
+      .where(and(eq(schema.trainingSessions.id, input.sessionId), eq(schema.trainingSessions.userId, input.userId)))
+      .limit(1);
+    if (!ownedSession) throw new NotOwnedError("training_session");
     if (!proposal.candidates.some((c) => c.slug === input.chosenSlug)) {
       throw new RangeError("chosen slug is not one of the proposed candidates");
     }

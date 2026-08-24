@@ -5,6 +5,8 @@ import { createDailyStateService } from "../domain/daily-state.js";
 import { createDietLogService, NeedsConfirmationError, StateConflict } from "../domain/diet-log-service.js";
 import { createTrainingService } from "../training/training-service.js";
 import { createSubstitutionEngine } from "../training/substitution-engine.js";
+import { NotOwnedError } from "../training/ownership.js";
+import { DomainHttpError, Errors } from "./domain-http-error.js";
 import { createReflectionEngine } from "../training/reflection-engine.js";
 import { createMediaIndexer, createMediaRetrieval } from "../media/retrieval.js";
 import { presetDishes } from "../data/preset-dishes.js";
@@ -286,10 +288,13 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       return result;
     } catch (error) {
       if (error instanceof NeedsConfirmationError) {
-        return sendNeedsConfirmation(error.estimate);
+        throw new DomainHttpError(422, "needs_confirmation", error.message, {
+          needsConfirmation: error.estimate.needsConfirmation ?? [],
+          unmatched: error.estimate.unmatched ?? [],
+        });
       }
       if (error instanceof StateConflict) {
-        return { error: "state_conflict", currentRevision: error.currentRevision };
+        throw Errors.conflict("state_conflict", "revision mismatch", { currentRevision: error.currentRevision });
       }
       throw error;
     }
@@ -511,19 +516,6 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
   },
 };
 
-/** Shape of the ad-hoc override estimate built from confirmed items. */
-function sendNeedsConfirmation(estimate: import("../tools/nutrition-estimate.js").NutritionEstimateResult): {
-  status: "needs_confirmation";
-  needsConfirmation: import("../tools/nutrition-estimate.js").FoodResolutionDiagnostic[];
-  unmatched: import("../tools/nutrition-estimate.js").FoodResolutionDiagnostic[];
-} {
-  return {
-    status: "needs_confirmation",
-    needsConfirmation: estimate.needsConfirmation ?? [],
-    unmatched: estimate.unmatched ?? [],
-  };
-}
-
 const PANTRY_SLUGS: ReadonlySet<string> = new Set([
   ...presetDishes.flatMap((dish) => dish.ingredients.map((ingredient) => ingredient.slug)),
   ...STAPLES.map((staple) => staple.slug),
@@ -581,8 +573,18 @@ async function dispatch(
   const externalUserHeader = Array.isArray(request.headers["x-external-user-id"])
     ? request.headers["x-external-user-id"][0]
     : request.headers["x-external-user-id"];
-  if (typeof externalUserHeader === "string" && externalUserHeader !== "") {
-    if (options.bearerToken === undefined || options.resolveUserId === undefined) {
+
+  // WO-HS-02: under service auth, every user-data route MUST carry an
+  // explicit per-request identity. Falling back to the startup default user
+  // would silently attribute data to the wrong account. /api/health is the
+  // only exempt route (pure liveness).
+  const isLivenessRoute = request.url !== undefined && request.url.startsWith("/api/health");
+  if (options.bearerToken !== undefined && !isLivenessRoute) {
+    if (typeof externalUserHeader !== "string" || externalUserHeader === "") {
+      sendJson(response, 400, { error: "missing_external_user_id" });
+      return;
+    }
+    if (options.resolveUserId === undefined) {
       sendJson(response, 400, { error: "per-request identity requires service auth (COMPASS_DISPLAY_TOKEN)" });
       return;
     }
@@ -593,6 +595,11 @@ async function dispatch(
       sendJson(response, 400, { error: `cannot resolve external user: ${error instanceof Error ? error.message : "unknown"}` });
       return;
     }
+  } else if (typeof externalUserHeader === "string" && externalUserHeader !== "") {
+    // No service auth configured (localhost-trusted mode): identity headers
+    // stay forbidden so a local caller cannot impersonate another user.
+    sendJson(response, 400, { error: "per-request identity requires service auth (COMPASS_DISPLAY_TOKEN)" });
+    return;
   }
 
   const url = new URL(request.url ?? "/", "http://localhost");
@@ -615,6 +622,17 @@ async function dispatch(
   try {
     sendJson(response, 200, await route(routeCtx, url.searchParams, body));
   } catch (error) {
+    // WO-HS-03: typed domain errors carry real status codes — conflicts are
+    // 409, ownership misses 404, needs-confirmation 422. The BFF preserves
+    // status + structured body downstream.
+    if (error instanceof DomainHttpError) {
+      sendJson(response, error.status, {
+        error: error.code,
+        ...(error.message ? { detail: error.message } : {}),
+        ...(error.details !== undefined ? { details: error.details } : {}),
+      });
+      return;
+    }
     // Handlers signal user-facing validation/refusal via RangeError; its
     // message (e.g. a swap refusal naming valid swaps) is UI copy.
     if (error instanceof RangeError) {

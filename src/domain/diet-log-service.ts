@@ -89,18 +89,6 @@ export function createDietLogService(db: Db, repo: Repository) {
     }
   }
 
-  async function insertWithLineage(values: typeof schema.dietLogs.$inferInsert): Promise<DietLogRow> {
-    const [created] = await db.insert(schema.dietLogs).values(values).returning();
-    if (!created) throw new Error("diet log insert returned no row");
-    return created;
-  }
-
-  async function markSuperseded(originalLogId: string, supersededById: string): Promise<void> {
-    await db.update(schema.dietLogs)
-      .set({ supersededById, updatedAt: new Date() })
-      .where(and(eq(schema.dietLogs.id, originalLogId), isNull(schema.dietLogs.supersededById)));
-  }
-
   return {
     preview,
 
@@ -136,31 +124,37 @@ export function createDietLogService(db: Db, repo: Repository) {
       const uncertain = estimate.uncertain === true || (estimate.needsConfirmation?.length ?? 0) > 0;
       const confidence = uncertain ? 0 : 1; // coarse tier until M09 word-level scores
 
-      const log = await insertWithLineage({
-        userId: input.userId,
-        logDate: input.logDate,
-        mealType: input.mealType,
-        description: input.description,
-        source: input.source ?? "agent",
-        ingredientsJson: estimate.items.map((item) => ({ slug: item.slug, grams: item.grams } as Record<string, unknown>)) as Array<Record<string, unknown>>,
-        seasoningsJson: [],
-        caloriesKcal: estimate.kcal,
-        proteinGrams: estimate.proteinGrams,
-        carbsGrams: estimate.carbsGrams,
-        fatGrams: estimate.fatGrams,
-        sodiumMg: estimate.sodiumMg,
-        idempotencyKey: input.idempotencyKey ?? null,
-        estimateConfidence: confidence,
-        uncertain,
-        journeyId: input.journeyId ?? null,
-      });
+      // WO-HS-03: fact + outbox commit atomically - a failure in either
+      // rolls back both, so no receipt-less fact or fact-less receipt.
+      const log = await db.transaction(async (tx) => {
+        const [created] = await tx.insert(schema.dietLogs).values({
+          userId: input.userId,
+          logDate: input.logDate,
+          mealType: input.mealType,
+          description: input.description,
+          source: input.source ?? "agent",
+          ingredientsJson: estimate.items.map((item) => ({ slug: item.slug, grams: item.grams } as Record<string, unknown>)) as Array<Record<string, unknown>>,
+          seasoningsJson: [],
+          caloriesKcal: estimate.kcal,
+          proteinGrams: estimate.proteinGrams,
+          carbsGrams: estimate.carbsGrams,
+          fatGrams: estimate.fatGrams,
+          sodiumMg: estimate.sodiumMg,
+          idempotencyKey: input.idempotencyKey ?? null,
+          estimateConfidence: confidence,
+          uncertain,
+          journeyId: input.journeyId ?? null,
+        }).returning();
+        if (!created) throw new Error("diet log insert returned no row");
 
-      await db.insert(schema.outboxEvents).values({
-        userId: input.userId,
-        aggregateType: "diet_log",
-        aggregateId: log.id,
-        eventType: "diet.commit",
-        payloadJson: { observedOn: input.logDate },
+        await tx.insert(schema.outboxEvents).values({
+          userId: input.userId,
+          aggregateType: "diet_log",
+          aggregateId: created.id,
+          eventType: "diet.commit",
+          payloadJson: { observedOn: input.logDate },
+        });
+        return created;
       });
 
       return { log, replayed: false };
@@ -174,58 +168,91 @@ export function createDietLogService(db: Db, repo: Repository) {
       original: DietLogRow;
       revised: DietLogRow;
     }> {
-      const [original] = await db.select().from(schema.dietLogs)
-        .where(and(eq(schema.dietLogs.id, input.originalLogId), eq(schema.dietLogs.userId, input.userId)))
-        .limit(1);
-      if (!original) throw new RangeError("original log not found");
-
-      if (input.idempotencyKey) {
-        const [existing] = await db.select().from(schema.dietLogs)
+      // WO-HS-03: lock the original FOR UPDATE inside the transaction so two
+      // concurrent corrections cannot both supersede; the loser replays the
+      // winner's revision instead of creating a duplicate.
+      return db.transaction(async (tx): Promise<{ original: DietLogRow; revised: DietLogRow }> => {
+        const lockedRows = await tx.select().from(schema.dietLogs)
           .where(and(
+            eq(schema.dietLogs.id, input.originalLogId),
             eq(schema.dietLogs.userId, input.userId),
-            eq(schema.dietLogs.idempotencyKey, input.idempotencyKey),
           ))
+          .for("update")
           .limit(1);
-        if (existing && existing.correctionOfId === original.id) {
-          return { original, revised: existing }; // correction replay
+        const original = lockedRows[0] as DietLogRow | undefined;
+        if (!original) throw new RangeError("original log not found");
+
+        if (original.supersededById !== null) {
+          if (input.idempotencyKey) {
+            const [priorRevision] = await tx.select().from(schema.dietLogs)
+              .where(and(
+                eq(schema.dietLogs.id, original.supersededById),
+                eq(schema.dietLogs.correctionOfId, original.id),
+              ))
+              .limit(1);
+            if (priorRevision) return { original, revised: priorRevision };
+          }
+          throw new StateConflict(-1);
         }
-      }
 
-      const description = input.description ?? original.description;
-      const mealType = input.mealType ?? original.mealType;
-      const estimate = await handleNutritionEstimate(ctx, { description });
-      const uncertain = (estimate.needsConfirmation?.length ?? 0) > 0 || estimate.uncertain === true;
+        if (input.idempotencyKey) {
+          const [existing] = await tx.select().from(schema.dietLogs)
+            .where(and(
+              eq(schema.dietLogs.userId, input.userId),
+              eq(schema.dietLogs.idempotencyKey, input.idempotencyKey),
+            ))
+            .limit(1);
+          if (existing && existing.correctionOfId === original.id) {
+            return { original, revised: existing }; // correction replay
+          }
+        }
 
-      const revised = await insertWithLineage({
-        userId: input.userId,
-        logDate: original.logDate,
-        mealType,
-        description: `${description}${input.reason ? `（修正：${input.reason}）` : ""}`,
-        source: original.source,
-        ingredientsJson: estimate.items.map((item) => ({ slug: item.slug, grams: item.grams } as Record<string, unknown>)) as Array<Record<string, unknown>>,
-        seasoningsJson: original.seasoningsJson,
-        caloriesKcal: estimate.kcal,
-        proteinGrams: estimate.proteinGrams,
-        carbsGrams: estimate.carbsGrams,
-        fatGrams: estimate.fatGrams,
-        sodiumMg: estimate.sodiumMg,
-        idempotencyKey: input.idempotencyKey ?? null,
-        estimateConfidence: uncertain ? 0 : 1,
-        uncertain,
-        correctionOfId: original.id,
-        journeyId: input.journeyId ?? null,
+        const description = input.description ?? original.description;
+        const mealType = input.mealType ?? original.mealType;
+        const estimate = await handleNutritionEstimate(ctx, { description });
+        const uncertain = (estimate.needsConfirmation?.length ?? 0) > 0 || estimate.uncertain === true;
+
+        const [revised] = await tx.insert(schema.dietLogs).values({
+          userId: input.userId,
+          logDate: original.logDate,
+          mealType,
+          description: `${description}${input.reason ? `（修正：${input.reason}）` : ""}`,
+          source: original.source,
+          ingredientsJson: estimate.items.map((item) => ({ slug: item.slug, grams: item.grams } as Record<string, unknown>)) as Array<Record<string, unknown>>,
+          seasoningsJson: original.seasoningsJson,
+          caloriesKcal: estimate.kcal,
+          proteinGrams: estimate.proteinGrams,
+          carbsGrams: estimate.carbsGrams,
+          fatGrams: estimate.fatGrams,
+          sodiumMg: estimate.sodiumMg,
+          idempotencyKey: input.idempotencyKey ?? null,
+          estimateConfidence: uncertain ? 0 : 1,
+          uncertain,
+          correctionOfId: original.id,
+          journeyId: input.journeyId ?? null,
+        }).returning();
+        if (!revised) throw new Error("revised insert returned no row");
+
+        // CAS: only supersede if still unsuperseded (belt-and-braces with lock).
+        const cas = await tx.update(schema.dietLogs)
+          .set({ supersededById: revised.id, updatedAt: new Date() })
+          .where(and(
+            eq(schema.dietLogs.id, original.id),
+            isNull(schema.dietLogs.supersededById),
+          ))
+          .returning({ id: schema.dietLogs.id });
+        if (cas.length === 0) throw new StateConflict(-1);
+
+        await tx.insert(schema.outboxEvents).values({
+          userId: input.userId,
+          aggregateType: "diet_log",
+          aggregateId: revised.id,
+          eventType: "diet.correct",
+          payloadJson: { observedOn: original.logDate, correctedOf: original.id },
+        });
+
+        return { original, revised };
       });
-
-      await markSuperseded(original.id, revised.id);
-      await db.insert(schema.outboxEvents).values({
-        userId: input.userId,
-        aggregateType: "diet_log",
-        aggregateId: revised.id,
-        eventType: "diet.correct",
-        payloadJson: { observedOn: original.logDate, correctedOf: original.id },
-      });
-
-      return { original, revised };
     },
 
     /** Effective logs for a day: excludes superseded revisions. */

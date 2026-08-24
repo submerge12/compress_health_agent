@@ -290,7 +290,7 @@ describe("display server identity (M01 service-auth)", () => {
     return `http://127.0.0.1:${port}`;
   }
 
-  test("X-External-User-ID resolves a per-request user under service auth", async () => {
+  test("user-data routes resolve X-External-User-ID under service auth; /api/health stays liveness-only", async () => {
     const resolved: string[] = [];
     const base = await boot({
       bearerToken: "svc",
@@ -299,11 +299,27 @@ describe("display server identity (M01 service-auth)", () => {
         return `internal-${externalUserId}`;
       },
     });
-    const response = await fetch(`${base}/api/health`, {
+    // Liveness route: no identity header needed, none resolved.
+    const health = await fetch(`${base}/api/health`, {
+      headers: { Authorization: "Bearer svc" },
+    });
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true, userId: "user-id" });
+    expect(resolved).toEqual([]);
+
+    // A user-data route WITHOUT the identity header is refused (WO-HS-02),
+    // never falling back to the startup default user.
+    const missing = await fetch(`${base}/api/plan?start=2026-07-08&days=1`, {
+      headers: { Authorization: "Bearer svc" },
+    });
+    expect(missing.status).toBe(400);
+    expect(await missing.json()).toEqual({ error: "missing_external_user_id" });
+
+    // With the header, the per-request user is resolved and scoped.
+    const scoped = await fetch(`${base}/api/plan?start=2026-07-08&days=1`, {
       headers: { Authorization: "Bearer svc", "X-External-User-ID": "compass-health:7" },
     });
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, userId: "internal-compass-health:7" });
+    expect(scoped.status).toBe(200);
     expect(resolved).toEqual(["compass-health:7"]);
   });
 

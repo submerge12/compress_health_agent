@@ -26,8 +26,11 @@ const BASE_URL =
 const lastSlash = BASE_URL.lastIndexOf("/");
 const ADMIN_PREFIX = BASE_URL.slice(0, lastSlash + 1); // ...postgres://user:pass@host:port/
 const SOURCE_DB = BASE_URL.slice(lastSlash + 1);
-const CLEAN_DB = `${SOURCE_DB}_mig_clean_test`;
-const UPGRADE_DB = `${SOURCE_DB}_mig_upgrade_test`;
+// Unique per-process suffix: vitest runs files in parallel workers, and
+// concurrent DROP/CREATE of the same throwaway DB name races.
+const RUN_ID = `${process.pid}_${Date.now() % 100000}`;
+const CLEAN_DB = `${SOURCE_DB}_mig_clean_${RUN_ID}`;
+const UPGRADE_DB = `${SOURCE_DB}_mig_upg_${RUN_ID}`;
 
 const cleanUrl = `${ADMIN_PREFIX}${CLEAN_DB}`;
 const upgradeUrl = `${ADMIN_PREFIX}${UPGRADE_DB}`;
