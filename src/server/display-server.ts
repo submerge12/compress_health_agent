@@ -514,6 +514,75 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     await createMediaRetrieval(db).recordFeedback(ctx.userId, input.segmentId, input.helpful, input.note);
     return { recorded: true };
   },
+  // ── WO-HS-04: water / activity / condition canonical routes ──
+  "POST /api/v1/water/logs": async (ctx, _query, body) => {
+    const input = cast(body) as { amount_ml?: number; amountMl?: number };
+    const amount = Math.round(Number(input.amount_ml ?? input.amountMl ?? 0));
+    if (!Number.isFinite(amount) || amount <= 0 || amount > 10000) {
+      throw new RangeError("amount_ml must be between 1 and 10000");
+    }
+    return handleLogWater(ctx, {
+      date: new Date().toISOString().slice(0, 10),
+      description: `${amount}ml`,
+    });
+  },
+
+  "GET /api/v1/water/today": async (ctx) => {
+    const today = new Date().toISOString().slice(0, 10);
+    const logs = await ctx.repo.listWaterLogs(ctx.userId, today);
+    const total = logs.reduce((sum, log) => sum + log.amountMl, 0);
+    const goal = 2000;
+    return {
+      logs: logs.map((log) => ({ id: log.id, amount_ml: log.amountMl, logged_at: log.logDate })),
+      total_ml: total,
+      goal_ml: goal,
+      percentage: Math.round((total / goal) * 1000) / 10,
+    };
+  },
+
+  "POST /api/v1/activities": async (_ctx, _query, body) => {
+    const input = cast(body) as {
+      activity_type?: string; activityType?: string;
+      duration_minutes?: number; durationMinutes?: number;
+      calories_burned?: number; caloriesBurnedKcal?: number;
+      notes?: string;
+    };
+    const activityType = String(input.activity_type ?? input.activityType ?? "").trim();
+    const duration = Number(input.duration_minutes ?? input.durationMinutes ?? 0);
+    if (!activityType || !Number.isFinite(duration) || duration <= 0 || duration > 600) {
+      throw new RangeError("activity_type and duration_minutes (1-600) are required");
+    }
+    return handleLogExercise(_ctx, {
+      date: new Date().toISOString().slice(0, 10),
+      description: `${activityType} ${duration} minutes`,
+    });
+  },
+
+  "GET /api/v1/activities": async (ctx, query) => {
+    const date = query.get("date") ?? new Date().toISOString().slice(0, 10);
+    const logs = await ctx.repo.listExerciseLogs(ctx.userId, date);
+    return {
+      logs: logs.map((log) => ({
+        id: log.id,
+        activity_type: log.activityType,
+        duration_minutes: log.durationMinutes,
+        calories_burned_kcal: log.caloriesBurnedKcal,
+        logged_at: log.logDate,
+        notes: log.notes,
+      })),
+      total_minutes: logs.reduce((s, l) => s + l.durationMinutes, 0),
+      total_calories: logs.reduce((s, l) => s + Number(l.caloriesBurnedKcal), 0),
+    };
+  },
+
+  "POST /api/v1/body/condition": async (ctx, _query, body) => {
+    const input = cast(body) as { weight_kg?: number; weightKg?: number };
+    const weight = Number(input.weight_kg ?? input.weightKg ?? 0);
+    if (!Number.isFinite(weight) || weight <= 0 || weight > 400) {
+      throw new RangeError("weight_kg must be between 1 and 400");
+    }
+    return handleLogWeight(ctx, { date: new Date().toISOString().slice(0, 10), description: "", weightKg: weight } as never);
+  },
 };
 
 const PANTRY_SLUGS: ReadonlySet<string> = new Set([
