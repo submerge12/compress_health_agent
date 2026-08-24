@@ -4,6 +4,7 @@ import {
   date,
   doublePrecision,
   index,
+  uniqueIndex,
   integer,
   jsonb,
   pgSchema,
@@ -105,9 +106,22 @@ export const dietLogs = compass.table("diet_logs", {
   source: text("source").notNull().default("manual"),
   ingredientsJson: jsonb("ingredients_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
   seasoningsJson: jsonb("seasonings_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  // ── M05 DietLogV2 metadata (nullable for legacy rows) ──
+  idempotencyKey: text("idempotency_key"),
+  estimateConfidence: doublePrecision("estimate_confidence"),
+  uncertain: boolean("uncertain"),
+  correctionOfId: uuid("correction_of_id"),
+  supersededById: uuid("superseded_by_id"),
+  journeyId: text("journey_id"),
   ...nutritionColumns(),
   ...timestamps()
-});
+}, (t) => [
+  // Partial unique index (matches live DB): only non-null idempotency keys
+  // participate, so legacy rows with NULL stay valid.
+  uniqueIndex("diet_logs_user_idempotency_key_uidx")
+    .on(t.userId, t.idempotencyKey)
+    .where(sql`idempotency_key is not null`),
+]);
 
 export const waterLogs = compass.table("water_logs", {
   id: uuid("id").primaryKey().defaultRandom(),

@@ -43,12 +43,13 @@ const columnsOf = (table: (typeof schema)[keyof typeof schema]): string[] => Obj
 // ── Schema baselines (no DB required) ──────────────────────────────────────
 
 describe("J01 baseline: diet plan vs actual (M05/P3 gaps)", () => {
-  it("diet_logs has no idempotency key, confidence, or correction-lineage columns", () => {
+  it("diet_logs now carries M05 metadata (flipped from P0 gap assertion)", () => {
+    // P0 recorded these columns as missing; M05 added them. Kept as a
+    // positive invariant so a future refactor cannot silently drop them.
     const cols = columnsOf(schema.dietLogs);
-    expect(cols).not.toContain("idempotencyKey");
-    expect(cols).not.toContain("confidence");
-    expect(cols).not.toContain("correctionOf");
-    expect(cols).not.toContain("supersededBy");
+    for (const present of ["idempotencyKey", "estimateConfidence", "uncertain", "correctionOfId", "supersededById"]) {
+      expect(cols).toContain(present);
+    }
   });
 
   it("meal_plan_entries has no plan_version_id column (plans mutate in place)", () => {

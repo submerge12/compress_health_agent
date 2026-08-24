@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 
 import type { ToolContext } from "../tools/context.js";
 import { createDailyStateService } from "../domain/daily-state.js";
+import { createDietLogService, NeedsConfirmationError, StateConflict } from "../domain/diet-log-service.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { DEFAULT_PROTEIN_TOP_UP_MENU, STAPLES } from "../engine/meal-composition.js";
 import { storedProcurement, storedWeekView } from "./display-queries.js";
@@ -222,7 +223,102 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       activeTo: input.activeTo ?? null,
     });
   },
+
+  // ── M05 diet logging (v1): preview → commit → correct ──
+  "POST /api/v1/diet/logs:preview": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as { description: string; date: string; mealType: string };
+    if (!input.description || !input.date || !input.mealType) {
+      throw new RangeError("description, date and mealType are required");
+    }
+    return createDietLogService(db, ctx.repo).preview(ctx, input);
+  },
+
+  "POST /api/v1/diet/logs:commit": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      date: string;
+      mealType: string;
+      description: string;
+      idempotencyKey?: string;
+      expectedRevision?: number;
+      items?: Array<{ slug: string; grams: number }>;
+    };
+    if (!input.date || !input.mealType || !input.description) {
+      throw new RangeError("date, mealType and description are required");
+    }
+    // A user-confirmed candidate list becomes an explicit override estimate so
+    // unresolved-segment refusal does not apply to reviewed commits.
+    const overrideEstimate = input.items === undefined ? undefined : ({
+      description: input.description,
+      kcal: 0,
+      proteinGrams: 0,
+      carbsGrams: 0,
+      fatGrams: 0,
+      sodiumMg: 0,
+      items: input.items,
+    } as unknown as import("../tools/nutrition-estimate.js").NutritionEstimateResult);
+
+    try {
+      const result = await createDietLogService(db, ctx.repo).commit(ctx, {
+        userId: ctx.userId,
+        logDate: input.date,
+        mealType: input.mealType,
+        description: input.description,
+        source: "web",
+        idempotencyKey: input.idempotencyKey,
+        expectedRevision: input.expectedRevision,
+        ...(overrideEstimate === undefined ? {} : { overrideEstimate }),
+      });
+      await createDailyStateService(db, ctx.repo)
+        .persistDailyProjection(ctx.userId, input.date,
+          process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
+      return result;
+    } catch (error) {
+      if (error instanceof NeedsConfirmationError) {
+        return sendNeedsConfirmation(error.estimate);
+      }
+      if (error instanceof StateConflict) {
+        return { error: "state_conflict", currentRevision: error.currentRevision };
+      }
+      throw error;
+    }
+  },
+
+  "POST /api/v1/diet/logs:correct": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      originalLogId: string;
+      mealType?: string;
+      description?: string;
+      reason?: string;
+      idempotencyKey?: string;
+    };
+    if (!input.originalLogId) throw new RangeError("originalLogId is required");
+    const result = await createDietLogService(db, ctx.repo).correct(ctx, {
+      userId: ctx.userId,
+      originalLogId: input.originalLogId,
+      mealType: input.mealType,
+      description: input.description,
+      reason: input.reason,
+      idempotencyKey: input.idempotencyKey,
+    });
+    return result;
+  },
 };
+
+/** Shape of the ad-hoc override estimate built from confirmed items. */
+function sendNeedsConfirmation(estimate: import("../tools/nutrition-estimate.js").NutritionEstimateResult): {
+  status: "needs_confirmation";
+  needsConfirmation: import("../tools/nutrition-estimate.js").FoodResolutionDiagnostic[];
+  unmatched: import("../tools/nutrition-estimate.js").FoodResolutionDiagnostic[];
+} {
+  return {
+    status: "needs_confirmation",
+    needsConfirmation: estimate.needsConfirmation ?? [],
+    unmatched: estimate.unmatched ?? [],
+  };
+}
 
 const PANTRY_SLUGS: ReadonlySet<string> = new Set([
   ...presetDishes.flatMap((dish) => dish.ingredients.map((ingredient) => ingredient.slug)),
