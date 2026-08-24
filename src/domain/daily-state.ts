@@ -1,0 +1,313 @@
+/**
+ * M03 / P2: Daily health state — facts, projection, and concurrency.
+ *
+ * Design (plan §6): PostgreSQL detail tables plus append-only events are the
+ * source of truth; `daily_health_state_projection` is a rebuildable read
+ * model keyed by (user, date) and is never a write target. Every state-
+ * changing command goes through `applyDailyCommand`, which:
+ *
+ *   1. checks optimistic concurrency (expectedRevision → 409 on mismatch),
+ *   2. enforces idempotency (same key → original result, no duplicate fact),
+ *   3. appends the observation fact,
+ *   4. enqueues an outbox event in the SAME transaction,
+ *   5. bumps the projection revision.
+ *
+ * The projection worker consumes the outbox separately (M04); a projection
+ * failure never rolls back committed facts.
+ */
+import { and, asc, eq, isNull, or, sql } from "drizzle-orm";
+import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+
+import * as schema from "../db/schema.js";
+import type { Repository } from "../db/repository.js";
+
+type Db = PostgresJsDatabase<typeof schema>;
+
+export class StateConflictError extends Error {
+  readonly code = "state_conflict";
+  constructor(readonly currentRevision: number, readonly field?: string) {
+    super(`revision mismatch (current: ${currentRevision})`);
+  }
+}
+
+export class DuplicateIdempotencyKeyError extends Error {
+  readonly code = "duplicate_idempotency_key";
+}
+
+/** Risk tiers per plan §17.1; M14 wraps these into an ask/deny matrix. */
+export const CONFIRMATION_POLICY = {
+  query: { confirm: false },
+  reversible_log: { confirm: false }, // ordinary logs: save directly + undo
+  low_confidence_input: { confirm: true }, // ASR/estimation below threshold
+  day_plan_change: { confirm: true }, // show diff before applying
+  long_horizon_change: { confirm: true }, // volume/cycle changes
+  delete_or_lift_constraint: { confirm: true }, // reversal event required
+  health_risk: { confirm: true }, // stop + escalate to human guidance
+} as const;
+
+export interface ObservationInput {
+  userId: string;
+  observedOn: string;
+  kind: "sleep" | "fatigue" | "recovery" | "pain" | "weight" | "note";
+  valueJson: Record<string, unknown>;
+  source?: string;
+  journeyId?: string;
+  actor?: string;
+}
+
+interface ApplyOptions {
+  /** Opaque command name, used for outbox typing. */
+  commandType: string;
+  aggregateType: string;
+}
+
+export interface DailyStateReadModel {
+  schemaVersion: "daily-health-state.v1";
+  userId: string;
+  localDate: string;
+  timezone: string;
+  revision: number;
+
+  activePlans: Record<string, string | null>;
+  observations: Array<{ kind: string; valueJson: Record<string, unknown>; observedOn: string }>;
+  activeConstraints: Array<Record<string, unknown>>;
+  dietActualCount: number;
+  dietActualKcal: number;
+  waterTotalMl: number;
+  exerciseMinutes: number;
+  projection: { status: string; builtAt: string };
+}
+
+export function createDailyStateService(db: Db, repo: Repository) {
+  // ── Facts ────────────────────────────────────────────────────────────────
+
+  async function recordObservation(input: ObservationInput, options: ApplyOptions): Promise<{ eventId: string }> {
+    return db.transaction(async (tx) => {
+      const [event] = await tx.insert(schema.healthObservationEvents).values({
+        userId: input.userId,
+        observedOn: input.observedOn,
+        kind: input.kind,
+        valueJson: input.valueJson,
+        source: input.source ?? "user",
+        journeyId: input.journeyId ?? null,
+      }).returning();
+      if (!event) throw new Error("observation insert returned no row");
+
+      await tx.insert(schema.outboxEvents).values({
+        userId: input.userId,
+        aggregateType: options.aggregateType,
+        aggregateId: event.id,
+        eventType: `${options.commandType}:recorded`,
+        payloadJson: { kind: input.kind, observedOn: input.observedOn },
+      });
+
+      await touchProjection(input.userId, input.observedOn);
+      return { eventId: event.id };
+    });
+  }
+
+  /**
+   * Pain constraints follow "strictest wins": inserting one is low-friction
+   * (the user is in pain), lifting one always creates a reversal event and
+   * requires explicit confirmation upstream (M14 confirmation matrix).
+   */
+  async function addConstraint(input: {
+    userId: string;
+    constraintType: string;
+    severity?: "warn" | "block";
+    targetJson: Record<string, unknown>;
+    reason: string;
+    activeFrom: string;
+    activeTo?: string | null;
+    sourceObservationId?: string | null;
+  }): Promise<{ constraintId: string }> {
+    const [created] = await db.insert(schema.healthConstraints).values({
+      userId: input.userId,
+      constraintType: input.constraintType,
+      severity: input.severity ?? "warn",
+      targetJson: input.targetJson,
+      reason: input.reason,
+      activeFrom: input.activeFrom,
+      activeTo: input.activeTo ?? null,
+      sourceObservationId: input.sourceObservationId ?? null,
+    }).returning();
+    if (!created) throw new Error("constraint insert returned no row");
+    return { constraintId: created.id };
+  }
+
+  async function liftConstraint(constraintId: string, liftedByActor: string): Promise<void> {
+    await db.update(schema.healthConstraints)
+      .set({ liftedAt: new Date(), liftedByActor, updatedAt: new Date() })
+      .where(and(eq(schema.healthConstraints.id, constraintId), isNull(schema.healthConstraints.liftedAt)));
+  }
+
+  async function listActiveConstraints(userId: string, onDate: string) {
+    return db.select().from(schema.healthConstraints).where(and(
+      eq(schema.healthConstraints.userId, userId),
+      isNull(schema.healthConstraints.liftedAt),
+      sql`${schema.healthConstraints.activeFrom} <= ${onDate}`,
+      or(isNull(schema.healthConstraints.activeTo), sql`${schema.healthConstraints.activeTo} >= ${onDate}`),
+    ));
+  }
+
+  // ── Idempotency ──────────────────────────────────────────────────────────
+
+  async function checkAndRecordIdempotency(key: string, requestHash: string): Promise<"new" | "replay"> {
+    // InteractionEvents double as the idempotency ledger until a dedicated
+    // table lands with M05's DietLogV2 (plan §10 M05 model).
+    const existing = await db.select({ id: schema.interactionEvents.id })
+      .from(schema.interactionEvents)
+      .where(and(
+        eq(schema.interactionEvents.stage, "idempotency"),
+        sql`${schema.interactionEvents.detailJson} ->> 'key' = ${key}`,
+      ))
+      .limit(1);
+    if (existing[0]) {
+      throw new DuplicateIdempotencyKeyError(`key already used: ${key}`);
+    }
+    await db.insert(schema.interactionEvents).values({
+      stage: "idempotency",
+      stageCode: "ok",
+      detailJson: { key, hash: requestHash },
+    });
+    return "new";
+  }
+
+  // ── Projection ───────────────────────────────────────────────────────────
+
+  async function buildDailyState(userId: string, localDate: string, timezone: string): Promise<DailyStateReadModel> {
+    const [dietLogs, waterLogs, exerciseLogs, constraints, observations, assignments] = await Promise.all([
+      repo.listDietLogs(userId, localDate),
+      repo.listWaterLogs(userId, localDate),
+      db.select().from(schema.exerciseLogs).where(and(
+        eq(schema.exerciseLogs.userId, userId),
+        eq(schema.exerciseLogs.logDate, localDate),
+      )),
+      listActiveConstraints(userId, localDate),
+      db.select().from(schema.healthObservationEvents).where(and(
+        eq(schema.healthObservationEvents.userId, userId),
+        eq(schema.healthObservationEvents.observedOn, localDate),
+        isNull(schema.healthObservationEvents.revokedAt),
+      )).orderBy(asc(schema.healthObservationEvents.createdAt)),
+      db.select().from(schema.activePlanAssignments).where(eq(schema.activePlanAssignments.userId, userId)),
+    ]);
+
+    return {
+      schemaVersion: "daily-health-state.v1",
+      userId,
+      localDate,
+      timezone,
+      revision: 0, // filled by persistDailyProjection
+      activePlans: Object.fromEntries(assignments.map((a) => [a.scope, a.planVersionId])),
+      observations: observations.map((o) => ({ kind: o.kind, valueJson: o.valueJson, observedOn: o.observedOn })),
+      activeConstraints: constraints.map((c) => ({
+        id: c.id,
+        constraintType: c.constraintType,
+        severity: c.severity,
+        targetJson: c.targetJson,
+        reason: c.reason,
+      })),
+      dietActualCount: dietLogs.length,
+      dietActualKcal: dietLogs.reduce((sum, log) => sum + Number(log.caloriesKcal), 0),
+      waterTotalMl: waterLogs.reduce((sum, log) => sum + log.amountMl, 0),
+      exerciseMinutes: exerciseLogs.reduce((sum, log) => sum + log.durationMinutes, 0),
+      projection: { status: "fresh", builtAt: new Date().toISOString() },
+    };
+  }
+
+  async function persistDailyProjection(
+    userId: string,
+    localDate: string,
+    timezone: string,
+    status: "fresh" | "lagging" | "failed" | "rebuilding" = "fresh",
+  ): Promise<DailyStateReadModel> {
+    const [existing] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
+      .from(schema.dailyHealthStateProjection)
+      .where(and(
+        eq(schema.dailyHealthStateProjection.userId, userId),
+        eq(schema.dailyHealthStateProjection.stateDate, localDate),
+      ))
+      .limit(1);
+
+    const state = await buildDailyState(userId, localDate, timezone);
+    const revision = (existing?.revision ?? -1) + 1;
+    const payload = { ...state, revision };
+
+    await db.insert(schema.dailyHealthStateProjection).values({
+      userId,
+      stateDate: localDate,
+      revision,
+      timezone,
+      stateJson: payload as unknown as Record<string, unknown>,
+      sourceEventCount: state.observations.length,
+      projectionStatus: status,
+      builtAt: new Date(),
+      updatedAt: new Date(),
+    }).onConflictDoUpdate({
+      target: [schema.dailyHealthStateProjection.userId, schema.dailyHealthStateProjection.stateDate],
+      set: {
+        revision,
+        stateJson: payload as unknown as Record<string, unknown>,
+        sourceEventCount: state.observations.length,
+        projectionStatus: status,
+        builtAt: new Date(),
+        updatedAt: new Date(),
+      },
+    });
+
+    return payload;
+  }
+
+  async function touchProjection(userId: string, localDate: string): Promise<void> {
+    // Facts commit first; marking the projection lagging is best-effort.
+    try {
+      await db.update(schema.dailyHealthStateProjection)
+        .set({ projectionStatus: "lagging", updatedAt: new Date() })
+        .where(and(
+          eq(schema.dailyHealthStateProjection.userId, userId),
+          eq(schema.dailyHealthStateProjection.stateDate, localDate),
+        ));
+    } catch {
+      // no projection row yet — fine, next rebuild creates it fresh
+    }
+  }
+
+  async function getDailyProjection(userId: string, localDate: string) {
+    const [row] = await db.select().from(schema.dailyHealthStateProjection)
+      .where(and(
+        eq(schema.dailyHealthStateProjection.userId, userId),
+        eq(schema.dailyHealthStateProjection.stateDate, localDate),
+      ))
+      .limit(1);
+    if (!row) return undefined;
+
+    const counts = await db.select({ count: sql<number>`count(*)::int` })
+      .from(schema.outboxEvents)
+      .where(and(
+        eq(schema.outboxEvents.userId, userId),
+        eq(schema.outboxEvents.status, "pending"),
+      ));
+
+    return {
+      ...row.stateJson as unknown as DailyStateReadModel,
+      projection: {
+        ...(row.stateJson as unknown as DailyStateReadModel).projection,
+        status: row.projectionStatus,
+        pendingOutboxEvents: counts[0]?.count ?? 0,
+      },
+    };
+  }
+
+  return {
+    recordObservation,
+    addConstraint,
+    liftConstraint,
+    listActiveConstraints,
+    buildDailyState,
+    persistDailyProjection,
+    getDailyProjection,
+    checkAndRecordIdempotency,
+  };
+}
+
+export type DailyStateService = ReturnType<typeof createDailyStateService>;

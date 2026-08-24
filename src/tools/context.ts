@@ -1,4 +1,4 @@
-import { drizzle } from "drizzle-orm/postgres-js";
+import { drizzle, type PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 
 import * as schema from "../db/schema.js";
@@ -13,6 +13,12 @@ export interface ToolContext {
   userId: string;
   locale: "zh" | "en";
   repo: Repository;
+  /**
+   * Drizzle handle for domain services that need transactions beyond the
+   * repository surface (M03 daily-state). Optional so hand-built test
+   * contexts stay valid; production initToolContext always sets it.
+   */
+  db?: PostgresJsDatabase<typeof schema>;
   embeddingClient?: EmbeddingClient;
   catalog: MealCatalog;
   seasoningRecords: NutritionRecord[];
@@ -62,6 +68,7 @@ export async function initToolContext(options: InitContextOptions): Promise<Tool
     userId: user.id,
     locale: (options.locale ?? user.locale ?? "zh") as "zh" | "en",
     repo,
+    db,
     ...(embeddingClient !== undefined ? { embeddingClient } : {}),
     catalog,
     seasoningRecords,

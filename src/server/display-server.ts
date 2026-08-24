@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 
 import type { ToolContext } from "../tools/context.js";
+import { createDailyStateService } from "../domain/daily-state.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { DEFAULT_PROTEIN_TOP_UP_MENU, STAPLES } from "../engine/meal-composition.js";
 import { storedProcurement, storedWeekView } from "./display-queries.js";
@@ -43,6 +44,14 @@ export interface DisplayServerOptions {
 
 const DEFAULT_CORS_ORIGIN = "http://localhost:5500";
 const MAX_BODY_BYTES = 1_000_000;
+
+/** M03 daily-state routes need the real drizzle handle; test fakes omit it. */
+function requireDailyStateDb(ctx: ToolContext): NonNullable<ToolContext["db"]> {
+  if (ctx.db === undefined) {
+    throw new RangeError("daily state requires a database-backed tool context");
+  }
+  return ctx.db;
+}
 
 type Query = URLSearchParams;
 type Body = Record<string, unknown>;
@@ -135,6 +144,74 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
   "POST /api/log/water": (ctx, _query, body) => handleLogWater(ctx, cast(body)),
   "POST /api/log/exercise": (ctx, _query, body) => handleLogExercise(ctx, cast(body)),
   "POST /api/log/weight": (ctx, _query, body) => handleLogWeight(ctx, cast(body)),
+
+  // ── M03 daily state (v1): read model + observation/constraint commands ──
+  "GET /api/v1/daily-state": async (ctx, query) => {
+    const date = requireQueryDate(query, "date");
+    requireDailyStateDb(ctx);
+    return createDailyStateService(requireDailyStateDb(ctx), ctx.repo)
+      .getDailyProjection(ctx.userId, date);
+  },
+
+  "POST /api/v1/observations": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      observedOn: string;
+      kind: string;
+      valueJson?: Record<string, unknown>;
+      value?: Record<string, unknown>;
+      journeyId?: string;
+    };
+    if (!input.observedOn || !/^\d{4}-\d{2}-\d{2}$/.test(input.observedOn)) {
+      throw new RangeError("observedOn must be an ISO date");
+    }
+    const kind = input.kind;
+    if (!["sleep", "fatigue", "recovery", "pain", "weight", "note"].includes(kind)) {
+      throw new RangeError("kind must be one of sleep|fatigue|recovery|pain|weight|note");
+    }
+    const service = createDailyStateService(db, ctx.repo);
+    const result = await service.recordObservation({
+      userId: ctx.userId,
+      observedOn: input.observedOn,
+      kind: kind as "sleep" | "fatigue" | "recovery" | "pain" | "weight" | "note",
+      valueJson: input.valueJson ?? input.value ?? {},
+      journeyId: input.journeyId,
+    }, { commandType: "observation.record", aggregateType: "observation" });
+    // Rebuild synchronously for now (local single-worker cadence); M04's
+    // standalone worker loop takes over when it runs as a process.
+    await service.persistDailyProjection(ctx.userId, input.observedOn,
+      process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
+    return result;
+  },
+
+  "GET /api/v1/constraints": async (ctx, query) => {
+    const date = requireQueryDate(query, "date");
+    return createDailyStateService(requireDailyStateDb(ctx), ctx.repo)
+      .listActiveConstraints(ctx.userId, date);
+  },
+
+  "POST /api/v1/constraints": async (ctx, _query, body) => {
+    const input = cast(body) as {
+      constraintType: string;
+      severity?: string;
+      targetJson: Record<string, unknown>;
+      reason: string;
+      activeFrom: string;
+      activeTo?: string;
+    };
+    if (!input.constraintType || !input.reason || !input.activeFrom) {
+      throw new RangeError("constraintType, reason and activeFrom are required");
+    }
+    return createDailyStateService(requireDailyStateDb(ctx), ctx.repo).addConstraint({
+      userId: ctx.userId,
+      constraintType: input.constraintType,
+      severity: input.severity === "block" ? "block" : "warn",
+      targetJson: input.targetJson ?? {},
+      reason: input.reason,
+      activeFrom: input.activeFrom,
+      activeTo: input.activeTo ?? null,
+    });
+  },
 };
 
 const PANTRY_SLUGS: ReadonlySet<string> = new Set([
