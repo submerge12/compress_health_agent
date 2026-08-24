@@ -6,6 +6,7 @@ import { createDietLogService, NeedsConfirmationError, StateConflict } from "../
 import { createTrainingService } from "../training/training-service.js";
 import { createSubstitutionEngine } from "../training/substitution-engine.js";
 import { createReflectionEngine } from "../training/reflection-engine.js";
+import { createMediaIndexer, createMediaRetrieval } from "../media/retrieval.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { DEFAULT_PROTEIN_TOP_UP_MENU, STAPLES } from "../engine/meal-composition.js";
 import { storedProcurement, storedWeekView } from "./display-queries.js";
@@ -479,6 +480,28 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     if (!input.childVersionId) throw new RangeError("childVersionId is required");
     await createReflectionEngine(db).activateChildVersion(ctx.userId, input.childVersionId);
     return { activated: true, planVersionId: input.childVersionId };
+  },
+
+  // ── M08 media retrieval (v1): J06 cue lookup + feedback ──
+  "GET /api/v1/media/segments:search": async (ctx, query) => {
+    const db = requireDailyStateDb(ctx);
+    return createMediaRetrieval(db).search({
+      movementPattern: query.get("pattern") ?? undefined,
+      bodyPart: query.get("bodyPart") ?? undefined,
+      category: query.get("category") ?? undefined,
+      text: query.get("text") ?? undefined,
+      limit: query.get("limit") === null ? undefined : Number(query.get("limit")),
+    });
+  },
+
+  "POST /api/v1/media/segments:feedback": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as { segmentId: string; helpful: boolean; note?: string };
+    if (!input.segmentId || typeof input.helpful !== "boolean") {
+      throw new RangeError("segmentId and helpful are required");
+    }
+    await createMediaRetrieval(db).recordFeedback(ctx.userId, input.segmentId, input.helpful, input.note);
+    return { recorded: true };
   },
 };
 

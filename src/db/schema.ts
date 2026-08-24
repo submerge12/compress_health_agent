@@ -569,3 +569,72 @@ export const trainingReflections = compass.table("training_reflections", {
   userAcceptedAt: timestamp("user_accepted_at", { withTimezone: true }),
   ...timestamps()
 });
+
+// ── M08 / P5: training media library (metadata only; binaries stay local) ──
+
+export const mediaAssets = compass.table("media_assets", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  kind: text("kind").notNull(), // video | subtitle
+  trainer: text("trainer").notNull(), // kaishengwang | curun | tanchengyi
+  title: text("title").notNull(),
+  localPath: text("local_path").notNull(),
+  sha256: text("sha256").notNull(),
+  durationMs: integer("duration_ms"),
+  probeStatus: text("probe_status").notNull().default("unprobed"), // ok | decode_error | unreadable | unprobed
+  bytes: integer("bytes").notNull().default(0),
+  ...timestamps()
+}, (t) => [
+  unique("media_assets_sha_kind_key").on(t.sha256, t.kind),
+]);
+
+export const mediaPairings = compass.table("media_pairings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  videoAssetId: uuid("video_asset_id").notNull()
+    .references(() => mediaAssets.id, { onDelete: "cascade" }),
+  subtitleAssetId: uuid("subtitle_asset_id")
+    .references(() => mediaAssets.id, { onDelete: "set null" }),
+  matchMethod: text("match_method").notNull(), // manifest | duration_proximity | confirmed_mapping | manual
+  completeness: text("completeness").notNull().default("unverified"),
+  // complete | video_decode_error | subtitle_truncated | missing_subtitle | missing_video | duration_mismatch | unverified
+  subtitleEndMs: integer("subtitle_end_ms"),
+  gapSeconds: integer("gap_seconds"), // video minus subtitle end; large => truncated
+  usableUntilMs: integer("usable_until_ms"), // segments beyond this are not evidence
+  notes: text("notes"),
+  ...timestamps()
+}, (t) => [
+  unique("media_pairings_video_key").on(t.videoAssetId),
+]);
+
+export const videoSegments = compass.table("video_segments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  pairingId: uuid("pairing_id").notNull()
+    .references(() => mediaPairings.id, { onDelete: "cascade" }),
+  startMs: integer("start_ms").notNull(),
+  endMs: integer("end_ms").notNull(),
+  trainer: text("trainer").notNull(),
+  sourceRole: text("source_role").notNull(), // main_program | chest_specialist | technique_details
+  title: text("title").notNull(),
+  bodyPart: text("body_part"),
+  movementPattern: text("movement_pattern"),
+  exerciseSlug: text("exercise_slug"),
+  category: text("category").notNull().default("practice"), // warmup | practice | improvement | correction
+  cuesText: text("cues_text").notNull().default(""),
+  reviewStatus: text("review_status").notNull().default("draft"), // draft | confirmed
+  helpfulCount: integer("helpful_count").notNull().default(0),
+  notHelpfulCount: integer("not_helpful_count").notNull().default(0),
+  supersededById: uuid("superseded_by_id"),
+  ...timestamps()
+}, (t) => [
+  index("video_segments_trainer_idx").on(t.trainer, t.category),
+  index("video_segments_pattern_idx").on(t.movementPattern),
+]);
+
+export const segmentFeedback = compass.table("segment_feedback", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  segmentId: uuid("segment_id").notNull()
+    .references(() => videoSegments.id, { onDelete: "cascade" }),
+  helpful: boolean("helpful").notNull(),
+  note: text("note"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+});
