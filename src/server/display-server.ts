@@ -148,9 +148,19 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
   // ── M03 daily state (v1): read model + observation/constraint commands ──
   "GET /api/v1/daily-state": async (ctx, query) => {
     const date = requireQueryDate(query, "date");
-    requireDailyStateDb(ctx);
-    return createDailyStateService(requireDailyStateDb(ctx), ctx.repo)
+    const db = requireDailyStateDb(ctx);
+    const state = await createDailyStateService(db, ctx.repo)
       .getDailyProjection(ctx.userId, date);
+    if (state === undefined) {
+      return {
+        schemaVersion: "daily-health-state.v1",
+        userId: ctx.userId,
+        localDate: date,
+        projection: { status: "rebuilding", pendingOutboxEvents: 0 },
+        missing: true,
+      };
+    }
+    return state;
   },
 
   "POST /api/v1/observations": async (ctx, _query, body) => {
