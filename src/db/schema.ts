@@ -310,3 +310,134 @@ export const memoryRecords = compass.table("memory_records", {
   index("memory_records_content_norm_trgm_idx").using("gin", t.contentNorm.op("gin_trgm_ops")),
   index("memory_records_embedding_hnsw_idx").using("hnsw", t.embedding.op("vector_cosine_ops")),
 ]);
+
+// ── M03 / P2: plan versions, facts, constraints, outbox, projection ─────────
+// Design: docs/display-interface-plan.md §6 (DailyHealthStateV1). Facts are
+// append-only; the daily projection is rebuildable and never a write target.
+
+export const planVersions = compass.table("plan_versions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  scope: text("scope").notNull(), // diet | training_template | training_cycle | training_day | training_session
+  status: text("status").notNull().default("draft"), // draft | active | superseded | archived
+  parentVersionId: uuid("parent_version_id"),
+  versionNumber: integer("version_number").notNull().default(1),
+  contentJson: jsonb("content_json").$type<Record<string, unknown>>().notNull(),
+  adjustmentReason: text("adjustment_reason"),
+  previousVersionProblems: jsonb("previous_version_problems").$type<string[]>().default(sql`'[]'::jsonb`),
+  validationQuestions: jsonb("validation_questions").$type<string[]>().default(sql`'[]'::jsonb`),
+  createdByActor: text("created_by_actor").notNull().default("user"),
+  activatedAt: timestamp("activated_at", { withTimezone: true }),
+  ...timestamps()
+}, (t) => [
+  index("plan_versions_user_scope_idx").on(t.userId, t.scope, t.status),
+]);
+
+/** Single active pointer per user+scope; plan changes swap this row atomically. */
+export const activePlanAssignments = compass.table("active_plan_assignments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  scope: text("scope").notNull(),
+  planVersionId: uuid("plan_version_id").notNull()
+    .references(() => planVersions.id, { onDelete: "cascade" }),
+  ...timestamps()
+}, (t) => [
+  unique("active_plan_assignments_user_scope_key").on(t.userId, t.scope),
+]);
+
+export const healthObservationEvents = compass.table("health_observation_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  observedOn: date("observed_on").notNull(),
+  kind: text("kind").notNull(), // sleep | fatigue | recovery | pain | weight | note
+  valueJson: jsonb("value_json").$type<Record<string, unknown>>().notNull(),
+  source: text("source").notNull().default("user"),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  journeyId: text("journey_id"),
+  ...timestamps()
+}, (t) => [
+  index("health_observation_events_user_day_idx").on(t.userId, t.observedOn, t.kind),
+]);
+
+export const healthConstraints = compass.table("health_constraints", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  constraintType: text("constraint_type").notNull(), // pain | equipment_unavailable | time_limited | medical
+  severity: text("severity").notNull().default("warn"), // warn | block
+  targetJson: jsonb("target_json").$type<Record<string, unknown>>().notNull(), // e.g. { movementPattern: "..." } or { exerciseSlug }
+  reason: text("reason").notNull(),
+  activeFrom: date("active_from").notNull(),
+  activeTo: date("active_to"),
+  liftedAt: timestamp("lifted_at", { withTimezone: true }),
+  liftedByActor: text("lifted_by_actor"),
+  sourceObservationId: uuid("source_observation_id"),
+  ...timestamps()
+}, (t) => [
+  index("health_constraints_user_active_idx").on(t.userId, t.activeFrom),
+]);
+
+export const userDecisionEvents = compass.table("user_decision_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  decisionType: text("decision_type").notNull(), // accepted | modified | rejected | undone
+  subjectJson: jsonb("subject_json").$type<Record<string, unknown>>().notNull(), // proposal/plan/log reference
+  journeyId: text("journey_id"),
+  ...timestamps()
+});
+
+export const outboxEvents = compass.table("outbox_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull(),
+  aggregateType: text("aggregate_type").notNull(), // diet_log | observation | plan_version | ...
+  aggregateId: text("aggregate_id").notNull(),
+  eventType: text("type").notNull(),
+  payloadJson: jsonb("payload_json").$type<Record<string, unknown>>(),
+  status: text("status").notNull().default("pending"), // pending | done | dead_letter
+  attempts: integer("attempts").notNull().default(0),
+  lastError: text("last_error"),
+  availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+  processedAt: timestamp("processed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+}, (t) => [
+  index("outbox_events_status_available_idx").on(t.status, t.availableAt),
+]);
+
+export const interactionEvents = compass.table("interaction_events", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id"),
+  requestId: text("request_id"),
+  journeyId: text("journey_id"),
+  actor: text("actor").notNull().default("web"), // web | agent | pi_primary | pi_legacy | teacher | manager
+  stage: text("stage").notNull(), // asr | intent | tool | api | validation | db | projection | ui
+  stageCode: text("stage_code").notNull(), // ok | failed | rejected | timeout | unavailable | stale
+  detailJson: jsonb("detail_json").$type<Record<string, unknown>>(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+}, (t) => [
+  index("interaction_events_journey_idx").on(t.journeyId),
+  index("interaction_events_stage_idx").on(t.stage, t.stageCode),
+]);
+
+export const projectionCheckpoints = compass.table("projection_checkpoints", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  projectionName: text("projection_name").notNull(),
+  checkpointKey: text("checkpoint_key").notNull(), // e.g. "daily-health-state:2026-08-24"
+  lastEventAt: timestamp("last_event_at", { withTimezone: true }),
+  status: text("status").notNull().default("fresh"), // fresh | lagging | failed | rebuilding
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+}, (t) => [
+  unique("projection_checkpoints_name_key_key").on(t.projectionName, t.checkpointKey),
+]);
+
+export const dailyHealthStateProjection = compass.table("daily_health_state_projection", {
+  userId: uuid("user_id").notNull(),
+  stateDate: date("state_date").notNull(),
+  revision: integer("revision").notNull().default(0),
+  timezone: text("timezone").notNull().default("UTC"),
+  stateJson: jsonb("state_json").$type<Record<string, unknown>>().notNull(),
+  sourceEventCount: integer("source_event_count").notNull().default(0),
+  projectionStatus: text("projection_status").notNull().default("fresh"),
+  builtAt: timestamp("built_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+}, (t) => [
+  unique("daily_health_state_projection_user_date_key").on(t.userId, t.stateDate),
+]);
