@@ -252,16 +252,22 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       throw new RangeError("date, mealType and description are required");
     }
     // A user-confirmed candidate list becomes an explicit override estimate so
-    // unresolved-segment refusal does not apply to reviewed commits.
-    const overrideEstimate = input.items === undefined ? undefined : ({
-      description: input.description,
-      kcal: 0,
-      proteinGrams: 0,
-      carbsGrams: 0,
-      fatGrams: 0,
-      sodiumMg: 0,
-      items: input.items,
-    } as unknown as import("../tools/nutrition-estimate.js").NutritionEstimateResult);
+    // unresolved-segment refusal does not apply to reviewed commits. Nutrition
+    // is computed from the catalog for the confirmed slugs — never zeros.
+    let overrideEstimate: import("../tools/nutrition-estimate.js").NutritionEstimateResult | undefined;
+    if (input.items !== undefined) {
+      const { aggregateNutrition } = await import("../engine/nutrition.js");
+      const totals = aggregateNutrition({
+        foods: input.items.map((item) => ({ slug: item.slug, grams: item.grams })),
+        foodRecords: ctx.catalog.foods,
+        requireWeightType: true,
+      }).total;
+      overrideEstimate = {
+        description: input.description,
+        ...totals,
+        items: input.items,
+      } as unknown as import("../tools/nutrition-estimate.js").NutritionEstimateResult;
+    }
 
     try {
       const result = await createDietLogService(db, ctx.repo).commit(ctx, {
