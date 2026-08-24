@@ -1,5 +1,6 @@
 CREATE SCHEMA IF NOT EXISTS "compass_health";
 CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;
 
 CREATE TABLE IF NOT EXISTS "compass_health"."food_aliases" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
@@ -13,10 +14,71 @@ CREATE TABLE IF NOT EXISTS "compass_health"."food_aliases" (
 CREATE UNIQUE INDEX IF NOT EXISTS "food_aliases_slug_alias_unique"
   ON "compass_health"."food_aliases" ("slug", "alias");
 
+-- WO-HS-01: baseline tables that predated the migration system (created
+-- historically via drizzle-kit push). Added here so a clean database can run
+-- the full chain. All statements are idempotent.
+
+CREATE TABLE IF NOT EXISTS compass_health.food_items (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+    slug text NOT NULL,
+    name text NOT NULL,
+    name_zh text,
+    category text,
+    execution_buckets jsonb DEFAULT '[]'::jsonb NOT NULL,
+    roles jsonb DEFAULT '[]'::jsonb NOT NULL,
+    weekly_floor integer DEFAULT 0 NOT NULL,
+    source text DEFAULT 'csv'::text NOT NULL,
+    calories_kcal double precision DEFAULT 0 NOT NULL,
+    protein_grams double precision DEFAULT 0 NOT NULL,
+    carbs_grams double precision DEFAULT 0 NOT NULL,
+    fat_grams double precision DEFAULT 0 NOT NULL,
+    fiber_grams double precision DEFAULT 0 NOT NULL,
+    sugar_grams double precision DEFAULT 0 NOT NULL,
+    sodium_mg double precision DEFAULT 0 NOT NULL,
+    potassium_mg double precision DEFAULT 0 NOT NULL,
+    calcium_mg double precision DEFAULT 0 NOT NULL,
+    iron_mg double precision DEFAULT 0 NOT NULL,
+    magnesium_mg double precision DEFAULT 0 NOT NULL,
+    zinc_mg double precision DEFAULT 0 NOT NULL,
+    vitamin_a_mcg double precision DEFAULT 0 NOT NULL,
+    vitamin_c_mg double precision DEFAULT 0 NOT NULL,
+    vitamin_d_mcg double precision DEFAULT 0 NOT NULL,
+    vitamin_b12_mcg double precision DEFAULT 0 NOT NULL,
+    folate_mcg double precision DEFAULT 0 NOT NULL,
+    cholesterol_mg double precision DEFAULT 0 NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    allergen_tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    weight_type text DEFAULT 'raw'::text NOT NULL,
+    frequency_hint text,
+    cooking_difficulty text,
+    availability text,
+    special_handling_tags jsonb DEFAULT '[]'::jsonb NOT NULL,
+    embedding public.vector(1024),
+    embedding_text text,
+    embedding_model text
+);
+
 ALTER TABLE "compass_health"."food_items"
   ADD COLUMN IF NOT EXISTS "execution_buckets" jsonb DEFAULT '[]'::jsonb NOT NULL,
   ADD COLUMN IF NOT EXISTS "roles" jsonb DEFAULT '[]'::jsonb NOT NULL,
   ADD COLUMN IF NOT EXISTS "weekly_floor" integer DEFAULT 0 NOT NULL;
+
+CREATE TABLE IF NOT EXISTS "compass_health"."users" (
+  "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+  "external_id" text NOT NULL,
+  "email" text,
+  "display_name" text,
+  "locale" text DEFAULT 'en'::text NOT NULL,
+  "timezone" text DEFAULT 'UTC'::text NOT NULL,
+  "created_at" timestamp with time zone DEFAULT now() NOT NULL,
+  "updated_at" timestamp with time zone DEFAULT now() NOT NULL
+);
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'users_external_id_unique' AND conrelid = 'compass_health.users'::regclass) THEN
+    ALTER TABLE "compass_health"."users" ADD CONSTRAINT users_external_id_unique UNIQUE ("external_id");
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS "compass_health"."user_dishes" (
   "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,

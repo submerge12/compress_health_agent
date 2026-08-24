@@ -34,7 +34,8 @@
     "db:push": "drizzle-kit push",
     "db:seed": "tsx src/db/run-seed.ts",
     "db:embed-catalog": "tsx src/db/embed-catalog.ts",
-    "db:embed-memories": "tsx src/db/embed-memories.ts"
+    "db:embed-memories": "tsx src/db/embed-memories.ts",
+    "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
     "dotenv": "^17.4.2",
