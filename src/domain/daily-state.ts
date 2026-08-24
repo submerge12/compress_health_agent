@@ -177,7 +177,13 @@ export function createDailyStateService(db: Db, repo: Repository) {
 
   async function buildDailyState(userId: string, localDate: string, timezone: string): Promise<DailyStateReadModel> {
     const [dietLogs, waterLogs, exerciseLogs, constraints, observations, assignments] = await Promise.all([
-      repo.listDietLogs(userId, localDate),
+      // Effective revisions only: superseded rows stay on disk for audit but
+      // must not count toward the day's facts (M05 correction lineage).
+      db.select().from(schema.dietLogs).where(and(
+        eq(schema.dietLogs.userId, userId),
+        eq(schema.dietLogs.logDate, localDate),
+        isNull(schema.dietLogs.supersededById),
+      )),
       repo.listWaterLogs(userId, localDate),
       db.select().from(schema.exerciseLogs).where(and(
         eq(schema.exerciseLogs.userId, userId),

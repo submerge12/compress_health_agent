@@ -303,6 +303,10 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       reason: input.reason,
       idempotencyKey: input.idempotencyKey,
     });
+    // Keep the read model on the effective revision (same cadence as commit).
+    await createDailyStateService(db, ctx.repo)
+      .persistDailyProjection(ctx.userId, result.revised.logDate,
+        process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
     return result;
   },
 };
