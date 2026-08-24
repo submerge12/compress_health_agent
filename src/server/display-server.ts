@@ -3,6 +3,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { ToolContext } from "../tools/context.js";
 import { createDailyStateService } from "../domain/daily-state.js";
 import { createDietLogService, NeedsConfirmationError, StateConflict } from "../domain/diet-log-service.js";
+import { createTrainingService } from "../training/training-service.js";
+import { createSubstitutionEngine } from "../training/substitution-engine.js";
+import { createReflectionEngine } from "../training/reflection-engine.js";
 import { presetDishes } from "../data/preset-dishes.js";
 import { DEFAULT_PROTEIN_TOP_UP_MENU, STAPLES } from "../engine/meal-composition.js";
 import { storedProcurement, storedWeekView } from "./display-queries.js";
@@ -308,6 +311,174 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       .persistDailyProjection(ctx.userId, result.revised.logDate,
         process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
     return result;
+  },
+
+  // ── M06/M07 training (v1): prepare → start → sets → finish → reflect ──
+  "GET /api/v1/training/prepare": async (ctx, query) => {
+    const db = requireDailyStateDb(ctx);
+    const date = requireQueryDate(query, "date");
+    const dayParam = query.get("day");
+    const day = dayParam === "A" || dayParam === "B" || dayParam === "C" ? dayParam : undefined;
+    return createTrainingService(db).prepareSession(ctx.userId, date, day);
+  },
+
+  "POST /api/v1/training/sessions": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      date: string;
+      dayRole: "A" | "B" | "C";
+      planVersionId?: string;
+      journeyId?: string;
+    };
+    if (!input.date || !input.dayRole) throw new RangeError("date and dayRole are required");
+    return createTrainingService(db).startSession({
+      userId: ctx.userId,
+      sessionDate: input.date,
+      dayRole: input.dayRole,
+      planVersionId: input.planVersionId,
+      journeyId: input.journeyId,
+    });
+  },
+
+  "POST /api/v1/training/sets": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      sessionId: string;
+      sessionExerciseId: string;
+      setNumber: number;
+      loadValue?: number;
+      loadUnit?: string;
+      reps?: number;
+      rir?: number;
+      targetMuscleFeel?: number;
+      pain?: Array<Record<string, unknown>>;
+      source?: string;
+      idempotencyKey?: string;
+    };
+    if (!input.sessionId || !input.sessionExerciseId || !input.setNumber) {
+      throw new RangeError("sessionId, sessionExerciseId and setNumber are required");
+    }
+    return createTrainingService(db).recordSet({
+      userId: ctx.userId,
+      sessionId: input.sessionId,
+      sessionExerciseId: input.sessionExerciseId,
+      setNumber: input.setNumber,
+      loadValue: input.loadValue ?? null,
+      loadUnit: (input.loadUnit as "kg" | "lb" | "bodyweight" | undefined) ?? null,
+      reps: input.reps ?? null,
+      rir: input.rir ?? null,
+      targetMuscleFeel: input.targetMuscleFeel ?? null,
+      pain: input.pain,
+      source: input.source,
+      idempotencyKey: input.idempotencyKey,
+    });
+  },
+
+  "GET /api/v1/training/sessions": async (ctx, query) => {
+    const db = requireDailyStateDb(ctx);
+    const sessionId = requireQueryText(query, "id");
+    return createTrainingService(db).readBackSession(ctx.userId, sessionId);
+  },
+
+  "POST /api/v1/training/sessions:finish": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as { sessionId: string; finalStatus?: string };
+    if (!input.sessionId) throw new RangeError("sessionId is required");
+    const status = input.finalStatus === "interrupted" ? "interrupted"
+      : input.finalStatus === "cancelled" ? "cancelled" : "completed";
+    const session = await createTrainingService(db)
+      .finishSession(ctx.userId, input.sessionId, status);
+    await createDailyStateService(db, ctx.repo)
+      .persistDailyProjection(ctx.userId, session.sessionDate,
+        process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
+    return session;
+  },
+
+  "POST /api/v1/training/substitutions:propose": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as { sessionId: string; sessionExerciseId: string };
+    if (!input.sessionId || !input.sessionExerciseId) {
+      throw new RangeError("sessionId and sessionExerciseId are required");
+    }
+    return createSubstitutionEngine(db).propose(ctx.userId, input.sessionId, input.sessionExerciseId);
+  },
+
+  "POST /api/v1/training/substitutions:apply": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      sessionId: string;
+      sessionExerciseId: string;
+      chosenSlug: string;
+      reason: string;
+      journeyId?: string;
+    };
+    if (!input.chosenSlug || !input.reason) {
+      throw new RangeError("chosenSlug and reason are required");
+    }
+    const engine = createSubstitutionEngine(db);
+    const proposal = await engine.propose(ctx.userId, input.sessionId, input.sessionExerciseId);
+    return engine.apply({
+      userId: ctx.userId,
+      sessionId: input.sessionId,
+      proposal,
+      chosenSlug: input.chosenSlug,
+      reason: input.reason,
+      journeyId: input.journeyId,
+    });
+  },
+
+  "POST /api/v1/training/reflections": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      sessionId: string;
+      bestCueRefs?: string[];
+      unresolvedIssues?: Array<Record<string, unknown>>;
+      painSummary?: Array<Record<string, unknown>>;
+      proposedAdjustments?: Array<Record<string, unknown>>;
+      nextValidationQuestions?: string[];
+    };
+    if (!input.sessionId) throw new RangeError("sessionId is required");
+    const result = await createReflectionEngine(db).record({
+      userId: ctx.userId,
+      sessionId: input.sessionId,
+      bestCueRefs: input.bestCueRefs,
+      unresolvedIssues: input.unresolvedIssues,
+      painSummary: input.painSummary,
+      proposedAdjustments: input.proposedAdjustments as never,
+      nextValidationQuestions: input.nextValidationQuestions,
+    });
+    await createTrainingService(db).readBackSession(ctx.userId, input.sessionId); // read-back proof
+    return result;
+  },
+
+  "POST /api/v1/training/plans:propose-child": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      reflectionId: string;
+      changes: Array<Record<string, unknown>>;
+      reason: string;
+      previousVersionProblems?: string[];
+      validationQuestions?: string[];
+    };
+    if (!input.reflectionId || !input.reason) {
+      throw new RangeError("reflectionId and reason are required");
+    }
+    return createReflectionEngine(db).proposeChildVersion({
+      userId: ctx.userId,
+      reflectionId: input.reflectionId,
+      changes: input.changes ?? [],
+      reason: input.reason,
+      previousVersionProblems: input.previousVersionProblems,
+      validationQuestions: input.validationQuestions,
+    });
+  },
+
+  "POST /api/v1/training/plans:activate": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as { childVersionId: string };
+    if (!input.childVersionId) throw new RangeError("childVersionId is required");
+    await createReflectionEngine(db).activateChildVersion(ctx.userId, input.childVersionId);
+    return { activated: true, planVersionId: input.childVersionId };
   },
 };
 
