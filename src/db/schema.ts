@@ -455,3 +455,117 @@ export const dailyHealthStateProjection = compass.table("daily_health_state_proj
 }, (t) => [
   unique("daily_health_state_projection_user_date_key").on(t.userId, t.stateDate),
 ]);
+
+// ── M06 / P4: structured training domain ────────────────────────────────────
+// Plans are immutable versions (plan_versions); sessions/set logs are facts;
+// coarse exercise_logs rows are later projected FROM sessions, never hand-fed.
+
+export const exerciseDefinitions = compass.table("exercise_definitions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  slug: text("slug").notNull().unique(),
+  nameZh: text("name_zh").notNull(),
+  nameEn: text("name_en"),
+  aliases: jsonb("aliases").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  movementPattern: text("movement_pattern").notNull(), // horizontal_push | vertical_pull | horizontal_pull | squat | hinge | single_leg | elbow_flexion | elbow_extension | lateral_raise | rear_delt | calf | core
+  trainingPurpose: text("training_purpose").notNull().default("hypertrophy"),
+  primaryMuscles: jsonb("primary_muscles").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  secondaryMuscles: jsonb("secondary_muscles").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  equipment: text("equipment"),
+  stabilityDemand: text("stability_demand").notNull().default("medium"), // low | medium | high
+  contraindicationTags: jsonb("contraindication_tags").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  regressions: jsonb("regressions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  progressions: jsonb("progressions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  ...timestamps()
+});
+
+/** Per-user exercise substitution graph (user may edit; seeded from defaults). */
+export const exerciseSubstitutions = compass.table("exercise_substitutions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  fromExerciseSlug: text("from_exercise_slug").notNull(),
+  toExerciseSlug: text("to_exercise_slug").notNull(),
+  retainedNote: text("retained_note"),
+  lostNote: text("lost_note"),
+  ...timestamps()
+}, (t) => [
+  unique("exercise_substitutions_pair_key").on(t.userId, t.fromExerciseSlug, t.toExerciseSlug),
+]);
+
+export const trainingTemplates = compass.table("training_templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  name: text("name").notNull(), // e.g. "三分化 A 日"
+  dayRole: text("day_role").notNull(), // A | B | C | REST
+  itemsJson: jsonb("items_json").$type<Array<Record<string, unknown>>>().notNull(),
+  cyclePattern: jsonb("cycle_pattern").$type<string[]>(),
+  sourceVersionId: uuid("source_version_id"),
+  ...timestamps()
+});
+
+export const trainingSessions = compass.table("training_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  sessionDate: date("session_date").notNull(),
+  planVersionId: uuid("plan_version_id"),
+  status: text("status").notNull().default("planned"), // planned | in_progress | completed | interrupted | cancelled
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  notes: text("notes"),
+  journeyId: text("journey_id"),
+  ...timestamps()
+}, (t) => [
+  index("training_sessions_user_date_idx").on(t.userId, t.sessionDate),
+]);
+
+export const trainingSessionExercises = compass.table("training_session_exercises", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sessionId: uuid("session_id").notNull()
+    .references(() => trainingSessions.id, { onDelete: "cascade" }),
+  exerciseSlug: text("exercise_slug").notNull(),
+  orderIndex: integer("order_index").notNull().default(0),
+  targetSets: integer("target_sets").notNull().default(3),
+  targetRepRangeLow: integer("target_rep_range_low"),
+  targetRepRangeHigh: integer("target_rep_range_high"),
+  targetRirLow: doublePrecision("target_rir_low"),
+  targetRirHigh: doublePrecision("target_rir_high"),
+  /** When substituted: the original session-exercise this row replaces. */
+  replacementForId: uuid("replacement_for_id"),
+  replacedById: uuid("replaced_by_id"),
+  status: text("status").notNull().default("pending"), // pending | done | skipped | replaced
+  ...timestamps()
+});
+
+export const trainingSetLogs = compass.table("training_set_logs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  sessionExerciseId: uuid("session_exercise_id").notNull()
+    .references(() => trainingSessionExercises.id, { onDelete: "cascade" }),
+  setNumber: integer("set_number").notNull(),
+  loadValue: doublePrecision("load_value"),
+  loadUnit: text("load_unit"), // kg | lb | bodyweight
+  reps: integer("reps"),
+  rir: doublePrecision("rir"),
+  targetMuscleFeel: integer("target_muscle_feel"), // 1..5 subjective
+  painJson: jsonb("pain_json").$type<Array<Record<string, unknown>>>().default(sql`'[]'::jsonb`),
+  performedAt: timestamp("performed_at", { withTimezone: true }).notNull().defaultNow(),
+  source: text("source").notNull().default("ui"),
+  idempotencyKey: text("idempotency_key"),
+  ...timestamps()
+}, (t) => [
+  unique("training_set_logs_exercise_set_key").on(t.sessionExerciseId, t.setNumber),
+]);
+
+export const trainingReflections = compass.table("training_reflections", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  sessionId: uuid("session_id").notNull()
+    .references(() => trainingSessions.id, { onDelete: "cascade" }),
+  completedVsPlannedJson: jsonb("completed_vs_planned_json").$type<Record<string, unknown>>(),
+  bestCueRefs: jsonb("best_cue_refs").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  unresolvedIssuesJson: jsonb("unresolved_issues_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  painSummaryJson: jsonb("pain_summary_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  proposedAdjustmentsJson: jsonb("proposed_adjustments_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  nextValidationQuestions: jsonb("next_validation_questions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
+  proposalPlanVersionId: uuid("proposal_plan_version_id"),
+  userAcceptedAt: timestamp("user_accepted_at", { withTimezone: true }),
+  ...timestamps()
+});
