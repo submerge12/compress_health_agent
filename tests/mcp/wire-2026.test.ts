@@ -1565,35 +1565,124 @@ describe("MCP 2026-07-28 stdio wire", () => {
     });
   }, 20_000);
 
-  it("executes J06 media search and feedback without exposing local paths", async () => {
+  it("executes J06 safe media ranking and feedback without exposing local paths", async () => {
     const binding = `mcp-wire-j06-${process.pid}-${Date.now()}`;
     const marker = `wire-j06-${process.pid}-${Date.now()}`;
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
-    let segmentId = "";
+    const segmentIds = new Map<string, string>();
+    const fixtures = [
+      {
+        key: "curun-confirmed",
+        trainer: "curun",
+        sourceRole: "chest_specialist",
+        reviewStatus: "confirmed",
+        helpfulCount: 0,
+        probeStatus: "ok",
+        fullDecodeStatus: "ok",
+        decodeErrorAtMs: null,
+        usableVideoUntilMs: 60_000,
+        startMs: 1_000,
+        endMs: 5_000,
+      },
+      {
+        key: "tanchengyi-confirmed",
+        trainer: "tanchengyi",
+        sourceRole: "technique_details",
+        reviewStatus: "confirmed",
+        helpfulCount: 0,
+        probeStatus: "ok",
+        fullDecodeStatus: "ok",
+        decodeErrorAtMs: null,
+        usableVideoUntilMs: 60_000,
+        startMs: 6_000,
+        endMs: 10_000,
+      },
+      {
+        key: "curun-draft-popular",
+        trainer: "curun",
+        sourceRole: "chest_specialist",
+        reviewStatus: "draft",
+        helpfulCount: 100,
+        probeStatus: "ok",
+        fullDecodeStatus: "ok",
+        decodeErrorAtMs: null,
+        usableVideoUntilMs: 60_000,
+        startMs: 11_000,
+        endMs: 15_000,
+      },
+      {
+        key: "curun-corrupt-tail",
+        trainer: "curun",
+        sourceRole: "chest_specialist",
+        reviewStatus: "confirmed",
+        helpfulCount: 0,
+        probeStatus: "ok",
+        fullDecodeStatus: "decode_errors",
+        decodeErrorAtMs: 3_000,
+        usableVideoUntilMs: 3_000,
+        startMs: 4_000,
+        endMs: 5_000,
+      },
+      {
+        key: "curun-unprobed",
+        trainer: "curun",
+        sourceRole: "chest_specialist",
+        reviewStatus: "confirmed",
+        helpfulCount: 0,
+        probeStatus: "ok",
+        fullDecodeStatus: "unprobed",
+        decodeErrorAtMs: null,
+        usableVideoUntilMs: 60_000,
+        startMs: 16_000,
+        endMs: 20_000,
+      },
+      {
+        key: "curun-unreadable",
+        trainer: "curun",
+        sourceRole: "chest_specialist",
+        reviewStatus: "confirmed",
+        helpfulCount: 0,
+        probeStatus: "unreadable",
+        fullDecodeStatus: "ok",
+        decodeErrorAtMs: null,
+        usableVideoUntilMs: 60_000,
+        startMs: 21_000,
+        endMs: 25_000,
+      },
+    ] as const;
     try {
-      const [asset] = await sql`
-        INSERT INTO compass_health.media_assets
-          (kind, trainer, source_role, title, local_path, sha256, duration_ms,
-           probe_status, full_decode_status, usable_video_until_ms, content_type, bytes)
-        VALUES
-          ('video', 'tanchengyi', 'technique_details', ${marker}, 'C:\\private\\fixture.mp4',
-           ${marker}, 60000, 'ok', 'ok', 60000, 'video/mp4', 1)
-        RETURNING id`;
-      testMediaAssetIds.add(String(asset!.id));
-      const [pairing] = await sql`
-        INSERT INTO compass_health.media_pairings
-          (video_asset_id, match_method, completeness, usable_until_ms)
-        VALUES (${asset!.id}::uuid, 'manifest', 'complete', 60000)
-        RETURNING id`;
-      const [segment] = await sql`
-        INSERT INTO compass_health.video_segments
-          (pairing_id, start_ms, end_ms, trainer, source_role, title, category,
-           cues_text, review_status)
-        VALUES
-          (${pairing!.id}::uuid, 1000, 5000, 'tanchengyi', 'technique_details',
-           ${marker}, 'correction', ${`${marker} bench cue`}, 'confirmed')
-        RETURNING id`;
-      segmentId = String(segment!.id);
+      for (const fixture of fixtures) {
+        const [asset] = await sql`
+          INSERT INTO compass_health.media_assets
+            (kind, trainer, source_role, title, local_path, sha256, duration_ms,
+             probe_status, full_decode_status, decode_error_at_ms,
+             usable_video_until_ms, content_type, bytes)
+          VALUES
+            ('video', ${fixture.trainer}, ${fixture.sourceRole}, ${`${marker}-${fixture.key}`},
+             ${`C:\\private\\${fixture.key}.mp4`}, ${`${marker}-${fixture.key}`}, 60000,
+             ${fixture.probeStatus}, ${fixture.fullDecodeStatus}, ${fixture.decodeErrorAtMs},
+             ${fixture.usableVideoUntilMs}, 'video/mp4', 1)
+          RETURNING id`;
+        testMediaAssetIds.add(String(asset!.id));
+        const [pairing] = await sql`
+          INSERT INTO compass_health.media_pairings
+            (video_asset_id, match_method, completeness, subtitle_end_ms, usable_until_ms)
+          VALUES (${asset!.id}::uuid, 'manifest', 'complete', 60000, 60000)
+          RETURNING id`;
+        const [segment] = await sql`
+          INSERT INTO compass_health.video_segments
+            (pairing_id, start_ms, end_ms, trainer, source_role, title, body_part,
+             movement_pattern, exercise_slug, category, cues_text, review_status,
+             helpful_count)
+          VALUES
+            (${pairing!.id}::uuid, ${fixture.startMs}, ${fixture.endMs},
+             ${fixture.trainer}, ${fixture.sourceRole}, ${`${marker}-${fixture.key}`},
+             'chest', 'horizontal_push', 'barbell-bench-press', 'correction',
+             ${`${marker} bench chest correction cue`}, ${fixture.reviewStatus},
+             ${fixture.helpfulCount})
+          RETURNING id`;
+        segmentIds.set(fixture.key, String(segment!.id));
+      }
     } finally {
       await sql.end({ timeout: 3 });
     }
@@ -1605,27 +1694,63 @@ describe("MCP 2026-07-28 stdio wire", () => {
       idempotencyKey: "wire-j06-run",
     }));
     const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
-    const searched = await client.request(toolCall(2, "health_search_training_media", {
+    const searchArgs = {
       text: marker,
-      limit: 5,
-    }));
+      movementPattern: "horizontal_push",
+      bodyPart: "chest",
+      category: "correction",
+      limit: 10,
+    };
+    const searched = await client.request(toolCall(2, "health_search_training_media", searchArgs));
     const segments = (searched.result?.structuredContent as {
-      segments: Array<{ segmentId: string; streamUrl: string; localPath?: string }>;
+      segments: Array<{
+        segmentId: string;
+        trainer: string;
+        sourceRole: string;
+        reviewStatus: string;
+        streamUrl: string;
+        localPath?: string;
+      }>;
     }).segments;
-    expect(segments).toEqual(expect.arrayContaining([
-      expect.objectContaining({ segmentId, streamUrl: `/api/v1/media/segments/${segmentId}/stream` }),
-    ]));
-    expect(segments.find((segment) => segment.segmentId === segmentId)?.localPath).toBeUndefined();
+    const ids = segments.map((segment) => segment.segmentId);
+    expect(ids).not.toContain(segmentIds.get("curun-corrupt-tail"));
+    expect(ids).not.toContain(segmentIds.get("curun-unprobed"));
+    expect(ids).not.toContain(segmentIds.get("curun-unreadable"));
+    expect(ids.slice(0, 2)).toEqual([
+      segmentIds.get("curun-confirmed"),
+      segmentIds.get("tanchengyi-confirmed"),
+    ]);
+    expect(ids.indexOf(segmentIds.get("curun-draft-popular")!)).toBeGreaterThan(1);
+    expect(segments[0]).toMatchObject({
+      trainer: "curun",
+      sourceRole: "chest_specialist",
+      reviewStatus: "confirmed",
+      streamUrl: `/api/v1/media/segments/${segmentIds.get("curun-confirmed")}/stream`,
+    });
+    expect(segments.every((segment) => segment.localPath === undefined)).toBe(true);
 
-    const feedback = await client.request(toolCall(3, "health_record_media_feedback", {
-      runHandle,
-      segmentId,
-      helpful: true,
-      note: "clear cue",
-      idempotencyKey: "wire-j06-feedback",
-    }));
-    expect(feedback.result?.structuredContent).toMatchObject({ segmentId, helpful: true });
-  }, 25_000);
+    for (let index = 0; index < 3; index += 1) {
+      const feedback = await client.request(toolCall(3 + index, "health_record_media_feedback", {
+        runHandle,
+        segmentId: segmentIds.get("curun-confirmed"),
+        helpful: false,
+        note: "did not resolve the cue",
+        idempotencyKey: `wire-j06-feedback-${index}`,
+      }));
+      expect(feedback.result?.structuredContent).toMatchObject({
+        segmentId: segmentIds.get("curun-confirmed"),
+        helpful: false,
+      });
+    }
+
+    const reranked = await client.request(toolCall(6, "health_search_training_media", searchArgs));
+    const rerankedSegments = (reranked.result?.structuredContent as {
+      segments: Array<{ segmentId: string; reviewStatus: string }>;
+    }).segments;
+    const rerankedIds = rerankedSegments.map((segment) => segment.segmentId);
+    expect(rerankedIds[0]).toBe(segmentIds.get("tanchengyi-confirmed"));
+    expect(rerankedIds.indexOf(segmentIds.get("curun-draft-popular")!)).toBeGreaterThan(1);
+  }, 35_000);
 
   it("executes J07 reflection, child proposal, and confirmed activation", async () => {
     const binding = `mcp-wire-j07-${process.pid}-${Date.now()}`;

@@ -43,6 +43,11 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
   let dir: string;
   let feedbackUserId: string;
   const videoDurationMs = 10 * 60_000; // 10 minutes
+  const cleanDecode = {
+    fullDecodeStatus: "ok" as const,
+    decodeErrorAtMs: null,
+    usableVideoUntilMs: videoDurationMs,
+  };
 
   beforeAll(async () => {
     dir = await mkdtemp(path.join(tmpdir(), "media-test-"));
@@ -52,6 +57,7 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
     await writeFile(path.join(dir, "video-truncated.mp4"), Buffer.alloc(1024, 1));
     await writeFile(path.join(dir, "video-nosub.mp4"), Buffer.alloc(1024, 2));
     await writeFile(path.join(dir, "video-complete.mp4"), Buffer.alloc(1024, 3));
+    await writeFile(path.join(dir, "video-corrupt-tail.mp4"), Buffer.alloc(1024, 4));
     await writeFile(path.join(dir, "sub-full.srt"), srt([
       ["1", "00:00:01,000", "00:00:04,000"],
       ["2", "00:09:30,000", "00:09:50,000"], // ends near video end → complete
@@ -59,6 +65,10 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
     await writeFile(path.join(dir, "sub-short.srt"), srt([
       ["1", "00:00:01,000", "00:00:04,000"],
       ["2", "00:04:00,000", "00:04:20,000"], // ends at 4:20 of a 10min video → truncated
+    ]));
+    await writeFile(path.join(dir, "sub-corrupt-tail.srt"), srt([
+      ["1", "00:00:01,000", "00:00:04,000"],
+      ["2", "00:09:30,000", "00:09:50,000"],
     ]));
   });
 
@@ -89,7 +99,7 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
       title: "截断测试",
       localPath: path.join(dir, "video-truncated.mp4"),
       srtPath: path.join(dir, "sub-short.srt"),
-    }, { videoDurationMs });
+    }, { videoDurationMs, decodeValidation: cleanDecode });
 
     expect(completeness).toBe("subtitle_truncated");
     const [pairing] = await db.select().from(schema.mediaPairings)
@@ -115,8 +125,39 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
       sourceRole: "chest_specialist",
       title: "无字幕测试",
       localPath: path.join(dir, "video-nosub.mp4"),
-    }, { videoDurationMs });
+    }, { videoDurationMs, decodeValidation: cleanDecode });
     expect(completeness).toBe("missing_subtitle");
+  });
+
+  it("caps the pairing and indexed segments at the first full-decode error", async () => {
+    const importer = createMediaImporter(db);
+    const options = {
+      videoDurationMs,
+      decodeValidation: {
+        fullDecodeStatus: "decode_errors" as const,
+        decodeErrorAtMs: 180_000,
+        usableVideoUntilMs: 180_000,
+      },
+    };
+    const { pairingId, completeness } = await importer.importEntry({
+      trainer: "curun",
+      sourceRole: "chest_specialist",
+      title: "损坏尾段测试",
+      localPath: path.join(dir, "video-corrupt-tail.mp4"),
+      srtPath: path.join(dir, "sub-corrupt-tail.srt"),
+    }, options);
+    expect(completeness).toBe("video_decode_error");
+    const [pairing] = await db.select().from(schema.mediaPairings)
+      .where(eq(schema.mediaPairings.id, pairingId));
+    expect(pairing?.usableUntilMs).toBe(180_000);
+
+    await createMediaIndexer(db).indexPairing(pairingId, [
+      { index: 1, startMs: 60_000, endMs: 120_000, text: "完整可解码前段" },
+      { index: 2, startMs: 200_000, endMs: 240_000, text: "解码错误后的损坏尾段" },
+    ]);
+    const segments = await db.select().from(schema.videoSegments)
+      .where(eq(schema.videoSegments.pairingId, pairingId));
+    expect(segments.map((segment) => segment.startMs)).toEqual([60_000]);
   });
 
   it("re-import is idempotent and search exposes completeness + role rules", async () => {
@@ -128,8 +169,8 @@ describe.skipIf(!isDbAvailable)("media pipeline invariants", () => {
       localPath: path.join(dir, "video-complete.mp4"),
       srtPath: path.join(dir, "sub-full.srt"),
     };
-    const first = await importer.importEntry(entry, { videoDurationMs });
-    const second = await importer.importEntry(entry, { videoDurationMs });
+    const first = await importer.importEntry(entry, { videoDurationMs, decodeValidation: cleanDecode });
+    const second = await importer.importEntry(entry, { videoDurationMs, decodeValidation: cleanDecode });
     expect(second.pairingId).toBe(first.pairingId);
 
     const assets = await db.select().from(schema.mediaAssets)

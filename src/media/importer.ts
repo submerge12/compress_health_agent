@@ -17,7 +17,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-import { validateFullDecode } from "./decode-validator.js";
+import { validateFullDecode, type DecodeValidation } from "./decode-validator.js";
 
 async function fileSizeBytes(filePath: string): Promise<number> {
   try {
@@ -122,6 +122,8 @@ export function createMediaImporter(db: Db) {
   async function importEntry(entry: ManifestVideo, options?: {
     videoDurationMs?: number | null; // pre-probed (tests); skips ffprobe
     skipDecodeValidation?: boolean; // tests; skips the expensive full decode
+    /** Deterministic full-decode result for tests and offline import orchestration. */
+    decodeValidation?: DecodeValidation;
   }): Promise<{ pairingId: string; completeness: string }> {
     const videoSha = await sha256File(entry.localPath);
     const videoDuration = options?.videoDurationMs !== undefined
@@ -129,10 +131,13 @@ export function createMediaImporter(db: Db) {
       : await probeDurationMs(entry.localPath);
     // WO-HS-09: header probe is not enough; fully decode to find mid-file
     // corruption. Tests may skip this via options.skipDecodeValidation.
-    let decode: Awaited<ReturnType<typeof validateFullDecode>> | null = null;
-    if (!options?.videoDurationMs && !options?.skipDecodeValidation) {
-      decode = await validateFullDecode(entry.localPath);
-    }
+    const decode = options?.decodeValidation
+      ?? (options?.skipDecodeValidation ? null : await validateFullDecode(entry.localPath));
+    const storedDecode = decode ?? {
+      fullDecodeStatus: "unprobed" as const,
+      decodeErrorAtMs: null,
+      usableVideoUntilMs: null,
+    };
 
     const [videoAsset] = await db.insert(schema.mediaAssets).values({
       kind: "video",
@@ -146,11 +151,9 @@ export function createMediaImporter(db: Db) {
       durationMs: videoDuration,
       probeStatus: videoDuration === null ? "unreadable" : "ok",
       contentType: "video/mp4",
-      ...(decode !== null ? {
-        fullDecodeStatus: decode.fullDecodeStatus,
-        decodeErrorAtMs: decode.decodeErrorAtMs,
-        usableVideoUntilMs: decode.usableVideoUntilMs,
-      } : {}),
+      fullDecodeStatus: storedDecode.fullDecodeStatus,
+      decodeErrorAtMs: storedDecode.decodeErrorAtMs,
+      usableVideoUntilMs: storedDecode.usableVideoUntilMs,
       bytes: await fileSizeBytes(entry.localPath),
     }).onConflictDoUpdate({
       target: [schema.mediaAssets.sha256, schema.mediaAssets.kind],
@@ -160,11 +163,9 @@ export function createMediaImporter(db: Db) {
         sourceRole: entry.sourceRole,
         durationMs: videoDuration,
         probeStatus: videoDuration === null ? "unreadable" : "ok",
-        ...(decode !== null ? {
-          fullDecodeStatus: decode.fullDecodeStatus,
-          decodeErrorAtMs: decode.decodeErrorAtMs,
-          usableVideoUntilMs: decode.usableVideoUntilMs,
-        } : {}),
+        fullDecodeStatus: storedDecode.fullDecodeStatus,
+        decodeErrorAtMs: storedDecode.decodeErrorAtMs,
+        usableVideoUntilMs: storedDecode.usableVideoUntilMs,
         updatedAt: new Date(),
       },
     }).returning();
@@ -203,8 +204,16 @@ export function createMediaImporter(db: Db) {
     let gapSeconds: number | null = null;
     let usableUntilMs: number | null = null;
 
-    if (!videoDuration) {
+    if (!videoDuration || decode?.fullDecodeStatus === "failed") {
       completeness = "video_decode_error";
+    } else if (decode?.fullDecodeStatus === "decode_errors") {
+      completeness = "video_decode_error";
+      usableUntilMs = minimumPositive(
+        videoDuration,
+        subtitleEndMs,
+        decode.usableVideoUntilMs,
+        decode.decodeErrorAtMs,
+      );
     } else if (subtitleId === null) {
       completeness = "missing_subtitle";
     } else if (subtitleEndMs === null || subtitleEndMs <= 0) {
@@ -213,10 +222,19 @@ export function createMediaImporter(db: Db) {
       gapSeconds = Math.round((videoDuration - subtitleEndMs) / 1000);
       if (gapSeconds > TRUNCATION_TOLERANCE_MS / 1000) {
         completeness = "subtitle_truncated";
-        usableUntilMs = subtitleEndMs;
+        usableUntilMs = minimumPositive(
+          subtitleEndMs,
+          decode?.usableVideoUntilMs ?? videoDuration,
+        );
       } else {
         completeness = "complete";
-        usableUntilMs = videoDuration;
+        // A complete subtitle may still end a few seconds before the video.
+        // Never claim an evidence window beyond the final subtitle cue.
+        usableUntilMs = minimumPositive(
+          videoDuration,
+          subtitleEndMs,
+          decode?.usableVideoUntilMs ?? videoDuration,
+        );
       }
     }
 
@@ -256,6 +274,13 @@ export function createMediaImporter(db: Db) {
   }
 
   return { importEntry };
+}
+
+function minimumPositive(...values: Array<number | null | undefined>): number | null {
+  const candidates = values.filter(
+    (value): value is number => value !== null && value !== undefined && Number.isFinite(value) && value > 0,
+  );
+  return candidates.length > 0 ? Math.min(...candidates) : null;
 }
 
 export function defaultManifest(downloadsDir: string, douyinDir: string): ManifestVideo[] {

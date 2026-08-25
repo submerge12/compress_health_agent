@@ -11,7 +11,7 @@
  *   chest_specialist / technique_details may explain and correct but NEVER
  *   add sets to the main program (enforced here, not by prompt).
  */
-import { and, asc, desc, eq, gte, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -46,12 +46,20 @@ export function createMediaIndexer(db: Db) {
       .limit(1);
     if (!video) throw new RangeError("video asset not found");
 
-    const usableUntil = pairing.usableUntilMs ?? Number.MAX_SAFE_INTEGER;
+    const usableUntil = effectiveUsableUntil(pairing, video);
+    if (
+      usableUntil === null
+      || video.probeStatus !== "ok"
+      || !["ok", "decode_errors"].includes(video.fullDecodeStatus)
+    ) {
+      return { created: 0 };
+    }
 
     const windows: Array<{ startMs: number; endMs: number; texts: string[] }> = [];
     let current: { startMs: number; endMs: number; texts: string[] } | null = null;
     for (const cue of cues) {
       if (cue.startMs >= usableUntil) break; // truncated tail produces no evidence
+      if (cue.endMs > usableUntil) continue;
       if (
         current !== null &&
         (cue.endMs - current.startMs > MAX_WINDOW_MS ||
@@ -134,6 +142,27 @@ export interface SearchQuery {
   limit?: number;
 }
 
+function minimumPositive(...values: Array<number | null | undefined>): number | null {
+  const candidates = values.filter(
+    (value): value is number => value !== null && value !== undefined && Number.isFinite(value) && value > 0,
+  );
+  return candidates.length > 0 ? Math.min(...candidates) : null;
+}
+
+function effectiveUsableUntil(
+  pairing: typeof schema.mediaPairings.$inferSelect,
+  asset: typeof schema.mediaAssets.$inferSelect,
+): number | null {
+  if (pairing.usableUntilMs === null || pairing.subtitleEndMs === null) return null;
+  const assetLimit = asset.fullDecodeStatus === "ok"
+    ? (asset.usableVideoUntilMs ?? asset.durationMs)
+    : asset.fullDecodeStatus === "decode_errors"
+      ? minimumPositive(asset.usableVideoUntilMs, asset.decodeErrorAtMs)
+      : null;
+  if (assetLimit === null) return null;
+  return minimumPositive(pairing.usableUntilMs, pairing.subtitleEndMs, assetLimit);
+}
+
 export function createMediaRetrieval(db: Db) {
   /**
    * P0-7: ONE SQL statement — filters, text matching, ordering and limit all
@@ -157,11 +186,37 @@ export function createMediaRetrieval(db: Db) {
     reviewStatus: string;
     helpfulCount: number;
     notHelpfulCount: number;
+    fullDecodeStatus: string;
+    decodeErrorAtMs: number | null;
   }>> {
+    const assetSafetyLimit = sql<number>`CASE
+      WHEN ${schema.mediaAssets.fullDecodeStatus} = 'ok'
+        THEN COALESCE(${schema.mediaAssets.usableVideoUntilMs}, ${schema.mediaAssets.durationMs})
+      WHEN ${schema.mediaAssets.fullDecodeStatus} = 'decode_errors'
+        THEN LEAST(
+          COALESCE(${schema.mediaAssets.usableVideoUntilMs}, ${schema.mediaAssets.decodeErrorAtMs}),
+          COALESCE(${schema.mediaAssets.decodeErrorAtMs}, ${schema.mediaAssets.usableVideoUntilMs})
+        )
+      ELSE NULL
+    END`;
+    const effectiveLimit = sql<number>`CASE
+      WHEN ${schema.mediaPairings.usableUntilMs} IS NULL
+        OR ${schema.mediaPairings.subtitleEndMs} IS NULL
+        OR ${assetSafetyLimit} IS NULL
+        THEN NULL
+      ELSE LEAST(
+        ${schema.mediaPairings.usableUntilMs},
+        ${schema.mediaPairings.subtitleEndMs},
+        ${assetSafetyLimit}
+      )
+    END`;
     const conditions = [
       isNull(schema.videoSegments.supersededById),
-      // Only segments inside the usable window of a paired video qualify.
-      gte(schema.mediaPairings.usableUntilMs, schema.videoSegments.endMs),
+      eq(schema.mediaAssets.probeStatus, "ok"),
+      inArray(schema.mediaAssets.fullDecodeStatus, ["ok", "decode_errors"]),
+      // Recompute the effective limit at read time so stale pairing metadata
+      // cannot expose a segment beyond an asset or subtitle safety boundary.
+      gte(effectiveLimit, schema.videoSegments.endMs),
     ];
     if (query.movementPattern) conditions.push(eq(schema.videoSegments.movementPattern, query.movementPattern));
     if (query.bodyPart) conditions.push(eq(schema.videoSegments.bodyPart, query.bodyPart));
@@ -173,6 +228,26 @@ export function createMediaRetrieval(db: Db) {
         sql`${schema.videoSegments.title} ILIKE ${like}`,
       )!);
     }
+
+    const chestCorrection = query.category === "correction"
+      || query.bodyPart === "chest"
+      || query.movementPattern === "horizontal_push"
+      || /(?:chest|bench|卧推|胸)/iu.test(query.text ?? "");
+    const reviewRank = sql<number>`CASE ${schema.videoSegments.reviewStatus}
+      WHEN 'confirmed' THEN 0
+      WHEN 'draft' THEN 1
+      ELSE 2
+    END`;
+    const contextualRoleBoost = chestCorrection
+      ? sql<number>`CASE ${schema.videoSegments.sourceRole}
+          WHEN 'chest_specialist' THEN 2
+          ELSE 0
+        END`
+      : sql<number>`0`;
+    const feedbackScore = sql<number>`
+      ${schema.videoSegments.helpfulCount}
+      - ${schema.videoSegments.notHelpfulCount}
+      + ${contextualRoleBoost}`;
 
     const rows = await db.select({
       id: schema.videoSegments.id,
@@ -187,7 +262,7 @@ export function createMediaRetrieval(db: Db) {
       helpfulCount: schema.videoSegments.helpfulCount,
       notHelpfulCount: schema.videoSegments.notHelpfulCount,
       completeness: schema.mediaPairings.completeness,
-      usableUntilMs: schema.mediaPairings.usableUntilMs,
+      usableUntilMs: effectiveLimit,
       decodeErrorAtMs: schema.mediaAssets.decodeErrorAtMs,
       fullDecodeStatus: schema.mediaAssets.fullDecodeStatus,
     })
@@ -195,11 +270,11 @@ export function createMediaRetrieval(db: Db) {
       .innerJoin(schema.mediaPairings, eq(schema.videoSegments.pairingId, schema.mediaPairings.id))
       .innerJoin(schema.mediaAssets, eq(schema.mediaPairings.videoAssetId, schema.mediaAssets.id))
       .where(and(...conditions))
-      // Deterministic ranking: confirmed first, then community signal,
-      // then position — identical inputs always yield identical order.
+      // Explicit review ordering avoids relying on lexical status order.
+      // Within a review tier, contextual role and feedback remain adaptive.
       .orderBy(
-        desc(schema.videoSegments.reviewStatus),
-        desc(sql`${schema.videoSegments.helpfulCount} - ${schema.videoSegments.notHelpfulCount}`),
+        asc(reviewRank),
+        desc(feedbackScore),
         asc(schema.videoSegments.startMs),
         asc(schema.videoSegments.id),
       )
