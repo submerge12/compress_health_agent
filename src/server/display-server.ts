@@ -435,78 +435,16 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     if (!input.proposalId) {
       throw new DomainHttpError(400, "proposal_required", "call GET /api/v1/training/prepare first and pass proposalId");
     }
+    // P0-3: consumption + session creation are one transaction inside the
+    // service; the route can no longer split them.
     try {
-      const consumed = await createPreparedSessionService(db).consumeValidProposal({
+      return await createPreparedSessionService(db).startSessionFromProposal({
         userId: ctx.userId,
         proposalId: input.proposalId,
         sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
-        dayRole: input.dayRole ?? "A",
+        ...(input.dayRole !== undefined ? { dayRole: input.dayRole } : {}),
+        journeyId: input.journeyId,
       });
-      const items = ((consumed.proposalJson.proposedExercises ?? []) as Array<Record<string, unknown>>).map((raw) => {
-        const item = raw as { order?: unknown; exerciseSlug?: unknown; sets?: unknown;
-          repRangeLow?: unknown; repRangeHigh?: unknown; rirLow?: unknown; rirHigh?: unknown };
-        return {
-          order: Number(item.order ?? 0),
-          exerciseSlug: String(item.exerciseSlug ?? ""),
-          sets: Number(item.sets ?? 3),
-          repRangeLow: item.repRangeLow === undefined ? null : Number(item.repRangeLow),
-          repRangeHigh: item.repRangeHigh === undefined ? null : Number(item.repRangeHigh),
-          rirLow: item.rirLow === undefined ? null : Number(item.rirLow),
-          rirHigh: item.rirHigh === undefined ? null : Number(item.rirHigh),
-        };
-      });
-      const dayRoleMatch = String((consumed.proposalJson as { dayRole?: string }).dayRole ?? input.dayRole ?? "A").trim().toUpperCase();
-      const dayRole = (["A", "B", "C"].includes(dayRoleMatch) ? dayRoleMatch : "A") as "A" | "B" | "C";
-
-      try {
-        return await createTrainingService(db).startSessionFromProposal({
-          userId: ctx.userId,
-          sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
-          dayRole,
-          planVersionId: consumed.planVersionId ?? undefined,
-          exercises: items.map((item, index) => ({
-            order: item.order || index + 1,
-            exerciseSlug: item.exerciseSlug,
-            sets: item.sets,
-            repRangeLow: item.repRangeLow === null ? undefined : item.repRangeLow,
-            repRangeHigh: item.repRangeHigh === null ? undefined : item.repRangeHigh,
-            rirLow: item.rirLow === null ? undefined : item.rirLow,
-            rirHigh: item.rirHigh === null ? undefined : item.rirHigh,
-          })),
-          journeyId: input.journeyId,
-        });
-      } catch (inner) {
-        if (inner instanceof RangeError && String(inner.message).includes("no template")) {
-          // Proposal-driven start does not need the template; fall through to
-          // the proposal-based creation below.
-        } else {
-          throw inner;
-        }
-      }
-
-      // Proposal-based session creation without template lookup.
-      const [session] = await db.insert(trainingSessionsTable).values({
-        userId: ctx.userId,
-        sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
-        planVersionId: consumed.planVersionId ?? null,
-        status: "in_progress",
-        startedAt: new Date(),
-        journeyId: input.journeyId ?? null,
-      }).returning();
-      if (!session) throw new Error("session insert returned no row");
-      if (items.length > 0) {
-        await db.insert(trainingSessionExercisesTable).values(items.map((item) => ({
-          sessionId: session.id,
-          exerciseSlug: item.exerciseSlug,
-          orderIndex: item.order,
-          targetSets: item.sets,
-          targetRepRangeLow: item.repRangeLow ?? null,
-          targetRepRangeHigh: item.repRangeHigh ?? null,
-          targetRirLow: item.rirLow ?? null,
-          targetRirHigh: item.rirHigh ?? null,
-        })));
-      }
-      return session;
     } catch (error) {
       if (error instanceof ProposalStaleError) {
         throw Errors.conflict("proposal_stale", `training proposal is stale (${error.reason}); re-run prepare`);
@@ -532,7 +470,22 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     await createDailyStateService(db, ctx.repo)
       .persistDailyProjection(ctx.userId, session.sessionDate,
         process.env["COMPASS_HEALTH_TIMEZONE"] ?? "Asia/Shanghai");
-    return session;
+    // P0-5: a completed working day explicitly advances the cycle position.
+    let cycle: unknown = null;
+    if (status === "completed") {
+      try {
+        const { createCycleEngine } = await import("../training/cycle-engine.js");
+        cycle = await createCycleEngine(db).recordCycleOutcome({
+          userId: ctx.userId,
+          sessionId: input.sessionId,
+          outcome: "completed",
+          onDate: session.sessionDate,
+        });
+      } catch {
+        cycle = null;
+      }
+    }
+    return { ...session, cycle };
   },
 
   "POST /api/v1/training/substitutions:propose": async (ctx, _query, body) => {
@@ -547,21 +500,22 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
   "POST /api/v1/training/substitutions:apply": async (ctx, _query, body) => {
     const db = requireDailyStateDb(ctx);
     const input = cast(body) as {
-      sessionId: string;
-      sessionExerciseId: string;
+      substitutionProposalId?: string;
       chosenSlug: string;
       reason: string;
       journeyId?: string;
     };
+    if (!input.substitutionProposalId) {
+      throw new DomainHttpError(400, "proposal_required", "pass the substitutionProposalId returned by substitutions:propose");
+    }
     if (!input.chosenSlug || !input.reason) {
       throw new RangeError("chosenSlug and reason are required");
     }
-    const engine = createSubstitutionEngine(db);
-    const proposal = await engine.propose(ctx.userId, input.sessionId, input.sessionExerciseId);
-    return engine.apply({
+    // P0-6: apply reads the PERSISTED proposal; the client cannot re-assemble
+    // a proposal body or re-propose inline.
+    return createSubstitutionEngine(db).apply({
       userId: ctx.userId,
-      sessionId: input.sessionId,
-      proposal,
+      substitutionProposalId: input.substitutionProposalId,
       chosenSlug: input.chosenSlug,
       reason: input.reason,
       journeyId: input.journeyId,
@@ -634,7 +588,7 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     });
   },
 
-  // ── WO-HS-09 / M23: authenticated range streaming for a segment's video ──
+  // ── WO-HS-09 / P0-7: authenticated range streaming for a segment's video ──
   "GET /api/v1/media/segments/:id/stream": async (ctx, query, _body, request) => {
     const db = requireDailyStateDb(ctx);
     const segmentId = requireQueryText(query, "id");
@@ -649,46 +603,61 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       .where(eq(schemaRef.mediaAssets.id, pairing.videoAssetId)).limit(1);
     if (!video) throw new DomainHttpError(404, "not_found", "video not found");
 
-    // Never expose local absolute paths; only byte ranges inside the usable window.
-    const usableUntilMs = Math.min(
-      video.usableVideoUntilMs ?? pairing.usableUntilMs ?? Number.MAX_SAFE_INTEGER,
-      video.durationMs ?? Number.MAX_SAFE_INTEGER,
-    );
-    void usableUntilMs;
-
-    const { stat, createReadStream } = await import("node:fs");
-    const statAsync = (await import("node:fs/promises")).stat;
+    const nodeFs = await import("node:fs");
+    const statAsync = nodeFs.promises.stat;
+    const createReadStream = nodeFs.createReadStream;
     let total = 0;
     try {
       total = (await statAsync(video.localPath)).size;
     } catch {
       throw new DomainHttpError(503, "media_unavailable", "media file is not accessible on this host");
     }
-    void stat;
 
-    const rangeHeader = request?.headers?.range ?? "";
-    const match = /bytes=(\d*)-(\d*)/.exec(String(rangeHeader));
+    // Byte-range clamp to the USABLE window: bytes before the window start are
+    // served only as part of a range that begins inside it; nothing beyond the
+    // truncated tail is ever sent.
+    const bytesPerMs = total / Math.max(video.durationMs ?? 0, 1);
+    const usableUntilByte = Number.isFinite(bytesPerMs) && bytesPerMs > 0
+      ? Math.min(total - 1, Math.floor(Math.min(
+          video.usableVideoUntilMs ?? pairing.usableUntilMs ?? Number.MAX_SAFE_INTEGER,
+          video.durationMs ?? Number.MAX_SAFE_INTEGER,
+        ) * bytesPerMs))
+      : total - 1;
+
+    // Any Range header → 206 semantics; malformed/unsatisfiable → 416.
+    const rangeHeader = request?.headers?.range;
     let start = 0;
-    let end = Math.min(total - 1, Math.max(total - 1, 0));
-    if (match) {
-      start = match[1] === undefined || match[1] === "" ? 0 : Number(match[1]);
-      end = match[2] === undefined || match[2] === "" ? total - 1 : Number(match[2]);
-      end = Math.min(end, total - 1);
+    let end = usableUntilByte;
+    let isRange = false;
+    if (rangeHeader !== undefined && String(rangeHeader) !== "") {
+      isRange = true;
+      const match = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
+      if (!match || (match[1] === "" && match[2] === "")) {
+        return { error: "invalid_range" } as never; // mapped to 416 by transport
+      }
+      start = match[1] === "" ? 0 : Number(match[1]);
+      end = match[2] === "" ? usableUntilByte : Math.min(Number(match[2]), usableUntilByte);
+      if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+        return { error: "range_not_satisfiable" } as never;
+      }
     }
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+    if (start > usableUntilByte) {
       return { error: "range_not_satisfiable" } as never;
     }
+    end = Math.min(end, usableUntilByte);
 
     const rawResponse = request.raw;
     if (rawResponse === undefined) {
       return { error: "streaming_unsupported_in_test_mode" };
     }
-    rawResponse.writeHead(start > 0 ? 206 : 200, {
-      "Content-Type": "video/mp4",
+    rawResponse.writeHead(isRange ? 206 : 200, {
+      "Content-Type": video.contentType,
       "Content-Length": String(end - start + 1),
       "Accept-Ranges": "bytes",
-      "Content-Range": `bytes ${start}-${end}/${total}`,
+      ...(isRange ? { "Content-Range": `bytes ${start}-${end}/${total}` } : {}),
       "Cache-Control": "no-store",
+      "X-Content-Type-Options": "nosniff",
+      // localPath is never exposed in the body or headers.
     });
     await new Promise<void>((resolve) => {
       const stream = createReadStream(video.localPath, { start, end });

@@ -13,7 +13,7 @@
   },
   "planner": {
     "status": "planned",
-    "elapsedMs": 31.9,
+    "elapsedMs": 45.4,
     "entryCount": 21,
     "distinctDishCount": 10,
     "hardViolations": [],

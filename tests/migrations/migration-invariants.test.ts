@@ -78,7 +78,9 @@ describe("migrations (live, throwaway databases)", () => {
   it("clean database: full run then idempotent re-run, gate passes", async () => {
     const first = await migrate(cleanUrl);
     expect(first.applied).toHaveLength(allMigrations.length);
-    expect(allMigrations.length).toBe(14);
+    // The migration set must keep growing with the code; the gate requires
+    // at least this many applied files.
+    expect(allMigrations.length).toBeGreaterThanOrEqual(MIN_SCHEMA_VERSION);
     expect(first.applied[0]).toMatch(/^0000_/);
 
     const second = await migrate(cleanUrl);

@@ -1,15 +1,20 @@
 /**
- * WO-HS-07 / M21: training cycle engine and readiness policy.
+ * P0-5 / M21: training cycle engine and readiness policy.
  *
- * Cycle decision is explainable and data-driven: next position in the active
- * plan's cyclePattern, adjusted by recent completion and body state. In
- * shadow mode (default) the recommendation is advisory only — it never
- * silently changes the active plan (plan §十).
+ * The cycle is EXPLICIT state now: training_cycle_instances /
+ * training_cycle_positions advance one position per finished or skipped
+ * working day. Readiness is judged per movement-pattern family of the
+ * CANDIDATE training day — shoulder pain must not block safe leg work, knee
+ * pain must not block safe upper-body work. Fatigue requires an explicit
+ * structured payload ({level, scope}) — the mere existence of a fatigue row
+ * no longer forces REST. In shadow mode the recommendation stays advisory:
+ * it never silently changes the active plan (plan §十).
  */
-import { and, desc, eq, gte, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
+import { THREE_SPLIT_DAYS } from "./three-split.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -18,14 +23,41 @@ export interface CycleDecision {
   reasonCodes: string[];
   adjustments: string[];
   requiresConfirmation: boolean;
+  /** Explicit cycle bookkeeping returned so callers can inspect progress. */
+  cycleInstanceId?: string;
+  positionIndex?: number;
 }
 
 const DEFAULT_CYCLE = ["A", "B", "REST", "C", "REST"];
 
+/** Movement patterns each A/B/C reference day trains (from the seed program). */
+function patternsForRole(role: string): string[] {
+  const day = THREE_SPLIT_DAYS.find((d) => d.dayRole === role);
+  const patterns = new Set<string>();
+  for (const item of day?.items ?? []) {
+    if (typeof item.movementPattern === "string") patterns.add(item.movementPattern);
+  }
+  return [...patterns];
+}
+
+interface StructuredFatigue {
+  level: number;
+  scope?: "general" | "local" | string;
+  feedback?: unknown;
+}
+
+/** Fatigue counts as high ONLY with explicit structured evidence. */
+function fatigueIsHigh(value: unknown): { high: boolean; level?: number } {
+  const f = value as Partial<StructuredFatigue> | null | undefined;
+  const level = typeof f?.level === "number" ? f.level : undefined;
+  // Legacy rows without a numeric level are NOT treated as high fatigue.
+  return { high: typeof level === "number" && level >= 4, level };
+}
+
 export function createCycleEngine(db: Db) {
   /**
-   * Decide today's training day from the active cycle pattern + recent history
-   * + body observations. Purely derived; no writes.
+   * Decide today's training day from explicit cycle positions + body state.
+   * Purely derived; no writes. Positions are advanced by recordCycleOutcome.
    */
   async function decide(userId: string, onDate: string): Promise<CycleDecision> {
     const [assignment] = await db.select().from(schema.activePlanAssignments)
@@ -40,41 +72,44 @@ export function createCycleEngine(db: Db) {
       if (content?.cyclePattern && content.cyclePattern.length > 0) pattern = content.cyclePattern;
     }
 
-    // Recent completed sessions (last 14 days), oldest first.
-    const since = new Date(Date.now() - 14 * 86400_000).toISOString().slice(0, 10);
-    const recent = await db.select().from(schema.trainingSessions)
+    // The active cycle instance holds the explicit next-position cursor.
+    const [instance] = await db.select().from(schema.trainingCycleInstances)
       .where(and(
-        eq(schema.trainingSessions.userId, userId),
-        eq(schema.trainingSessions.status, "completed"),
-        gte(schema.trainingSessions.sessionDate, since),
+        eq(schema.trainingCycleInstances.userId, userId),
+        eq(schema.trainingCycleInstances.status, "active"),
       ))
-      .orderBy(schema.trainingSessions.sessionDate);
+      .orderBy(desc(schema.trainingCycleInstances.startedAt))
+      .limit(1);
 
-    const workDays = recent
-      .map((s) => s.sessionDate)
-      .filter((d) => d !== onDate);
-    const lastWorkDay = workDays[workDays.length - 1] ?? null;
+    const positions = instance
+      ? await db.select().from(schema.trainingCyclePositions)
+          .where(eq(schema.trainingCyclePositions.cycleInstanceId, instance.id))
+          .orderBy(asc(schema.trainingCyclePositions.positionIndex))
+      : [];
+    const settled = positions.filter((p) => p.status !== "pending");
+    const nextIndex = instance !== undefined
+      ? (settled[settled.length - 1]?.positionIndex ?? -1) + 1
+      : 0;
+    const role = pattern[nextIndex % pattern.length] ?? "A";
 
-    // Next non-REST position after the last completed working day.
-    const completedWorkCount = workDays.length;
-    if (completedWorkCount === 0) {
+    const reasonCodes: string[] = [
+      ...(instance === undefined ? ["cycle_start"] : []),
+      `position_${nextIndex}`,
+    ];
+
+    // ── Readiness: scoped to the CANDIDATE day's movement patterns ──
+    if (role === "REST") {
       return {
-        decision: pattern.find((p) => p !== "REST") as ("A" | "B" | "C") ?? "A",
-        reasonCodes: ["cycle_start"],
+        decision: "REST",
+        reasonCodes: [...reasonCodes, "scheduled_rest"],
         adjustments: [],
         requiresConfirmation: false,
+        ...(instance ? { cycleInstanceId: instance.id } : {}),
+        positionIndex: nextIndex,
       };
     }
-    const workPositions = pattern.map((p, i) => ({ p, i })).filter((x) => x.p !== "REST");
-    const nextPosition = workPositions[completedWorkCount % workPositions.length]!;
-    let decision: CycleDecision = {
-      decision: nextPosition.p as "A" | "B" | "C",
-      reasonCodes: ["cycle_next", ...(lastWorkDay ? [`last_session_${lastWorkDay}`] : [])],
-      adjustments: [],
-      requiresConfirmation: false,
-    };
 
-    // Readiness inputs: sleep/fatigue/recovery/pain observations today or yesterday.
+    const candidatePatterns = patternsForRole(role);
     const obsSince = new Date(Date.now() - 2 * 86400_000).toISOString().slice(0, 10);
     const observations = await db.select().from(schema.healthObservationEvents)
       .where(and(
@@ -93,41 +128,170 @@ export function createCycleEngine(db: Db) {
       }
       return undefined;
     })();
-    const fatigueHigh = observations.some((o) => o.kind === "fatigue");
-    const activePainBlock = await db.select({ n: sql<number>`count(*)::int` })
-      .from(schema.healthConstraints)
-      .where(and(
-        eq(schema.healthConstraints.userId, userId),
-        eq(schema.healthConstraints.severity, "block"),
-        isNull(schema.healthConstraints.liftedAt),
-      ));
-    const painBlocked = (activePainBlock[0]?.n ?? 0) > 0;
 
-    const reasonCodes: string[] = [];
+    const adjustments: string[] = [];
     let rest = false;
+
     if (sleepHours !== undefined && sleepHours < 5.5) {
       reasonCodes.push("sleep_low");
       rest = true;
     }
-    if (fatigueHigh) {
-      reasonCodes.push("fatigue_high");
-      rest = true;
+
+    for (const o of observations) {
+      if (o.kind !== "fatigue") continue;
+      const { high, level } = fatigueIsHigh(o.valueJson);
+      if (!high) continue;
+      const scope = (o.valueJson as Partial<StructuredFatigue>).scope ?? "general";
+      if (scope === "general") {
+        reasonCodes.push(`fatigue_high_general_${level}`);
+        rest = true;
+      } else {
+        // Local fatigue only adjusts; it never forces a full rest day.
+        reasonCodes.push(`fatigue_high_local_${level}`);
+        adjustments.push("reduce_intensity_for_fatigued_area");
+      }
     }
 
-    if (rest || painBlocked) {
+    // Active block constraints that intersect THIS day's patterns force REST;
+    // constraints on other families do not (肩痛不阻止腿部日).
+    const candidateBlocked = candidatePatterns.length > 0
+      ? await db.select({ target: schema.healthConstraints.targetJson })
+          .from(schema.healthConstraints)
+          .where(and(
+            eq(schema.healthConstraints.userId, userId),
+            eq(schema.healthConstraints.severity, "block"),
+            isNull(schema.healthConstraints.liftedAt),
+            sql`${schema.healthConstraints.activeFrom} <= ${onDate}`,
+          ))
+      : [];
+    const { blockedPatternsForBodyPart } = await import("./prepared-session.js");
+    const blockedHere: string[] = [];
+    for (const c of candidateBlocked) {
+      const target = c.target as { movementPattern?: string; bodyPart?: string };
+      if (target.movementPattern !== undefined && candidatePatterns.includes(target.movementPattern)) {
+        blockedHere.push(target.movementPattern);
+      }
+      for (const pattern of blockedPatternsForBodyPart(target.bodyPart)) {
+        if (candidatePatterns.includes(pattern)) blockedHere.push(pattern);
+      }
+    }
+    const fullyBlocked = candidatePatterns.length > 0
+      && blockedHere.length >= candidatePatterns.length;
+    const partiallyBlocked = !fullyBlocked && blockedHere.length > 0;
+    if (fullyBlocked) {
+      reasonCodes.push("active_block_constraint_covers_day_patterns");
+      rest = true;
+    } else if (partiallyBlocked) {
+      reasonCodes.push("active_block_constraint_partial");
+      adjustments.push(`skip_blocked_patterns:${blockedHere.join("|")}`);
+    }
+
+    if (rest) {
       return {
         decision: "REST",
-        reasonCodes: [...reasonCodes, ...(painBlocked ? ["active_block_constraint"] : [])],
-        adjustments: rest ? ["delay_next_training"] : [],
+        reasonCodes,
+        adjustments,
         requiresConfirmation: false,
+        ...(instance ? { cycleInstanceId: instance.id } : {}),
+        positionIndex: nextIndex,
       };
     }
-    void decision;
+
+    void role;
     return {
-      ...decision,
-      reasonCodes: [...decision.reasonCodes, ...(sleepHours !== undefined ? [`sleep_${sleepHours}h_ok`] : [])],
+      decision: role as "A" | "B" | "C",
+      reasonCodes: [...reasonCodes, ...(sleepHours !== undefined ? [`sleep_${sleepHours}h_ok`] : [])],
+      adjustments,
+      requiresConfirmation: false,
+      ...(instance ? { cycleInstanceId: instance.id } : {}),
+      positionIndex: nextIndex,
     };
   }
 
-  return { decide };
+  /**
+   * Advance the explicit cycle after a working day settles. Called when a
+   * session finishes (completed → position completed; readiness-skip →
+   * skipped_readiness). Idempotent per (instance, index).
+   */
+  async function recordCycleOutcome(input: {
+    userId: string;
+    sessionId?: string;
+    outcome: "completed" | "skipped_readiness";
+    reasonCode?: string;
+    onDate: string;
+  }): Promise<{ cycleInstanceId: string; positionIndex: number }> {
+    return db.transaction(async (tx) => {
+      const [assignment] = await tx.select().from(schema.activePlanAssignments)
+        .where(and(eq(schema.activePlanAssignments.userId, input.userId), eq(schema.activePlanAssignments.scope, "training_template")))
+        .limit(1);
+      let pattern = DEFAULT_CYCLE;
+      let versionId: string | null = null;
+      if (assignment) {
+        const [version] = await tx.select().from(schema.planVersions)
+          .where(eq(schema.planVersions.id, assignment.planVersionId))
+          .limit(1);
+        versionId = assignment.planVersionId;
+        const content = version?.contentJson as { cyclePattern?: string[] } | undefined;
+        if (content?.cyclePattern && content.cyclePattern.length > 0) pattern = content.cyclePattern;
+      }
+
+      let [instance] = await tx.select().from(schema.trainingCycleInstances)
+        .where(and(
+          eq(schema.trainingCycleInstances.userId, input.userId),
+          eq(schema.trainingCycleInstances.status, "active"),
+        ))
+        .orderBy(desc(schema.trainingCycleInstances.startedAt))
+        .limit(1)
+        .for("update");
+      if (!instance) {
+        const created = await tx.insert(schema.trainingCycleInstances).values({
+          userId: input.userId,
+          cycleVersionId: versionId,
+        }).returning();
+        instance = created[0]!;
+      }
+
+      const positions = await tx.select().from(schema.trainingCyclePositions)
+        .where(eq(schema.trainingCyclePositions.cycleInstanceId, instance.id))
+        .orderBy(asc(schema.trainingCyclePositions.positionIndex));
+      const settled = positions.filter((p) => p.status !== "pending");
+      const nextIndex = (settled[settled.length - 1]?.positionIndex ?? -1) + 1;
+      const role = pattern[nextIndex % pattern.length]!;
+
+      await tx.insert(schema.trainingCyclePositions).values({
+        cycleInstanceId: instance.id,
+        userId: input.userId,
+        positionIndex: nextIndex,
+        positionRole: role,
+        sessionId: input.sessionId ?? null,
+        status: role === "REST" ? "skipped_rest"
+          : input.outcome === "completed" ? "completed" : "skipped_readiness",
+        reason: input.reasonCode ?? null,
+        positionDate: input.onDate,
+      });
+
+      // When we just consumed the LAST position of the pattern, retire the
+      // instance so the next decide() starts a fresh cycle run.
+      if ((nextIndex + 1) % pattern.length === 0) {
+        await tx.update(schema.trainingCycleInstances)
+          .set({ status: "retired", updatedAt: new Date() })
+          .where(eq(schema.trainingCycleInstances.id, instance.id));
+      }
+
+      return { cycleInstanceId: instance.id, positionIndex: nextIndex };
+    });
+  }
+
+  /** Positions for inspection/testing. */
+  async function listPositions(userId: string): Promise<Array<typeof schema.trainingCyclePositions.$inferSelect>> {
+    const instances = await db.select({ id: schema.trainingCycleInstances.id })
+      .from(schema.trainingCycleInstances)
+      .where(eq(schema.trainingCycleInstances.userId, userId));
+    if (instances.length === 0) return [];
+    return db.select().from(schema.trainingCyclePositions)
+      .where(inArray(schema.trainingCyclePositions.cycleInstanceId, instances.map((i) => i.id)))
+      .orderBy(asc(schema.trainingCyclePositions.createdAt));
+  }
+
+  return { decide, recordCycleOutcome, listPositions };
 }

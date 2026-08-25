@@ -137,11 +137,15 @@ export function createMediaImporter(db: Db) {
     const [videoAsset] = await db.insert(schema.mediaAssets).values({
       kind: "video",
       trainer: entry.trainer,
+      // P0-7: sourceRole comes from the MANIFEST, never inferred from the
+      // trainer name at query time.
+      sourceRole: entry.sourceRole,
       title: entry.title,
       localPath: entry.localPath,
       sha256: videoSha,
       durationMs: videoDuration,
       probeStatus: videoDuration === null ? "unreadable" : "ok",
+      contentType: "video/mp4",
       ...(decode !== null ? {
         fullDecodeStatus: decode.fullDecodeStatus,
         decodeErrorAtMs: decode.decodeErrorAtMs,
@@ -153,6 +157,7 @@ export function createMediaImporter(db: Db) {
       set: {
         title: entry.title,
         localPath: entry.localPath,
+        sourceRole: entry.sourceRole,
         durationMs: videoDuration,
         probeStatus: videoDuration === null ? "unreadable" : "ok",
         ...(decode !== null ? {

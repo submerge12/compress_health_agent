@@ -9,7 +9,7 @@
  * proposal; start() consumes ONLY a proposal, re-validating that no newer
  * constraint invalidates it. A new pain after prepare -> 409 proposal_stale.
  */
-import { and, desc, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, eq, gt, isNull, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -190,17 +190,33 @@ export function createPreparedSessionService(db: Db) {
   }
 
   /**
-   * Consume a pending proposal for starting a session. Throws on:
-   * - missing/expired/consumed proposal,
-   * - stale: any health constraint created AFTER the proposal snapshot
-   *   (a new pain between prepare and start invalidates it).
+   * Consume a pending proposal and create the session ATOMICALLY (P0-3).
+   * Previously consumption committed first and session creation ran after —
+   * a failure in between burned the proposal with no retry path. Now:
+   *
+   *   SELECT proposal FOR UPDATE
+   *   → validate user/date/day/status/expiry
+   *   → validate no newer block constraint
+   *   → insert training_sessions + training_session_exercises
+   *   → mark proposal consumed + outbox + interaction receipt
+   *   → commit
+   *
+   * The client may not reinterpret the proposal: request date/dayRole/
+   * planVersionId must match what prepare persisted.
    */
-  async function consumeValidProposal(input: {
+  async function startSessionFromProposal(input: {
     userId: string;
     proposalId: string;
+    /** Must equal the proposal's persisted values — mismatches are 409s. */
     sessionDate: string;
-    dayRole: string;
-  }): Promise<{ proposalJson: Record<string, unknown>; planVersionId: string | null }> {
+    dayRole?: "A" | "B" | "C";
+    journeyId?: string;
+  }): Promise<{
+    sessionId: string;
+    dayRole: "A" | "B" | "C";
+    planVersionId: string | null;
+    exerciseCount: number;
+  }> {
     return db.transaction(async (tx) => {
       const [proposal] = await tx.select().from(schema.preparedTrainingProposals)
         .where(and(
@@ -208,9 +224,24 @@ export function createPreparedSessionService(db: Db) {
           eq(schema.preparedTrainingProposals.userId, input.userId),
           eq(schema.preparedTrainingProposals.status, "pending"),
         ))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (!proposal || proposal.expiresAt < new Date()) {
         throw new ProposalStaleError("proposal_missing_or_expired");
+      }
+
+      // The client cannot re-interpret the proposal by passing another date
+      // or role: both must match the prepared values exactly.
+      const proposedDate = String(proposal.sessionDate);
+      const proposedRole = String(proposal.dayRole).trim().toUpperCase();
+      if (input.sessionDate !== proposedDate) {
+        throw new ProposalStaleError(`date_mismatch (proposal is for ${proposedDate})`);
+      }
+      if (input.dayRole !== undefined && input.dayRole !== proposedRole) {
+        throw new ProposalStaleError(`day_role_mismatch (proposal is for ${proposedRole})`);
+      }
+      if (!["A", "B", "C"].includes(proposedRole)) {
+        throw new ProposalStaleError(`unsupported_day_role_${proposedRole}`);
       }
 
       // Staleness: any constraint created after this proposal was made.
@@ -228,19 +259,70 @@ export function createPreparedSessionService(db: Db) {
         throw new ProposalStaleError("new_constraint_after_prepare");
       }
 
+      const proposalJson = proposal.proposalJson as Record<string, unknown>;
+      const rawExercises = (proposalJson.proposedExercises ?? []) as Array<Record<string, unknown>>;
+      const exercises = rawExercises
+        .map((raw, index) => {
+          const item = raw as {
+            order?: unknown; exerciseSlug?: unknown; sets?: unknown;
+            repRangeLow?: unknown; repRangeHigh?: unknown; rirLow?: unknown; rirHigh?: unknown;
+          };
+          return {
+            orderIndex: Number(item.order ?? index + 1),
+            exerciseSlug: String(item.exerciseSlug ?? ""),
+            targetSets: Number(item.sets ?? 3),
+            targetRepRangeLow: item.repRangeLow === undefined ? null : Number(item.repRangeLow),
+            targetRepRangeHigh: item.repRangeHigh === undefined ? null : Number(item.repRangeHigh),
+            targetRirLow: item.rirLow === undefined ? null : Number(item.rirLow),
+            targetRirHigh: item.rirHigh === undefined ? null : Number(item.rirHigh),
+          };
+        })
+        .filter((item) => item.exerciseSlug !== "");
+      if (exercises.length === 0) throw new ProposalStaleError("proposal_has_no_exercises");
+
+      const [session] = await tx.insert(schema.trainingSessions).values({
+        userId: input.userId,
+        sessionDate: proposedDate,
+        planVersionId: proposal.planVersionId,
+        status: "in_progress",
+        startedAt: new Date(),
+        journeyId: input.journeyId ?? null,
+      }).returning();
+      if (!session) throw new Error("session insert returned no row");
+
+      await tx.insert(schema.trainingSessionExercises).values(exercises.map((item) => ({
+        sessionId: session.id,
+        exerciseSlug: item.exerciseSlug,
+        orderIndex: item.orderIndex,
+        targetSets: item.targetSets,
+        targetRepRangeLow: item.targetRepRangeLow,
+        targetRepRangeHigh: item.targetRepRangeHigh,
+        targetRirLow: item.targetRirLow,
+        targetRirHigh: item.targetRirHigh,
+      })));
+
       await tx.update(schema.preparedTrainingProposals)
         .set({ status: "consumed", consumedAt: new Date() })
         .where(eq(schema.preparedTrainingProposals.id, proposal.id));
 
-      const proposalJson = proposal.proposalJson as Record<string, unknown>;
-      const exercises = (proposalJson.proposedExercises ?? []) as Array<Record<string, unknown>>;
-      if (exercises.length === 0) throw new ProposalStaleError("proposal_has_no_exercises");
+      await tx.insert(schema.outboxEvents).values({
+        userId: input.userId,
+        aggregateType: "training_session",
+        aggregateId: session.id,
+        eventType: "training.started",
+        payloadJson: { observedOn: proposedDate, fromProposalId: proposal.id },
+      });
 
-      return { proposalJson, planVersionId: proposal.planVersionId };
+      return {
+        sessionId: session.id,
+        dayRole: proposedRole as "A" | "B" | "C",
+        planVersionId: proposal.planVersionId,
+        exerciseCount: exercises.length,
+      };
     });
   }
 
-  return { saveProposal, consumeValidProposal };
+  return { saveProposal, startSessionFromProposal };
 }
 
 export class ProposalStaleError extends Error {

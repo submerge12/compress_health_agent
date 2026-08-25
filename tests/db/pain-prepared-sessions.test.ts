@@ -109,14 +109,14 @@ describe.skipIf(!isDbAvailable)("pain & prepared sessions (WO-HS-06)", () => {
       activeConstraints: constraints.map((c) => ({ id: c.id, severity: c.severity })),
     });
 
-    // 3. Start consumes ONLY the proposal.
-    const consumed = await prepared.consumeValidProposal({
+    // 3. Start consumes ONLY the proposal — atomically creating the session.
+    const started = await prepared.startSessionFromProposal({
       userId: ctx.userId,
       proposalId: saved.proposalId,
       sessionDate: today,
       dayRole: "C",
     });
-    void consumed;
+    void started;
 
     const planC = await training.prepareSession(ctx.userId, today, "C");
     const session = await training.startSessionFromProposal({
@@ -136,7 +136,7 @@ describe.skipIf(!isDbAvailable)("pain & prepared sessions (WO-HS-06)", () => {
     expect(sessionExercises.map((e) => e.exerciseSlug)).not.toContain("bulgarian_split_squat");
 
     // 5. Proposal is consumed; a second start with same id is refused.
-    await expect(prepared.consumeValidProposal({
+    await expect(prepared.startSessionFromProposal({
       userId: ctx.userId,
       proposalId: saved.proposalId,
       sessionDate: today,
@@ -164,7 +164,7 @@ describe.skipIf(!isDbAvailable)("pain & prepared sessions (WO-HS-06)", () => {
       severityHint: "worsening",
     });
 
-    await expect(prepared.consumeValidProposal({
+    await expect(prepared.startSessionFromProposal({
       userId: ctx.userId,
       proposalId: saved.proposalId,
       sessionDate: today,

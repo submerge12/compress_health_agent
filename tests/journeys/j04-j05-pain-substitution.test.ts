@@ -101,26 +101,15 @@ describe.skipIf(!isDbAvailable)("J04/J05: pain & substitution final acceptance",
       blockedExercises: planC.blockedExercises as unknown as Array<Record<string, unknown>>,
       activeConstraints: [],
     });
-    await prepared.consumeValidProposal({
+    const started = await prepared.startSessionFromProposal({
       userId: ctx.userId,
       proposalId: saved.proposalId,
       sessionDate: today,
       dayRole: "C",
     });
 
-    const session = await training.startSessionFromProposal({
-      userId: ctx.userId,
-      sessionDate: today,
-      dayRole: "C",
-      exercises: planC.proposedExercises.map((e, i) => ({
-        order: Number((e as { order?: number }).order ?? i + 1),
-        exerciseSlug: String(e.exerciseSlug),
-        sets: Number(e.sets ?? 3),
-      })),
-    });
-
     const rows = await db.select().from(schema.trainingSessionExercises)
-      .where(eq(schema.trainingSessionExercises.sessionId, session.id));
+      .where(eq(schema.trainingSessionExercises.sessionId, started.sessionId));
     expect(rows.map((r) => r.exerciseSlug)).not.toContain("bulgarian_split_squat");
   });
 
@@ -153,8 +142,7 @@ describe.skipIf(!isDbAvailable)("J04/J05: pain & substitution final acceptance",
     const chosen = proposal.candidates[0]!;
     const applied = await substitution.apply({
       userId: ctx.userId,
-      sessionId: session.id,
-      proposal,
+      substitutionProposalId: proposal.substitutionProposalId,
       chosenSlug: chosen.slug,
       reason: "器械被占用",
     });

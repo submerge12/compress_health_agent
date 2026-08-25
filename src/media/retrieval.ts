@@ -11,7 +11,7 @@
  *   chest_specialist / technique_details may explain and correct but NEVER
  *   add sets to the main program (enforced here, not by prompt).
  */
-import { and, asc, eq, gte, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -77,7 +77,9 @@ export function createMediaIndexer(db: Db) {
       startMs: w.startMs,
       endMs: w.endMs,
       trainer: video.trainer,
-      sourceRole: sourceRoleFor(video.trainer),
+      // P0-7: the manifest-declared role stored on the asset wins; no
+      // trainer-name inference at index time.
+      sourceRole: (video.sourceRole as "main_program" | "chest_specialist" | "technique_details"),
       title: `${video.title} · ${formatTs(w.startMs)}-${formatTs(w.endMs)}`,
       bodyPart: options?.bodyPart ?? null,
       movementPattern: options?.movementPattern ?? null,
@@ -120,12 +122,6 @@ function formatTs(ms: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-function sourceRoleFor(trainer: string): "main_program" | "chest_specialist" | "technique_details" {
-  if (trainer === "kaishengwang") return "main_program";
-  if (trainer === "curun") return "chest_specialist";
-  return "technique_details";
-}
-
 function categoryFor(trainer: string): string {
   return trainer === "curun" ? "correction" : "practice";
 }
@@ -140,8 +136,10 @@ export interface SearchQuery {
 
 export function createMediaRetrieval(db: Db) {
   /**
-   * Deterministic-first retrieval. Every result carries completeness info so
-   * callers can never mistake a truncated source for a complete one.
+   * P0-7: ONE SQL statement — filters, text matching, ordering and limit all
+   * happen in the database. The previous two-step (fetch N, then filter by
+   * separately-matched IDs) silently dropped any match ranked beyond the
+   * initial fetch.
    */
   async function search(query: SearchQuery): Promise<Array<{
     segmentId: string;
@@ -151,7 +149,8 @@ export function createMediaRetrieval(db: Db) {
     category: string;
     startMs: number;
     endMs: number;
-    localPath: string;
+    /** Authenticated stream URL path; localPath is NEVER exposed (P0-7). */
+    streamUrl: string;
     completeness: string;
     usableUntilMs: number | null;
     snippet: string;
@@ -167,8 +166,15 @@ export function createMediaRetrieval(db: Db) {
     if (query.movementPattern) conditions.push(eq(schema.videoSegments.movementPattern, query.movementPattern));
     if (query.bodyPart) conditions.push(eq(schema.videoSegments.bodyPart, query.bodyPart));
     if (query.category) conditions.push(eq(schema.videoSegments.category, query.category));
+    if (query.text !== undefined && query.text !== "") {
+      const like = `%${query.text}%`;
+      conditions.push(or(
+        sql`${schema.videoSegments.cuesText} ILIKE ${like}`,
+        sql`${schema.videoSegments.title} ILIKE ${like}`,
+      )!);
+    }
 
-    let rows = await db.select({
+    const rows = await db.select({
       id: schema.videoSegments.id,
       title: schema.videoSegments.title,
       trainer: schema.videoSegments.trainer,
@@ -180,7 +186,6 @@ export function createMediaRetrieval(db: Db) {
       reviewStatus: schema.videoSegments.reviewStatus,
       helpfulCount: schema.videoSegments.helpfulCount,
       notHelpfulCount: schema.videoSegments.notHelpfulCount,
-      localPath: schema.mediaAssets.localPath,
       completeness: schema.mediaPairings.completeness,
       usableUntilMs: schema.mediaPairings.usableUntilMs,
       decodeErrorAtMs: schema.mediaAssets.decodeErrorAtMs,
@@ -190,28 +195,15 @@ export function createMediaRetrieval(db: Db) {
       .innerJoin(schema.mediaPairings, eq(schema.videoSegments.pairingId, schema.mediaPairings.id))
       .innerJoin(schema.mediaAssets, eq(schema.mediaPairings.videoAssetId, schema.mediaAssets.id))
       .where(and(...conditions))
-      .orderBy(asc(schema.videoSegments.startMs))
+      // Deterministic ranking: confirmed first, then community signal,
+      // then position — identical inputs always yield identical order.
+      .orderBy(
+        desc(schema.videoSegments.reviewStatus),
+        desc(sql`${schema.videoSegments.helpfulCount} - ${schema.videoSegments.notHelpfulCount}`),
+        asc(schema.videoSegments.startMs),
+        asc(schema.videoSegments.id),
+      )
       .limit(query.limit ?? 10);
-
-    // Text search is applied IN SQL (before limit) so later matches are not
-    // lost; pg_trgm index covers cues_text for larger libraries.
-    if (query.text !== undefined && query.text !== "") {
-      const like = `%${query.text}%`;
-      const matched = await db.select({ id: schema.videoSegments.id })
-        .from(schema.videoSegments)
-        .where(and(
-          ...conditions,
-          or(
-            sql`${schema.videoSegments.cuesText} ILIKE ${like}`,
-            sql`${schema.videoSegments.title} ILIKE ${like}`,
-          ),
-        ))
-        .limit(query.limit ?? 10);
-      const allowedIds = new Set(matched.map((m) => m.id));
-      rows = rows.filter((r) => allowedIds.has(r.id));
-    } else {
-      rows = rows.slice(0, query.limit ?? 10);
-    }
 
     return rows.map((r) => ({
       segmentId: r.id,
@@ -221,7 +213,7 @@ export function createMediaRetrieval(db: Db) {
       category: r.category,
       startMs: r.startMs,
       endMs: r.endMs,
-      localPath: r.localPath,
+      streamUrl: `/api/v1/media/segments/${r.id}/stream`,
       completeness: r.completeness,
       usableUntilMs: r.usableUntilMs,
       snippet: r.cuesText.slice(0, 400),

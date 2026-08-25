@@ -577,6 +577,8 @@ export const mediaAssets = compass.table("media_assets", {
   id: uuid("id").primaryKey().defaultRandom(),
   kind: text("kind").notNull(), // video | subtitle
   trainer: text("trainer").notNull(), // kaishengwang | curun | tanchengyi
+  /** Declared in the import manifest (P0-7); never inferred from trainer name. */
+  sourceRole: text("source_role").notNull().default("technique_details"),
   title: text("title").notNull(),
   localPath: text("local_path").notNull(),
   sha256: text("sha256").notNull(),
@@ -585,6 +587,7 @@ export const mediaAssets = compass.table("media_assets", {
   fullDecodeStatus: text("full_decode_status").notNull().default("unprobed"),
   decodeErrorAtMs: integer("decode_error_at_ms"),
   usableVideoUntilMs: integer("usable_video_until_ms"),
+  contentType: text("content_type").notNull().default("video/mp4"),
   bytes: bigint("bytes", { mode: "number" }).notNull().default(0),
   ...timestamps()
 }, (t) => [
@@ -658,4 +661,60 @@ export const preparedTrainingProposals = compass.table("prepared_training_propos
   consumedAt: timestamp("consumed_at", { withTimezone: true })
 }, (t) => [
   index("prepared_training_proposals_user_idx").on(t.userId, t.sessionDate, t.status),
+]);
+
+// ── P0-5: explicit training cycle instances ─────────────────────────────────
+// The cycle is no longer inferred by counting completed sessions mod pattern
+// length. Every completed or skipped working day advances a durable position.
+
+export const trainingCycleInstances = compass.table("training_cycle_instances", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  cycleVersionId: uuid("cycle_version_id"), // plan version whose cyclePattern this run follows
+  status: text("status").notNull().default("active"), // active | retired
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  ...timestamps()
+}, (t) => [
+  index("training_cycle_instances_user_idx").on(t.userId, t.status),
+]);
+
+export const trainingCyclePositions = compass.table("training_cycle_positions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  cycleInstanceId: uuid("cycle_instance_id").notNull()
+    .references(() => trainingCycleInstances.id, { onDelete: "cascade" }),
+  userId: userId(),
+  positionIndex: integer("position_index").notNull(), // index into cyclePattern
+  positionRole: text("position_role").notNull(), // A | B | C | REST
+  sessionId: uuid("session_id"),
+  /** completed | skipped_rest | skipped_readiness | pending */
+  status: text("status").notNull().default("pending"),
+  reason: text("reason"),
+  positionDate: date("position_date"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("training_cycle_positions_instance_idx").on(t.cycleInstanceId, t.positionIndex),
+]);
+
+// ── P0-6: durable substitution proposals ────────────────────────────────────
+// propose() persists candidates server-side; apply() receives ONLY the
+// proposal id + chosen slug — clients can never re-assemble a proposal body.
+
+export const substitutionProposals = compass.table("substitution_proposals", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  sessionId: uuid("session_id").notNull()
+    .references(() => trainingSessions.id, { onDelete: "cascade" }),
+  sessionExerciseId: uuid("session_exercise_id").notNull()
+    .references(() => trainingSessionExercises.id, { onDelete: "cascade" }),
+  sourceRevision: integer("source_revision").notNull().default(-1),
+  remainingSets: integer("remaining_sets").notNull(),
+  candidateJson: jsonb("candidate_json").$type<Array<Record<string, unknown>>>().notNull(),
+  constraintSnapshotJson: jsonb("constraint_snapshot_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  equipmentSnapshotJson: jsonb("equipment_snapshot_json").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull().default(sql`now() + interval '6 hours'`),
+  status: text("status").notNull().default("pending"), // pending | applied | expired
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  appliedAt: timestamp("applied_at", { withTimezone: true })
+}, (t) => [
+  index("substitution_proposals_user_idx").on(t.userId, t.sessionId, t.status),
 ]);

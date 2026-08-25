@@ -1,7 +1,7 @@
 {
   "node": "CHA-MPV2-5",
   "command": "node_modules/.bin/vitest.CMD run tests/tools/generate-meal-plan-pool.test.ts",
-  "measuredMs": 13.5,
+  "measuredMs": 10.1,
   "thresholdMs": 1000,
   "status": "planned"
 }

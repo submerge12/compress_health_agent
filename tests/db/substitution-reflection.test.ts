@@ -97,11 +97,18 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
     expect(proposal.remainingSets).toBe(originalExercise.targetSets - 1);
     expect(proposal.candidates.length).toBeGreaterThan(0);
 
+    // Rejecting an unknown slug is refused while the proposal is still live.
+    await expect(substitution.apply({
+      userId: ctx.userId,
+      substitutionProposalId: proposal.substitutionProposalId,
+      chosenSlug: "not_a_candidate",
+      reason: "x",
+    })).rejects.toBeInstanceOf(RangeError);
+
     const chosen = proposal.candidates[0]!;
     const { replacementId } = await substitution.apply({
       userId: ctx.userId,
-      sessionId: session.id,
-      proposal,
+      substitutionProposalId: proposal.substitutionProposalId,
       chosenSlug: chosen.slug,
       reason: "器械被占用",
     });
@@ -133,15 +140,6 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
       .where(eq(schema.userDecisionEvents.userId, ctx.userId));
     expect(decisions.some((d) => (d.subjectJson as Record<string, unknown>)["type"] === "exercise_substitution"))
       .toBe(true);
-
-    // Rejecting an unknown slug is refused.
-    await expect(substitution.apply({
-      userId: ctx.userId,
-      sessionId: session.id,
-      proposal,
-      chosenSlug: "not_a_candidate",
-      reason: "x",
-    })).rejects.toBeInstanceOf(RangeError);
   });
 
   it("J07: reflection proposes a child draft; activation supersedes the parent atomically", async () => {

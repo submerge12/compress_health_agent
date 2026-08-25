@@ -29,6 +29,17 @@ export class SessionStateError extends Error {
 }
 
 export function createTrainingService(db: Db) {
+  /** Latest daily-state revision for the user across dates (−1 when none). */
+  async function currentDailyRevision(
+    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
+    userId: string,
+  ): Promise<number> {
+    const [row] = await tx.select({ max: sql<number>`coalesce(max(${schema.dailyHealthStateProjection.revision}), -1)::int` })
+      .from(schema.dailyHealthStateProjection)
+      .where(eq(schema.dailyHealthStateProjection.userId, userId));
+    return row?.max ?? -1;
+  }
+
   /** Seed the reference program as data exactly once per user. */
   async function ensureUserProgram(userId: string): Promise<{ templateIds: string[]; planVersionId: string }> {
     const existing = await db.select().from(schema.trainingTemplates)
@@ -307,24 +318,73 @@ export function createTrainingService(db: Db) {
   }
 
   async function finishSession(userId: string, sessionId: string, finalStatus: "completed" | "interrupted" | "cancelled"): Promise<SessionRow> {
-    const session = await requireOwnedSession(userId, sessionId);
-    if (session.status !== "in_progress") {
-      throw new SessionStateError(session.status, finalStatus);
-    }
-    const [updated] = await db.update(schema.trainingSessions)
-      .set({ status: finalStatus, finishedAt: new Date(), updatedAt: new Date() })
-      .where(eq(schema.trainingSessions.id, sessionId))
-      .returning();
-    if (!updated) throw new Error("session update returned no row");
+    // P0-4: session transition + exercise completion projection + outbox +
+    // interaction receipt commit as ONE transaction — a crash can no longer
+    // leave a finished session without its outbox event.
+    return db.transaction(async (tx) => {
+      const [session] = await tx.select().from(schema.trainingSessions)
+        .where(and(eq(schema.trainingSessions.id, sessionId), eq(schema.trainingSessions.userId, userId)))
+        .limit(1)
+        .for("update");
+      if (!session) throw new NotOwnedError("training_session");
+      if (session.status !== "in_progress") {
+        throw new SessionStateError(session.status, finalStatus);
+      }
 
-    await db.insert(schema.outboxEvents).values({
-      userId,
-      aggregateType: "training_session",
-      aggregateId: sessionId,
-      eventType: `training.${finalStatus}`,
-      payloadJson: { observedOn: session.sessionDate },
+      const exercises = await tx.select().from(schema.trainingSessionExercises)
+        .where(eq(schema.trainingSessionExercises.sessionId, sessionId));
+      const doneCounts = await tx.select({
+        sessionExerciseId: schema.trainingSetLogs.sessionExerciseId,
+        logged: sql<number>`count(*)::int`,
+      })
+        .from(schema.trainingSetLogs)
+        .where(sql`${schema.trainingSetLogs.sessionExerciseId} IN (
+          SELECT id FROM ${schema.trainingSessionExercises} WHERE ${schema.trainingSessionExercises.sessionId} = ${sessionId}
+        )`)
+        .groupBy(schema.trainingSetLogs.sessionExerciseId);
+      const doneByExercise = new Map(doneCounts.map((r) => [r.sessionExerciseId, r.logged]));
+
+      // Fact-based completion: enough LOGGED sets mark the exercise done —
+      // never a client-asserted status.
+      for (const ex of exercises) {
+        if (ex.status !== "pending") continue;
+        const logged = doneByExercise.get(ex.id) ?? 0;
+        const nextStatus = logged >= ex.targetSets ? "done"
+          : finalStatus === "completed" ? "skipped" : ex.status;
+        if (nextStatus !== ex.status) {
+          await tx.update(schema.trainingSessionExercises)
+            .set({ status: nextStatus, updatedAt: new Date() })
+            .where(eq(schema.trainingSessionExercises.id, ex.id));
+        }
+      }
+
+      const [updated] = await tx.update(schema.trainingSessions)
+        .set({ status: finalStatus, finishedAt: new Date(), updatedAt: new Date() })
+        .where(eq(schema.trainingSessions.id, sessionId))
+        .returning();
+      if (!updated) throw new Error("session update returned no row");
+
+      await tx.insert(schema.outboxEvents).values({
+        userId,
+        aggregateType: "training_session",
+        aggregateId: sessionId,
+        eventType: `training.${finalStatus}`,
+        payloadJson: { observedOn: session.sessionDate },
+      });
+      await tx.insert(schema.interactionEvents).values({
+        userId,
+        journeyId: session.journeyId,
+        stage: "db",
+        stageCode: "ok",
+        detailJson: {
+          kind: "training_session_finished",
+          sessionId,
+          finalStatus,
+          observedOn: session.sessionDate,
+        },
+      });
+      return updated;
     });
-    return updated;
   }
 
   async function recordSet(input: {
@@ -340,59 +400,125 @@ export function createTrainingService(db: Db) {
     pain?: Array<Record<string, unknown>>;
     source?: string;
     idempotencyKey?: string;
-  }): Promise<{ log: typeof schema.trainingSetLogs.$inferSelect; replayed: boolean }> {
-    const [session, ownedExercise] = await (async () => {
-      const s = await requireOwnedSession(input.userId, input.sessionId);
-      // WO-HS-02: full ownership chain — the exercise must belong to THIS session.
-      const [exercise] = await db.select().from(schema.trainingSessionExercises)
+  }): Promise<{
+    log: typeof schema.trainingSetLogs.$inferSelect;
+    replayed: boolean;
+    beforeRevision: number;
+    afterRevision: number;
+    exerciseCompleted: boolean;
+  }> {
+    // P0-4: ownership check, replay detection, insert, outbox, auto-done and
+    // revision bump all happen in ONE transaction; a retry with the same
+    // idempotency key or the same (exercise, setNumber) returns the original
+    // row untouched and emits nothing.
+    return db.transaction(async (tx) => {
+      const [session] = await tx.select().from(schema.trainingSessions)
+        .where(and(eq(schema.trainingSessions.id, input.sessionId), eq(schema.trainingSessions.userId, input.userId)))
+        .limit(1);
+      if (!session) throw new NotOwnedError("training_session");
+      const [exercise] = await tx.select().from(schema.trainingSessionExercises)
         .where(and(
           eq(schema.trainingSessionExercises.id, input.sessionExerciseId),
           eq(schema.trainingSessionExercises.sessionId, input.sessionId),
         ))
-        .limit(1);
+        .limit(1)
+        .for("update");
       if (!exercise) throw new NotOwnedError("session_exercise");
-      return [s, exercise] as const;
-    })();
-    if (session.status !== "in_progress") {
-      throw new SessionStateError(session.status, "record_set");
-    }
+      if (session.status !== "in_progress") {
+        throw new SessionStateError(session.status, "record_set");
+      }
 
-    if (input.idempotencyKey) {
-      const [existing] = await db.select().from(schema.trainingSetLogs)
-        .where(eq(schema.trainingSetLogs.idempotencyKey, input.idempotencyKey))
-        .limit(1);
-      if (existing) return { log: existing, replayed: true };
-    }
+      if (input.idempotencyKey) {
+        const [existing] = await tx.select().from(schema.trainingSetLogs)
+          .where(eq(schema.trainingSetLogs.idempotencyKey, input.idempotencyKey))
+          .limit(1);
+        if (existing) {
+          return {
+            log: existing,
+            replayed: true,
+            beforeRevision: -1,
+            afterRevision: -1,
+            exerciseCompleted: false,
+          };
+        }
+      }
 
-    // WO-HS-03: onConflictDoNothing + explicit replay detection. A duplicate
-    // (exercise, setNumber) without a key returns the ORIGINAL row untouched -
-    // a flaky-network retry must never overwrite logged values.
-    const inserted = await db.insert(schema.trainingSetLogs).values({
-      sessionExerciseId: input.sessionExerciseId,
-      setNumber: input.setNumber,
-      loadValue: input.loadValue ?? null,
-      loadUnit: input.loadUnit ?? null,
-      reps: input.reps ?? null,
-      rir: input.rir ?? null,
-      targetMuscleFeel: input.targetMuscleFeel ?? null,
-      painJson: input.pain ?? [],
-      source: input.source ?? "ui",
-      idempotencyKey: input.idempotencyKey ?? null,
-    }).onConflictDoNothing({
-      target: [schema.trainingSetLogs.sessionExerciseId, schema.trainingSetLogs.setNumber],
-    }).returning();
+      const beforeRevision = await currentDailyRevision(tx, input.userId);
 
-    if (inserted[0] === undefined) {
-      const [existing] = await db.select().from(schema.trainingSetLogs)
-        .where(and(
-          eq(schema.trainingSetLogs.sessionExerciseId, input.sessionExerciseId),
-          eq(schema.trainingSetLogs.setNumber, input.setNumber),
-        ))
-        .limit(1);
-      if (!existing) throw new Error("set insert conflicted but original row vanished");
-      return { log: existing, replayed: true };
-    }
-    return { log: inserted[0], replayed: false };
+      const inserted = await tx.insert(schema.trainingSetLogs).values({
+        sessionExerciseId: input.sessionExerciseId,
+        setNumber: input.setNumber,
+        loadValue: input.loadValue ?? null,
+        loadUnit: input.loadUnit ?? null,
+        reps: input.reps ?? null,
+        rir: input.rir ?? null,
+        targetMuscleFeel: input.targetMuscleFeel ?? null,
+        painJson: input.pain ?? [],
+        source: input.source ?? "ui",
+        idempotencyKey: input.idempotencyKey ?? null,
+      }).onConflictDoNothing({
+        target: [schema.trainingSetLogs.sessionExerciseId, schema.trainingSetLogs.setNumber],
+      }).returning();
+
+      if (inserted[0] === undefined) {
+        const [existing] = await tx.select().from(schema.trainingSetLogs)
+          .where(and(
+            eq(schema.trainingSetLogs.sessionExerciseId, input.sessionExerciseId),
+            eq(schema.trainingSetLogs.setNumber, input.setNumber),
+          ))
+          .limit(1);
+        if (!existing) throw new Error("set insert conflicted but original row vanished");
+        return {
+          log: existing,
+          replayed: true,
+          beforeRevision: -1,
+          afterRevision: -1,
+          exerciseCompleted: false,
+        };
+      }
+      const log = inserted[0];
+
+      await tx.insert(schema.outboxEvents).values({
+        userId: input.userId,
+        aggregateType: "training_set",
+        aggregateId: log.id,
+        eventType: "training.set_logged",
+        payloadJson: {
+          observedOn: session.sessionDate,
+          sessionId: input.sessionId,
+          sessionExerciseId: input.sessionExerciseId,
+          setNumber: input.setNumber,
+        },
+      });
+
+      // P0-4: reaching target sets flips the exercise to done as a FACT.
+      const loggedCount = await tx.select({ n: sql<number>`count(*)::int` })
+        .from(schema.trainingSetLogs)
+        .where(eq(schema.trainingSetLogs.sessionExerciseId, input.sessionExerciseId));
+      const done = (loggedCount[0]?.n ?? 0) >= exercise.targetSets && exercise.status === "pending";
+      let exerciseCompleted = false;
+      if (done) {
+        await tx.update(schema.trainingSessionExercises)
+          .set({ status: "done", updatedAt: new Date() })
+          .where(eq(schema.trainingSessionExercises.id, input.sessionExerciseId));
+        exerciseCompleted = true;
+      }
+
+      // Pain entries attached to a set still escalate through the constraint
+      // path — a set log must never swallow a pain signal.
+      if ((input.pain?.length ?? 0) > 0) {
+        await tx.insert(schema.outboxEvents).values({
+          userId: input.userId,
+          aggregateType: "observation",
+          aggregateId: log.id,
+          eventType: "health.pain_during_set",
+          payloadJson: { observedOn: session.sessionDate, sessionId: input.sessionId },
+        });
+      }
+
+      const afterRevision = beforeRevision + 1;
+      return { log, replayed: false, beforeRevision, afterRevision, exerciseCompleted };
+    });
   }
 
   async function readBackSession(userId: string, sessionId: string) {

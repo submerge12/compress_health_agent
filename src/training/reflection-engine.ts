@@ -44,11 +44,25 @@ export function createReflectionEngine(db: Db) {
 
     const exercises = await db.select().from(schema.trainingSessionExercises)
       .where(eq(schema.trainingSessionExercises.sessionId, input.sessionId));
+    // P0-4: completion is computed from logged-set FACTS, not from the
+    // status column alone.
+    const setCounts = await db.select({
+      sessionExerciseId: schema.trainingSetLogs.sessionExerciseId,
+      logged: sql<number>`count(*)::int`,
+    })
+      .from(schema.trainingSetLogs)
+      .where(sql`${schema.trainingSetLogs.sessionExerciseId} IN (
+        SELECT id FROM ${schema.trainingSessionExercises} WHERE ${schema.trainingSessionExercises.sessionId} = ${input.sessionId}
+      )`)
+      .groupBy(schema.trainingSetLogs.sessionExerciseId);
+    const setsByExercise = new Map(setCounts.map((r) => [r.sessionExerciseId, r.logged]));
+    const isComplete = (ex: typeof schema.trainingSessionExercises.$inferSelect): boolean =>
+      (setsByExercise.get(ex.id) ?? 0) >= ex.targetSets;
     const completedVsPlanned = {
       plannedExercises: exercises.length,
-      completedExercises: exercises.filter((e) => e.status === "done").length,
+      completedExercises: exercises.filter(isComplete).length,
       replacedExercises: exercises.filter((e) => e.status === "replaced").length,
-      skippedExercises: exercises.filter((e) => e.status === "skipped").length,
+      skippedExercises: exercises.filter((e) => !isComplete(e) && e.status !== "replaced").length,
     };
 
     const [created] = await db.insert(schema.trainingReflections).values({
