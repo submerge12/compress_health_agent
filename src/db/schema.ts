@@ -718,3 +718,87 @@ export const substitutionProposals = compass.table("substitution_proposals", {
 }, (t) => [
   index("substitution_proposals_user_idx").on(t.userId, t.sessionId, t.status),
 ]);
+
+// ── P3 / WO-MCP: Agent Run evidence ─────────────────────────────────────────
+// High-level structure of one agent user journey. interaction_events stays the
+// low-level domain log; runs/steps index it without copying payloads.
+
+export const agentActors = compass.table("agent_actors", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  /** codex | pi | dsh | other | reviewer */
+  actorType: text("actor_type").notNull().default("other"),
+  runtimeName: text("runtime_name"),
+  runtimeVersion: text("runtime_version"),
+  agentProfile: text("agent_profile"),
+  agentProfileVersion: text("agent_profile_version"),
+  modelProvider: text("model_provider"),
+  modelName: text("model_name"),
+  status: text("status").notNull().default("active"), // active | retired
+  ...timestamps()
+}, (t) => [
+  index("agent_actors_type_idx").on(t.actorType, t.status),
+]);
+
+export const agentRuns = compass.table("agent_runs", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  actorId: uuid("actor_id"),
+  journeyId: text("journey_id"),
+  objective: text("objective"),
+  inputChannel: text("input_channel").notNull().default("mcp"),
+  /** production | shadow | limited_write | review */
+  mode: text("mode").notNull().default("production"),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  /** running | completed | failed | abandoned */
+  outcome: text("outcome").notNull().default("running"),
+  responseSummary: text("response_summary"),
+  parentRunId: uuid("parent_run_id"),
+  comparisonGroupId: uuid("comparison_group_id"),
+  ...timestamps()
+}, (t) => [
+  index("agent_runs_user_started_idx").on(t.userId, t.startedAt),
+  index("agent_runs_journey_idx").on(t.journeyId),
+]);
+
+export const agentRunSteps = compass.table("agent_run_steps", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  runId: uuid("run_id").notNull()
+    .references(() => agentRuns.id, { onDelete: "cascade" }),
+  sequence: integer("sequence").notNull(),
+  /** resource_read | tool_call | confirmation | response */
+  stage: text("stage").notNull(),
+  mcpMethod: text("mcp_method"),
+  mcpName: text("mcp_name"),
+  resourceUri: text("resource_uri"),
+  aggregateType: text("aggregate_type"),
+  aggregateId: text("aggregate_id"),
+  stateRevisionBefore: integer("state_revision_before"),
+  stateRevisionAfter: integer("state_revision_after"),
+  status: text("status").notNull().default("ok"), // ok | failed | refused
+  errorCode: text("error_code"),
+  /** Redacted arguments: no tokens, no free-text health bodies beyond need. */
+  argumentsRedactedJson: jsonb("arguments_redacted_json").$type<Record<string, unknown>>(),
+  resultSummaryJson: jsonb("result_summary_json").$type<Record<string, unknown>>(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+}, (t) => [
+  index("agent_run_steps_run_idx").on(t.runId, t.sequence),
+]);
+
+export const reviewFindings = compass.table("review_findings", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  reviewerActorId: uuid("reviewer_actor_id"),
+  targetRunId: uuid("target_run_id").notNull()
+    .references(() => agentRuns.id, { onDelete: "cascade" }),
+  /** pass | fail | needs_human */
+  verdict: text("verdict").notNull(),
+  failureStage: text("failure_stage"),
+  severity: text("severity"),
+  ruleCode: text("rule_code"),
+  evidenceRefsJson: jsonb("evidence_refs_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  recommendedTarget: text("recommended_target"),
+  recommendedChange: text("recommended_change"),
+  ...timestamps()
+}, (t) => [
+  index("review_findings_run_idx").on(t.targetRunId),
+]);

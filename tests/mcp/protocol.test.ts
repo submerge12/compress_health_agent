@@ -129,7 +129,9 @@ describe.skipIf(!isDbAvailable)("MCP server core (P1)", () => {
     expect(result.isError).not.toBe(true);
     expect(JSON.parse((result.content as Array<{ text: string }>)[0]!.text).status).toBe("ok");
 
-    await expect(client.callTool({ name: "health_nonexistent", arguments: {} }))
-      .rejects.toThrow();
+    // Unknown tools surface as isError results (P2 semantics), not rejections.
+    const unknown = await client.callTool({ name: "health_nonexistent", arguments: {} });
+    expect(unknown.isError).toBe(true);
+    expect((unknown.content as Array<{ text: string }>)[0]!.text).toContain("not_found");
   });
 });

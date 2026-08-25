@@ -29,6 +29,7 @@ import { MCP_SERVER_NAME, MCP_SERVER_VERSION, serverCapabilitiesDocument } from 
 import { McpProtocolError, JSON_RPC } from "./errors.js";
 import { createPrincipalResolver, type ActorBindingOptions, type Principal } from "./auth/principal-resolver.js";
 import { createResourceCatalog } from "./resources/catalog.js";
+import { createHealthToolCatalog } from "./tools/catalog.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -96,7 +97,8 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     return { contents: result.contents, _meta: result._meta };
   });
 
-  // ── tools/list (read-only catalog in P1; writes land in P2) ──
+  // ── tools/list: P1 read tool + P2 canonical write tools ──
+  const tools = createHealthToolCatalog(db, repo);
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
@@ -106,12 +108,13 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
           inputSchema: { type: "object" as const, properties: {}, additionalProperties: false },
           _meta: { "compass.health/risk": "read-only" },
         },
+        ...tools.listTools(),
       ],
     };
   });
-  void server.setRequestHandler;
 
-  // tools/call for the single P1 read tool
+  // tools/call: dispatch to the catalog; MRTR results pass through with
+  // resultType input_required.
   server.setRequestHandler(
     z.object({
       method: z.literal("tools/call"),
@@ -124,16 +127,26 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     async (request) => {
       const params = request.params;
       const principal = await resolveFromRequest(principalResolver, request);
-      if (params.name !== "health_get_system_status") {
-        throw new McpProtocolError("not_found", `unknown tool: ${params.name}`, JSON_RPC.INVALID_PARAMS);
+      if (params.name === "health_get_system_status") {
+        // Liveness probe: a trivial query proves the DB path end to end.
+        await db.execute(sql`SELECT 1`);
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({ status: "ok", server: MCP_SERVER_NAME, version: MCP_SERVER_VERSION, actor: principal.actor }),
+          }],
+        };
       }
-      // Liveness probe: a trivial query proves the DB path end to end.
-      await db.execute(sql`SELECT 1`);
+      const outcome = await tools.call(params.name, {
+        principalUserId: principal.userId,
+        actor: principal.actor,
+        args: params.arguments ?? {},
+      });
       return {
-        content: [{
-          type: "text",
-          text: JSON.stringify({ status: "ok", server: MCP_SERVER_NAME, version: MCP_SERVER_VERSION, actor: principal.actor }),
-        }],
+        ...(outcome.resultType === "input_required"
+          ? { _meta: { "compass.health/resultType": "input_required" } } : {}),
+        isError: outcome.isError === true ? true : undefined,
+        content: outcome.content,
       };
     },
   );
