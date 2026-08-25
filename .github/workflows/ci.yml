@@ -18,7 +18,8 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:16
+        # pgvector is required by 0000 (embeddings); the stock image lacks it.
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: compass
           POSTGRES_PASSWORD: compass
