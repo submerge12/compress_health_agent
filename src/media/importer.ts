@@ -17,6 +17,17 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+import { validateFullDecode } from "./decode-validator.js";
+
+async function fileSizeBytes(filePath: string): Promise<number> {
+  try {
+    const stat = await import("node:fs/promises").then((fs) => fs.stat(filePath));
+    return Number(stat.size);
+  } catch {
+    return 0;
+  }
+}
+
 import { eq } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
@@ -59,8 +70,17 @@ export function parseSrt(content: string): SrtCue[] {
 }
 
 export async function sha256File(filePath: string): Promise<string> {
-  const buffer = await readFile(filePath);
-  return createHash("sha256").update(buffer).digest("hex");
+  // WO-HS-09: stream the file - multi-GB videos must not be read into memory.
+  const { createReadStream } = await import("node:fs");
+  const stat = await import("node:fs/promises").then((fs) => fs.stat(filePath));
+  return new Promise((resolve, reject) => {
+    const hash = createHash("sha256");
+    const stream = createReadStream(filePath);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("end", () => resolve(hash.digest("hex")));
+    stream.on("error", reject);
+    void stat;
+  });
 }
 
 /** ffprobe duration in ms; null when the tool or file is unusable. */
@@ -101,11 +121,18 @@ export function createMediaImporter(db: Db) {
    */
   async function importEntry(entry: ManifestVideo, options?: {
     videoDurationMs?: number | null; // pre-probed (tests); skips ffprobe
+    skipDecodeValidation?: boolean; // tests; skips the expensive full decode
   }): Promise<{ pairingId: string; completeness: string }> {
     const videoSha = await sha256File(entry.localPath);
     const videoDuration = options?.videoDurationMs !== undefined
       ? options.videoDurationMs
       : await probeDurationMs(entry.localPath);
+    // WO-HS-09: header probe is not enough; fully decode to find mid-file
+    // corruption. Tests may skip this via options.skipDecodeValidation.
+    let decode: Awaited<ReturnType<typeof validateFullDecode>> | null = null;
+    if (!options?.videoDurationMs && !options?.skipDecodeValidation) {
+      decode = await validateFullDecode(entry.localPath);
+    }
 
     const [videoAsset] = await db.insert(schema.mediaAssets).values({
       kind: "video",
@@ -115,7 +142,12 @@ export function createMediaImporter(db: Db) {
       sha256: videoSha,
       durationMs: videoDuration,
       probeStatus: videoDuration === null ? "unreadable" : "ok",
-      bytes: (await readFile(entry.localPath)).length > 2 ** 31 ? 2 ** 31 - 1 : 0,
+      ...(decode !== null ? {
+        fullDecodeStatus: decode.fullDecodeStatus,
+        decodeErrorAtMs: decode.decodeErrorAtMs,
+        usableVideoUntilMs: decode.usableVideoUntilMs,
+      } : {}),
+      bytes: await fileSizeBytes(entry.localPath),
     }).onConflictDoUpdate({
       target: [schema.mediaAssets.sha256, schema.mediaAssets.kind],
       set: {
@@ -123,6 +155,11 @@ export function createMediaImporter(db: Db) {
         localPath: entry.localPath,
         durationMs: videoDuration,
         probeStatus: videoDuration === null ? "unreadable" : "ok",
+        ...(decode !== null ? {
+          fullDecodeStatus: decode.fullDecodeStatus,
+          decodeErrorAtMs: decode.decodeErrorAtMs,
+          usableVideoUntilMs: decode.usableVideoUntilMs,
+        } : {}),
         updatedAt: new Date(),
       },
     }).returning();

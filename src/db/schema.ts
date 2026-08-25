@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
+  bigint,
   boolean,
   date,
   doublePrecision,
@@ -581,7 +582,10 @@ export const mediaAssets = compass.table("media_assets", {
   sha256: text("sha256").notNull(),
   durationMs: integer("duration_ms"),
   probeStatus: text("probe_status").notNull().default("unprobed"), // ok | decode_error | unreadable | unprobed
-  bytes: integer("bytes").notNull().default(0),
+  fullDecodeStatus: text("full_decode_status").notNull().default("unprobed"),
+  decodeErrorAtMs: integer("decode_error_at_ms"),
+  usableVideoUntilMs: integer("usable_video_until_ms"),
+  bytes: bigint("bytes", { mode: "number" }).notNull().default(0),
   ...timestamps()
 }, (t) => [
   unique("media_assets_sha_kind_key").on(t.sha256, t.kind),

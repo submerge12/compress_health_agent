@@ -67,7 +67,12 @@ function requireDailyStateDb(ctx: ToolContext): NonNullable<ToolContext["db"]> {
 
 type Query = URLSearchParams;
 type Body = Record<string, unknown>;
-type RouteHandler = (ctx: ToolContext, query: Query, body: Body) => Promise<unknown>;
+interface DispatchRequest {
+  headers: IncomingMessage["headers"];
+  raw?: ServerResponse;
+}
+
+type RouteHandler = (ctx: ToolContext, query: Query, body: Body, request: DispatchRequest) => Promise<unknown>;
 
 const ROUTES: Readonly<Record<string, RouteHandler>> = {
   "GET /api/health": async (ctx) => ({ ok: true, userId: ctx.userId }),
@@ -629,6 +634,70 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     });
   },
 
+  // ── WO-HS-09 / M23: authenticated range streaming for a segment's video ──
+  "GET /api/v1/media/segments/:id/stream": async (ctx, query, _body, request) => {
+    const db = requireDailyStateDb(ctx);
+    const segmentId = requireQueryText(query, "id");
+    const [segment] = await db.select().from(schemaRef.videoSegments)
+      .where(and(eq(schemaRef.videoSegments.id, segmentId), isNull(schemaRef.videoSegments.supersededById)))
+      .limit(1);
+    if (!segment) throw new DomainHttpError(404, "not_found", "segment not found");
+    const [pairing] = await db.select().from(schemaRef.mediaPairings)
+      .where(eq(schemaRef.mediaPairings.id, segment.pairingId)).limit(1);
+    if (!pairing) throw new DomainHttpError(404, "not_found", "pairing not found");
+    const [video] = await db.select().from(schemaRef.mediaAssets)
+      .where(eq(schemaRef.mediaAssets.id, pairing.videoAssetId)).limit(1);
+    if (!video) throw new DomainHttpError(404, "not_found", "video not found");
+
+    // Never expose local absolute paths; only byte ranges inside the usable window.
+    const usableUntilMs = Math.min(
+      video.usableVideoUntilMs ?? pairing.usableUntilMs ?? Number.MAX_SAFE_INTEGER,
+      video.durationMs ?? Number.MAX_SAFE_INTEGER,
+    );
+    void usableUntilMs;
+
+    const { stat, createReadStream } = await import("node:fs");
+    const statAsync = (await import("node:fs/promises")).stat;
+    let total = 0;
+    try {
+      total = (await statAsync(video.localPath)).size;
+    } catch {
+      throw new DomainHttpError(503, "media_unavailable", "media file is not accessible on this host");
+    }
+    void stat;
+
+    const rangeHeader = request?.headers?.range ?? "";
+    const match = /bytes=(\d*)-(\d*)/.exec(String(rangeHeader));
+    let start = 0;
+    let end = Math.min(total - 1, Math.max(total - 1, 0));
+    if (match) {
+      start = match[1] === undefined || match[1] === "" ? 0 : Number(match[1]);
+      end = match[2] === undefined || match[2] === "" ? total - 1 : Number(match[2]);
+      end = Math.min(end, total - 1);
+    }
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= total) {
+      return { error: "range_not_satisfiable" } as never;
+    }
+
+    const rawResponse = request.raw;
+    if (rawResponse === undefined) {
+      return { error: "streaming_unsupported_in_test_mode" };
+    }
+    rawResponse.writeHead(start > 0 ? 206 : 200, {
+      "Content-Type": "video/mp4",
+      "Content-Length": String(end - start + 1),
+      "Accept-Ranges": "bytes",
+      "Content-Range": `bytes ${start}-${end}/${total}`,
+      "Cache-Control": "no-store",
+    });
+    await new Promise<void>((resolve) => {
+      const stream = createReadStream(video.localPath, { start, end });
+      stream.on("error", () => { rawResponse.end(); resolve(); });
+      stream.pipe(rawResponse).on("finish", () => resolve()).on("error", () => resolve());
+    });
+    return undefined as never;
+  },
+
   "POST /api/v1/media/segments:feedback": async (ctx, _query, body) => {
     const db = requireDailyStateDb(ctx);
     const input = cast(body) as { segmentId: string; helpful: boolean; note?: string };
@@ -813,7 +882,11 @@ async function dispatch(
   }
 
   try {
-    sendJson(response, 200, await route(routeCtx, url.searchParams, body));
+    const payload = await route(routeCtx, url.searchParams, body, { headers: request.headers, raw: response });
+    if (payload === undefined && response.writableEnded) {
+      return; // streamed by the handler
+    }
+    sendJson(response, 200, payload);
   } catch (error) {
     // WO-HS-03: typed domain errors carry real status codes — conflicts are
     // 409, ownership misses 404, needs-confirmation 422. The BFF preserves

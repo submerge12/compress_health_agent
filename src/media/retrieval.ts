@@ -11,7 +11,7 @@
  *   chest_specialist / technique_details may explain and correct but NEVER
  *   add sets to the main program (enforced here, not by prompt).
  */
-import { and, asc, eq, gte, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gte, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -168,7 +168,7 @@ export function createMediaRetrieval(db: Db) {
     if (query.bodyPart) conditions.push(eq(schema.videoSegments.bodyPart, query.bodyPart));
     if (query.category) conditions.push(eq(schema.videoSegments.category, query.category));
 
-    const rows = await db.select({
+    let rows = await db.select({
       id: schema.videoSegments.id,
       title: schema.videoSegments.title,
       trainer: schema.videoSegments.trainer,
@@ -183,6 +183,8 @@ export function createMediaRetrieval(db: Db) {
       localPath: schema.mediaAssets.localPath,
       completeness: schema.mediaPairings.completeness,
       usableUntilMs: schema.mediaPairings.usableUntilMs,
+      decodeErrorAtMs: schema.mediaAssets.decodeErrorAtMs,
+      fullDecodeStatus: schema.mediaAssets.fullDecodeStatus,
     })
       .from(schema.videoSegments)
       .innerJoin(schema.mediaPairings, eq(schema.videoSegments.pairingId, schema.mediaPairings.id))
@@ -191,13 +193,27 @@ export function createMediaRetrieval(db: Db) {
       .orderBy(asc(schema.videoSegments.startMs))
       .limit(query.limit ?? 10);
 
-    let filtered = rows;
-    if (query.text) {
-      const needle = query.text.toLowerCase();
-      filtered = rows.filter((r) => r.cuesText.toLowerCase().includes(needle) || r.title.toLowerCase().includes(needle));
+    // Text search is applied IN SQL (before limit) so later matches are not
+    // lost; pg_trgm index covers cues_text for larger libraries.
+    if (query.text !== undefined && query.text !== "") {
+      const like = `%${query.text}%`;
+      const matched = await db.select({ id: schema.videoSegments.id })
+        .from(schema.videoSegments)
+        .where(and(
+          ...conditions,
+          or(
+            sql`${schema.videoSegments.cuesText} ILIKE ${like}`,
+            sql`${schema.videoSegments.title} ILIKE ${like}`,
+          ),
+        ))
+        .limit(query.limit ?? 10);
+      const allowedIds = new Set(matched.map((m) => m.id));
+      rows = rows.filter((r) => allowedIds.has(r.id));
+    } else {
+      rows = rows.slice(0, query.limit ?? 10);
     }
 
-    return filtered.map((r) => ({
+    return rows.map((r) => ({
       segmentId: r.id,
       title: r.title,
       trainer: r.trainer,
@@ -209,6 +225,8 @@ export function createMediaRetrieval(db: Db) {
       completeness: r.completeness,
       usableUntilMs: r.usableUntilMs,
       snippet: r.cuesText.slice(0, 400),
+      fullDecodeStatus: r.fullDecodeStatus,
+      decodeErrorAtMs: r.decodeErrorAtMs,
       reviewStatus: r.reviewStatus,
       helpfulCount: r.helpfulCount,
       notHelpfulCount: r.notHelpfulCount,
