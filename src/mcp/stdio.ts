@@ -1,0 +1,73 @@
+/**
+ * P1 / WO-MCP-2: STDIO transport entry for local Codex usage.
+ *
+ * Codex config (~/.codex/config.toml):
+ *   [mcp_servers.compass_health]
+ *   command = "node"
+ *   args = ["G:/compress_health_agent/dist/mcp/stdio.js"]
+ *   [mcp_servers.compass_health.env]
+ *   COMPASS_HEALTH_USER_BINDING = "compass-health:1"
+ *
+ * Environment:
+ * - DATABASE_URL                     (required) PostgreSQL DSN
+ * - COMPASS_HEALTH_USER_BINDING      (required) external id of the single
+ *                                     local user; no binding, no tools
+ * - COMPASS_HEALTH_ACTOR             (optional) actor label, default codex-primary
+ *
+ * STDIO mode never listens on a port and never reads bearer tokens: the OS
+ * user that launched the process IS the principal.
+ */
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+
+import { initToolContext } from "../tools/context.js";
+import { assertSchemaReady } from "../db/migrate.js";
+import { createHealthMcpServer } from "./server-core.js";
+
+async function main(): Promise<void> {
+  const databaseUrl = process.env.DATABASE_URL
+    ?? "postgres://compass:compass@localhost:5433/compass_health";
+  const externalUserId = process.env.COMPASS_HEALTH_USER_BINDING;
+
+  if (!externalUserId) {
+    // Fail loudly on stderr (stdout is the MCP channel) and exit — a server
+    // without a user binding would silently act as nobody.
+    process.stderr.write("compass-health MCP: COMPASS_HEALTH_USER_BINDING is required\n");
+    process.exit(2);
+  }
+
+  await assertSchemaReady(databaseUrl);
+
+  const ctx = await initToolContext({
+    externalUserId,
+    locale: "zh",
+    databaseUrl,
+    timezone: process.env.COMPASS_HEALTH_TIMEZONE ?? "Asia/Shanghai",
+  });
+  if (!ctx.db) {
+    process.stderr.write("compass-health MCP: database-backed context is required\n");
+    process.exit(2);
+  }
+
+  const server = createHealthMcpServer({
+    db: ctx.db,
+    repo: ctx.repo,
+    externalUserId,
+    actor: process.env.COMPASS_HEALTH_ACTOR,
+  });
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  process.stderr.write(`compass-health MCP: ready on stdio (binding=${externalUserId})\n`);
+
+  const shutdown = async () => {
+    await ctx.close();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+}
+
+main().catch((error: unknown) => {
+  process.stderr.write(`compass-health MCP: fatal: ${error instanceof Error ? error.message : String(error)}\n`);
+  process.exit(1);
+});

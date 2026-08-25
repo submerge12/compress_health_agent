@@ -28,6 +28,7 @@
     "dev:repl": "tsx src/dev-repl.ts",
     "start": "tsx src/index.ts",
     "serve:display": "tsx src/server/serve.ts",
+    "mcp:stdio": "tsx src/mcp/stdio.ts",
     "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
@@ -38,9 +39,11 @@
     "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
-    "postgres": "^3.4.9"
+    "postgres": "^3.4.9",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.19.21",
