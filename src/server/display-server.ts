@@ -364,6 +364,17 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     const service = createTrainingService(db);
     const proposal = await service.prepareSession(ctx.userId, date, day);
 
+    // WO-HS-07: cycle/readiness recommendation is advisory (shadow mode) -
+    // it never silently changes the requested day or the active plan.
+    let cycleRecommendation: unknown = null;
+    try {
+      const { createCycleEngine } = await import("../training/cycle-engine.js");
+      cycleRecommendation = await createCycleEngine(db).decide(ctx.userId, date);
+    } catch {
+      cycleRecommendation = null;
+    }
+    void cycleRecommendation;
+
     // WO-HS-06: body-part pain constraints additionally block pattern families.
     const constraints = await db.select().from(schemaRef.healthConstraints).where(and(
       eq(schemaRef.healthConstraints.userId, ctx.userId),
@@ -403,7 +414,7 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
       activeConstraints: proposal.activeConstraints as unknown as Array<Record<string, unknown>>,
     });
     void schemaRef;
-    return { ...proposal, proposalId: saved.proposalId };
+    return { ...proposal, proposalId: saved.proposalId, cycleRecommendation };
   },
 
   "POST /api/v1/training/sessions": async (ctx, _query, body) => {

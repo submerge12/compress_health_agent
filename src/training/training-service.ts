@@ -107,13 +107,71 @@ export function createTrainingService(db: Db) {
    */
   async function prepareSession(userId: string, sessionDate: string, requestedDay?: "A" | "B" | "C") {
     await ensureUserProgram(userId);
-    const [template] = await db.select().from(schema.trainingTemplates)
+
+    // WO-HS-07: the ACTIVE plan version is authoritative (its content_json is
+    // a complete compiled plan). Templates are only the initial seed.
+    const [assignment] = await db.select().from(schema.activePlanAssignments)
       .where(and(
-        eq(schema.trainingTemplates.userId, userId),
-        ...(requestedDay ? [eq(schema.trainingTemplates.dayRole, requestedDay)] : []),
+        eq(schema.activePlanAssignments.userId, userId),
+        eq(schema.activePlanAssignments.scope, "training_template"),
       ))
       .limit(1);
-    if (!template) throw new RangeError("no training template found for the request");
+    const [activeVersion] = assignment
+      ? await db.select().from(schema.planVersions)
+          .where(eq(schema.planVersions.id, assignment.planVersionId))
+          .limit(1)
+      : [];
+
+    let dayRole: string;
+    let items: Array<{
+      exerciseSlug: string; nameZh?: string; movementPattern?: string; sets: number;
+      repRangeLow?: number; repRangeHigh?: number; rirLow?: number; rirHigh?: number;
+      alternates?: string[]; note?: string;
+    }>;
+    let planVersionId: string | undefined;
+
+    if (activeVersion) {
+      const content = activeVersion.contentJson as {
+        cyclePattern?: string[];
+        // Compiled (WO-HS-07): days keyed by A/B/C.
+        days?: Record<string, Array<Record<string, unknown>>>;
+        // Legacy seed format: days is an ARRAY of {dayRole|name, items}.
+        legacyDays?: Array<{ dayRole?: string; name?: string; items?: Array<Record<string, unknown>> }>;
+      };
+      let dayList: Record<string, Array<Record<string, unknown>>> = {};
+      if (content.days && !Array.isArray(content.days)) {
+        dayList = content.days;
+      } else {
+        for (const day of (Array.isArray(content.days) ? content.days : [])) {
+          const typed = day as { dayRole?: string; name?: string; items?: Array<Record<string, unknown>> };
+          const key = (typed.dayRole
+            ?? (typed.name?.startsWith("胸") ? "A"
+              : typed.name?.includes("背") || typed.name?.includes("肩后束") ? "B"
+              : typed.name?.includes("腿") ? "C" : undefined)
+            ?? "").toUpperCase();
+          if (key && typed.items) dayList[key] = typed.items;
+        }
+      }
+      const role = requestedDay ?? content.cyclePattern?.[0]?.toUpperCase() ?? "A";
+      const dayItems = dayList[role];
+      if (!dayItems || dayItems.length === 0) {
+        throw new RangeError(`no training plan found for the request (${role})`);
+      }
+      dayRole = role;
+      planVersionId = activeVersion.id;
+      items = dayItems as typeof items;
+    } else {
+      const [template] = await db.select().from(schema.trainingTemplates)
+        .where(and(
+          eq(schema.trainingTemplates.userId, userId),
+          ...(requestedDay ? [eq(schema.trainingTemplates.dayRole, requestedDay)] : []),
+        ))
+        .limit(1);
+      if (!template) throw new RangeError("no training template found for the request");
+      dayRole = template.dayRole;
+      planVersionId = template.sourceVersionId ?? undefined;
+      items = template.itemsJson as typeof items;
+    }
 
     const constraints = await listActiveConstraints(userId, sessionDate);
     const blockedPatterns = new Set(
@@ -125,17 +183,12 @@ export function createTrainingService(db: Db) {
         }),
     );
 
-    const items = (template.itemsJson as unknown as Array<{
-      exerciseSlug: string; nameZh: string; movementPattern: string; sets: number;
-      repRangeLow?: number; repRangeHigh?: number; rirLow?: number; rirHigh?: number;
-      alternates?: string[]; note?: string;
-    }>);
-    const kept = items.filter((item) => !blockedPatterns.has(item.movementPattern));
-    const blocked = items.filter((item) => blockedPatterns.has(item.movementPattern));
+    const kept = items.filter((item) => !blockedPatterns.has(String(item.movementPattern)));
+    const blocked = items.filter((item) => blockedPatterns.has(String(item.movementPattern)));
 
     return {
-      dayRole: template.dayRole,
-      planVersionId: template.sourceVersionId,
+      dayRole,
+      planVersionId,
       proposedExercises: kept.map((item) => ({
         ...item,
         status: blockedPatterns.size > 0 && kept.length < items.length ? "adjusted_for_constraints" : "as_planned",
@@ -199,6 +252,53 @@ export function createTrainingService(db: Db) {
       .limit(1);
     if (!session) throw new NotOwnedError("training_session");
     return session;
+  }
+
+  /**
+   * WO-HS-06: create a session directly from a prepared proposal's exercise
+   * list — no template lookup, so the constraint-filtered plan is exactly
+   * what lands in the database (J04 acceptance).
+   */
+  async function startSessionFromProposal(input: {
+    userId: string;
+    sessionDate: string;
+    dayRole: "A" | "B" | "C";
+    planVersionId?: string;
+    exercises: Array<{
+      order: number;
+      exerciseSlug: string;
+      sets: number;
+      repRangeLow?: number;
+      repRangeHigh?: number;
+      rirLow?: number;
+      rirHigh?: number;
+    }>;
+    journeyId?: string;
+  }): Promise<SessionRow> {
+    return db.transaction(async (tx) => {
+      const [session] = await tx.insert(schema.trainingSessions).values({
+        userId: input.userId,
+        sessionDate: input.sessionDate,
+        planVersionId: input.planVersionId ?? null,
+        status: "in_progress",
+        startedAt: new Date(),
+        journeyId: input.journeyId ?? null,
+      }).returning();
+      if (!session) throw new Error("session insert returned no row");
+
+      const exercises = [...input.exercises].sort((a, b) => a.order - b.order);
+      await tx.insert(schema.trainingSessionExercises).values(exercises.map((item) => ({
+        sessionId: session.id,
+        exerciseSlug: item.exerciseSlug,
+        orderIndex: item.order,
+        targetSets: item.sets,
+        targetRepRangeLow: item.repRangeLow ?? null,
+        targetRepRangeHigh: item.repRangeHigh ?? null,
+        targetRirLow: item.rirLow ?? null,
+        targetRirHigh: item.rirHigh ?? null,
+      })));
+      return session;
+    });
   }
 
   async function finishSession(userId: string, sessionId: string, finalStatus: "completed" | "interrupted" | "cancelled"): Promise<SessionRow> {
@@ -308,6 +408,7 @@ export function createTrainingService(db: Db) {
     ensureUserProgram,
     prepareSession,
     startSession,
+    startSessionFromProposal,
     finishSession,
     recordSet,
     readBackSession,
