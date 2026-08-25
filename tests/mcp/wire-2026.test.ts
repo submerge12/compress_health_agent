@@ -1062,8 +1062,10 @@ describe("MCP 2026-07-28 stdio wire", () => {
           count(DISTINCT receipt.user_id)::int AS users,
           count(*)::int AS receipts
         FROM compass_health.mcp_write_receipts receipt
+        JOIN compass_health.users usr ON usr.id = receipt.user_id
         WHERE receipt.tool_name = 'health_record_set'
-          AND receipt.idempotency_key = 'shared-training-set-key'`;
+          AND receipt.idempotency_key = 'shared-training-set-key'
+          AND usr.external_id IN (${userA}, ${userB})`;
       expect(counts).toMatchObject({ users: 2, receipts: 2 });
     } finally {
       await sql.end({ timeout: 3 });
