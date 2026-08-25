@@ -926,16 +926,58 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(replayed.result?.structuredContent).toMatchObject({
       date: "2026-08-24",
       status: "fresh",
+      drained: 1,
+      diagnostics: {
+        status: "fresh",
+        outbox: { pending: 0, processing: 0, deadLetter: 0 },
+      },
     });
     expect((replayed.result?.structuredContent as { revived: number }).revived).toBeGreaterThan(0);
     const diagnostics = await client.request(toolCall(6, "health_get_projection_diagnostics", {
       date: "2026-08-24",
     }));
     expect(diagnostics.result?.structuredContent).toMatchObject({
-      outbox: { deadLetter: 0 },
+      status: "fresh",
+      outbox: { pending: 0, processing: 0, deadLetter: 0 },
     });
 
-    const evidence = await client.request(toolCall(7, "health_get_run_evidence", { runHandle }));
+    const repairedRead = await client.request(resourceRead(
+      7,
+      "health://daily-state/2026-08-24",
+      runHandle,
+    ));
+    const repaired = JSON.parse(
+      (repairedRead.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as { waterTotalMl: number; projection: { status: string } };
+    expect(repaired).toMatchObject({
+      waterTotalMl: 222,
+      projection: { status: "fresh" },
+    });
+
+    const replayAudit = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [counts] = await replayAudit`
+        SELECT
+          (SELECT status FROM compass_health.outbox_events
+           WHERE aggregate_id = ${waterLogId}) AS repaired_status,
+          (SELECT count(*)::int FROM compass_health.outbox_events
+           WHERE type = 'projection.replayed'
+             AND payload_json ->> 'observedOn' = '2026-08-24') AS replay_outbox,
+          (SELECT count(*)::int FROM compass_health.interaction_events interaction
+           JOIN compass_health.users usr ON usr.id = interaction.user_id
+           WHERE usr.external_id = ${externalUserId}
+             AND interaction.stage = 'projection_replay'
+             AND interaction.stage_code = 'ok') AS operational_audits`;
+      expect(counts).toMatchObject({
+        repaired_status: "done",
+        replay_outbox: 0,
+        operational_audits: 1,
+      });
+    } finally {
+      await replayAudit.end({ timeout: 3 });
+    }
+
+    const evidence = await client.request(toolCall(8, "health_get_run_evidence", { runHandle }));
     const steps = (evidence.result?.structuredContent as {
       steps: Array<{ stage: string; resourceUri: string | null }>;
     }).steps;

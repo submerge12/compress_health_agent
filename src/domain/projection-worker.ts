@@ -70,6 +70,17 @@ export interface ProjectionWorkerOptions {
   now?: () => Date;
 }
 
+export class ProjectionReplayError extends Error {
+  readonly code = "projection_replay_not_drained";
+
+  constructor(readonly diagnostics: Awaited<ReturnType<ProjectionWorker["getDiagnostics"]>>) {
+    super(
+      `projection replay did not drain: pending=${diagnostics.outbox.pending}, `
+      + `processing=${diagnostics.outbox.processing}, deadLetter=${diagnostics.outbox.deadLetter}`,
+    );
+  }
+}
+
 export function createProjectionWorker(
   db: Db,
   repo: Repository,
@@ -93,6 +104,7 @@ export function createProjectionWorker(
   async function claimNext(
     claimAt: Date,
     onlyUserId?: string,
+    localDate?: string,
   ): Promise<typeof schema.outboxEvents.$inferSelect | undefined> {
     return db.transaction(async (tx) => {
       const claimed = await tx.select().from(schema.outboxEvents)
@@ -111,6 +123,7 @@ export function createProjectionWorker(
             ),
           ),
           ...(onlyUserId === undefined ? [] : [eq(schema.outboxEvents.userId, onlyUserId)]),
+          ...(localDate === undefined ? [] : [eventMatchesDate(localDate)]),
         ))
         .orderBy(asc(schema.outboxEvents.createdAt))
         .limit(1)
@@ -201,10 +214,14 @@ export function createProjectionWorker(
     }
   }
 
-  async function runOnce(runAt = now(), onlyUserId?: string): Promise<WorkerRunResult> {
+  async function runOnce(
+    runAt = now(),
+    onlyUserId?: string,
+    localDate?: string,
+  ): Promise<WorkerRunResult> {
     const result: WorkerRunResult = { processed: 0, succeeded: 0, deadLettered: 0, requeued: 0 };
     for (let i = 0; i < batchSize; i++) {
-      const event = await claimNext(runAt, onlyUserId);
+      const event = await claimNext(runAt, onlyUserId, localDate);
       if (!event) break;
       result.processed += 1;
       const stopHeartbeat = startLeaseHeartbeat(event.id);
@@ -252,10 +269,35 @@ export function createProjectionWorker(
     return revived.length;
   }
 
-  /** Full rebuild path: drop the read model row and rebuild from facts. */
+  async function drainUserDate(
+    userId: string,
+    localDate: string,
+    maxBatches = 100,
+  ): Promise<{ processed: number; succeeded: number; diagnostics: Awaited<ReturnType<typeof getDiagnostics>> }> {
+    let processed = 0;
+    let succeeded = 0;
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const result = await runOnce(now(), userId, localDate);
+      processed += result.processed;
+      succeeded += result.succeeded;
+      if (result.processed === 0) break;
+    }
+    const diagnostics = await getDiagnostics(userId, localDate);
+    if (
+      diagnostics.outbox.pending > 0
+      || diagnostics.outbox.processing > 0
+      || diagnostics.outbox.deadLetter > 0
+    ) {
+      throw new ProjectionReplayError(diagnostics);
+    }
+    return { processed, succeeded, diagnostics };
+  }
+
+  /** Full rebuild path: overwrite from facts while preserving revision monotonicity. */
   async function rebuildUserProjection(userId: string, localDate: string): Promise<void> {
     const tz = await resolveTimezone(userId);
-    await db.delete(schema.dailyHealthStateProjection)
+    await db.update(schema.dailyHealthStateProjection)
+      .set({ projectionStatus: "rebuilding", updatedAt: now() })
       .where(and(
         eq(schema.dailyHealthStateProjection.userId, userId),
         eq(schema.dailyHealthStateProjection.stateDate, localDate),
@@ -277,6 +319,12 @@ export function createProjectionWorker(
           eq(schema.projectionCheckpoints.checkpointKey, `${userId}:${localDate}`),
         ));
     } catch (error) {
+      await db.update(schema.dailyHealthStateProjection)
+        .set({ projectionStatus: "failed", updatedAt: now() })
+        .where(and(
+          eq(schema.dailyHealthStateProjection.userId, userId),
+          eq(schema.dailyHealthStateProjection.stateDate, localDate),
+        ));
       await db.update(schema.projectionCheckpoints)
         .set({ status: "failed", updatedAt: new Date() })
         .where(and(
@@ -357,7 +405,13 @@ export function createProjectionWorker(
     };
   }
 
-  return { runOnce, replayDeadLetters, rebuildUserProjection, getDiagnostics };
+  return {
+    runOnce,
+    replayDeadLetters,
+    drainUserDate,
+    rebuildUserProjection,
+    getDiagnostics,
+  };
 }
 
 export type ProjectionWorker = ReturnType<typeof createProjectionWorker>;

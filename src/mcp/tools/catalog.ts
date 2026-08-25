@@ -27,7 +27,10 @@ import {
   StateConflict,
 } from "../../domain/diet-log-service.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
-import { createProjectionWorker } from "../../domain/projection-worker.js";
+import {
+  createProjectionWorker,
+  ProjectionReplayError,
+} from "../../domain/projection-worker.js";
 import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createHealthRecordingService } from "../../domain/health-recording-service.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
@@ -585,7 +588,7 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_replay_projection",
-      description: "Requeue this user's dead letters and rebuild one daily-state projection.",
+      description: "Requeue and drain this user's dated dead letters, rebuild from facts, verify fresh diagnostics, and write an operational audit.",
       risk: "state-change",
       inputSchema: {
         type: "object",
@@ -604,6 +607,7 @@ export function createHealthToolCatalog(
             const txDb = tx as unknown as Db;
             const worker = createProjectionWorker(txDb, createRepository(txDb));
             const revived = await worker.replayDeadLetters(inv.principalUserId, date);
+            const drained = await worker.drainUserDate(inv.principalUserId, date);
             await worker.rebuildUserProjection(inv.principalUserId, date);
             const [projection] = await tx.select().from(schema.dailyHealthStateProjection)
               .where(and(
@@ -611,18 +615,44 @@ export function createHealthToolCatalog(
                 eq(schema.dailyHealthStateProjection.stateDate, date),
               )).limit(1);
             if (!projection) throw new Error("projection replay read-back failed");
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
+            const diagnostics = await worker.getDiagnostics(inv.principalUserId, date);
+            if (
+              diagnostics.status !== "fresh"
+              || diagnostics.outbox.pending !== 0
+              || diagnostics.outbox.processing !== 0
+              || diagnostics.outbox.deadLetter !== 0
+            ) {
+              throw new ProjectionReplayError(diagnostics);
+            }
+            const [audit] = await tx.insert(schema.interactionEvents).values({
               userId: inv.principalUserId,
-              aggregateType: "user_decision",
-              aggregateId: `${inv.principalUserId}:${date}`,
-              eventType: "projection.replayed",
-              payloadJson: { observedOn: date, revived },
-            }).returning({ id: schema.outboxEvents.id });
-            if (!outbox) throw new Error("projection replay outbox failed");
+              requestId: str(inv.args, "runHandle"),
+              actor: `mcp:${inv.actor}`,
+              stage: "projection_replay",
+              stageCode: "ok",
+              detailJson: {
+                localDate: date,
+                revived,
+                drained: drained.succeeded,
+                revision: projection.revision,
+              },
+            }).returning({ id: schema.interactionEvents.id });
+            if (!audit) throw new Error("projection replay audit failed");
             return {
-              response: { date, revived, revision: projection.revision, status: projection.projectionStatus },
-              factRefs: [{ type: "daily_state_projection", id: `${inv.principalUserId}:${date}` }],
-              outboxEventIds: [outbox.id],
+              response: {
+                date,
+                revived,
+                drained: drained.succeeded,
+                revision: projection.revision,
+                status: diagnostics.status,
+                diagnostics,
+              },
+              factRefs: [
+                { type: "daily_state_projection", id: `${inv.principalUserId}:${date}` },
+                { type: "operational_audit", id: audit.id },
+              ],
+              outboxEventIds: [],
+              auditEventIds: [audit.id],
             };
           },
         );
@@ -2027,6 +2057,9 @@ export function createHealthToolCatalog(
         }
         if (error instanceof SubstitutionProposalError) {
           return toolError("proposal_stale", error.reason);
+        }
+        if (error instanceof ProjectionReplayError) {
+          return toolError("domain_unavailable", error.message);
         }
         if (error instanceof WriteCommandError) {
           return toolError(error.code, error.message);

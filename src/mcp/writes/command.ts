@@ -17,6 +17,8 @@ export interface WriteMutation {
   response: Record<string, unknown>;
   factRefs: Array<{ type: string; id: string }>;
   outboxEventIds: string[];
+  /** Operational maintenance writes audit here instead of re-entering health projection. */
+  auditEventIds?: string[];
 }
 
 export interface WriteCommandInput {
@@ -198,10 +200,14 @@ export function createWriteCommandService(db: Db) {
       }
 
       const mutation = await mutate(tx);
-      if (mutation.factRefs.length === 0 || mutation.outboxEventIds.length === 0) {
+      const auditEventIds = mutation.auditEventIds ?? [];
+      if (
+        mutation.factRefs.length === 0
+        || (mutation.outboxEventIds.length === 0 && auditEventIds.length === 0)
+      ) {
         throw new WriteCommandError(
           "write_contract_failed",
-          "write must return at least one fact and one outbox event",
+          "write must return at least one fact and one outbox or operational audit event",
         );
       }
 
@@ -220,11 +226,24 @@ export function createWriteCommandService(db: Db) {
         outboxEventIdsJson: mutation.outboxEventIds,
         responseJson: response,
       });
-      const outboxReadBack = await tx.select({ id: schema.outboxEvents.id })
-        .from(schema.outboxEvents)
-        .where(inArray(schema.outboxEvents.id, mutation.outboxEventIds));
-      if (outboxReadBack.length !== mutation.outboxEventIds.length) {
-        throw new WriteCommandError("write_contract_failed", "outbox read-back did not match mutation");
+      if (mutation.outboxEventIds.length > 0) {
+        const outboxReadBack = await tx.select({ id: schema.outboxEvents.id })
+          .from(schema.outboxEvents)
+          .where(inArray(schema.outboxEvents.id, mutation.outboxEventIds));
+        if (outboxReadBack.length !== mutation.outboxEventIds.length) {
+          throw new WriteCommandError("write_contract_failed", "outbox read-back did not match mutation");
+        }
+      }
+      if (auditEventIds.length > 0) {
+        const auditReadBack = await tx.select({ id: schema.interactionEvents.id })
+          .from(schema.interactionEvents)
+          .where(and(
+            inArray(schema.interactionEvents.id, auditEventIds),
+            eq(schema.interactionEvents.userId, input.userId),
+          ));
+        if (auditReadBack.length !== auditEventIds.length) {
+          throw new WriteCommandError("write_contract_failed", "audit read-back did not match mutation");
+        }
       }
       const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
         eq(schema.mcpWriteReceipts.id, receiptId),
@@ -248,6 +267,7 @@ export function createWriteCommandService(db: Db) {
           receiptId,
           facts: mutation.factRefs,
           outboxEventIds: mutation.outboxEventIds,
+          auditEventIds,
         },
       });
 
