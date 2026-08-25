@@ -618,7 +618,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     let childId = "";
     try {
       const [user] = await sql`SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
-      const scope = `activation-replay-${Date.now()}`;
+      const scope = "training_template";
       const [parent] = await sql`
         INSERT INTO compass_health.plan_versions
           (user_id, scope, status, content_json, version_number)
@@ -629,6 +629,9 @@ describe("MCP 2026-07-28 stdio wire", () => {
           (user_id, scope, status, parent_version_id, content_json, version_number)
         VALUES (${user!.id}::uuid, ${scope}, 'draft', ${parent!.id}::uuid, '{"days":{}}'::jsonb, 2)
         RETURNING id`;
+      await sql`
+        INSERT INTO compass_health.active_plan_assignments (user_id, scope, plan_version_id)
+        VALUES (${user!.id}::uuid, ${scope}, ${parent!.id}::uuid)`;
       childId = String(child!.id);
     } finally {
       await sql.end({ timeout: 3 });
@@ -1844,7 +1847,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(rerankedIds.indexOf(segmentIds.get("curun-draft-popular")!)).toBeGreaterThan(1);
   }, 35_000);
 
-  it("executes J07 reflection, child proposal, and confirmed activation", async () => {
+  it("executes J07 non-empty plan diff, activation, next prepare, and rollback", async () => {
     const binding = `mcp-wire-j07-${process.pid}-${Date.now()}`;
     const client = new WireClient({ externalUserId: binding });
     clients.push(client);
@@ -1859,7 +1862,16 @@ describe("MCP 2026-07-28 stdio wire", () => {
       day: "A",
       idempotencyKey: "wire-j07-prepare",
     }));
-    const proposalId = (prepared.result?.structuredContent as { trainingProposalId: string }).trainingProposalId;
+    const preparedBody = prepared.result?.structuredContent as {
+      trainingProposalId: string;
+      proposedExercises: Array<{ exerciseSlug: string }>;
+    };
+    const proposalId = preparedBody.trainingProposalId;
+    const originalOrder = preparedBody.proposedExercises.map((exercise) => exercise.exerciseSlug);
+    expect(originalOrder.slice(0, 2)).toEqual([
+      "barbell_bench_press",
+      "incline_dumbbell_press",
+    ]);
     const started = await client.request(toolCall(3, "health_start_training", {
       runHandle,
       trainingProposalId: proposalId,
@@ -1878,18 +1890,54 @@ describe("MCP 2026-07-28 stdio wire", () => {
       runHandle,
       trainingSessionId: sessionId,
       bestCueRefs: [],
-      proposedAdjustments: [],
+      proposedAdjustments: [{
+        kind: "cue_change",
+        target: "barbell_bench_press",
+        change: "place incline press first for the next validation",
+        reason: "compare upper-chest recruitment while fresh",
+        riskLevel: "low",
+      }],
       idempotencyKey: "wire-j07-reflection",
     }));
     const reflectionId = (reflected.result?.structuredContent as { reflectionId: string }).reflectionId;
     const proposed = await client.request(toolCall(6, "health_propose_plan_change", {
       runHandle,
       reflectionId,
-      changes: [],
+      changes: [{
+        kind: "reorder",
+        dayRole: "A",
+        order: ["incline_dumbbell_press", "barbell_bench_press"],
+      }],
       reason: "wire J07 validation",
       idempotencyKey: "wire-j07-propose-plan",
     }));
-    const childVersionId = (proposed.result?.structuredContent as { childVersionId: string }).childVersionId;
+    const proposedBody = proposed.result?.structuredContent as {
+      childVersionId: string;
+      parentVersionId: string;
+      diff: {
+        changedDays: Array<{ dayRole: string; beforeOrder: string[]; afterOrder: string[] }>;
+      };
+    };
+    const childVersionId = proposedBody.childVersionId;
+    const parentVersionId = proposedBody.parentVersionId;
+    expect(proposedBody.diff.changedDays).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        dayRole: "A",
+        beforeOrder: expect.arrayContaining(["barbell_bench_press", "incline_dumbbell_press"]),
+        afterOrder: expect.arrayContaining(["incline_dumbbell_press", "barbell_bench_press"]),
+      }),
+    ]));
+    const verify = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let parentContentBefore: unknown;
+    try {
+      const [parent] = await verify`
+        SELECT content_json, status FROM compass_health.plan_versions
+        WHERE id = ${parentVersionId}::uuid`;
+      parentContentBefore = parent?.content_json;
+      expect(parent?.status).toBe("active");
+    } finally {
+      await verify.end({ timeout: 3 });
+    }
     const activationArgs = {
       runHandle,
       planVersionId: childVersionId,
@@ -1897,6 +1945,13 @@ describe("MCP 2026-07-28 stdio wire", () => {
     };
     const pending = await client.request(toolCall(7, "health_activate_plan_version", activationArgs));
     expect(pending.result?.resultType).toBe("input_required");
+    const activationMessage = (((pending.result?.inputRequests as {
+      confirmation: { params: { message: string } };
+    }).confirmation.params.message));
+    expect(activationMessage).toContain("barbell_bench_press");
+    expect(activationMessage).toContain("incline_dumbbell_press");
+    expect(activationMessage).toContain("beforeOrder");
+    expect(activationMessage).toContain("afterOrder");
     const activated = await client.request(toolCall(8, "health_activate_plan_version", activationArgs, {
       requestState: pending.result?.requestState as string,
       inputResponses: {
@@ -1908,5 +1963,71 @@ describe("MCP 2026-07-28 stdio wire", () => {
       activated: true,
       status: "active",
     });
-  }, 35_000);
+
+    const nextPrepared = await client.request(toolCall(9, "health_prepare_training", {
+      runHandle,
+      date: "2026-08-16",
+      day: "A",
+      idempotencyKey: "wire-j07-prepare-child",
+    }));
+    const nextBody = nextPrepared.result?.structuredContent as {
+      planVersionId: string;
+      proposedExercises: Array<{ exerciseSlug: string }>;
+    };
+    expect(nextBody.planVersionId).toBe(childVersionId);
+    expect(nextBody.proposedExercises.slice(0, 2).map((exercise) => exercise.exerciseSlug)).toEqual([
+      "incline_dumbbell_press",
+      "barbell_bench_press",
+    ]);
+
+    const postActivation = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [parent] = await postActivation`
+        SELECT content_json, status FROM compass_health.plan_versions
+        WHERE id = ${parentVersionId}::uuid`;
+      const [child] = await postActivation`
+        SELECT content_json, status FROM compass_health.plan_versions
+        WHERE id = ${childVersionId}::uuid`;
+      expect(parent?.status).toBe("superseded");
+      expect(parent?.content_json).toEqual(parentContentBefore);
+      expect(child?.status).toBe("active");
+      expect(child?.content_json).not.toEqual(parentContentBefore);
+    } finally {
+      await postActivation.end({ timeout: 3 });
+    }
+
+    const rollbackArgs = {
+      runHandle,
+      planVersionId: parentVersionId,
+      idempotencyKey: "wire-j07-rollback-parent",
+    };
+    const rollbackPending = await client.request(toolCall(10, "health_activate_plan_version", rollbackArgs));
+    expect(rollbackPending.result?.resultType).toBe("input_required");
+    const rolledBack = await client.request(toolCall(11, "health_activate_plan_version", rollbackArgs, {
+      requestState: rollbackPending.result?.requestState as string,
+      inputResponses: {
+        confirmation: { action: "accept", content: { choice: "确认激活" } },
+      },
+    }));
+    expect(rolledBack.result?.structuredContent).toMatchObject({
+      planVersionId: parentVersionId,
+      activated: true,
+      status: "active",
+      direction: "rollback",
+      previousVersionId: childVersionId,
+    });
+
+    const restored = await client.request(toolCall(12, "health_prepare_training", {
+      runHandle,
+      date: "2026-08-17",
+      day: "A",
+      idempotencyKey: "wire-j07-prepare-restored",
+    }));
+    const restoredBody = restored.result?.structuredContent as {
+      planVersionId: string;
+      proposedExercises: Array<{ exerciseSlug: string }>;
+    };
+    expect(restoredBody.planVersionId).toBe(parentVersionId);
+    expect(restoredBody.proposedExercises.map((exercise) => exercise.exerciseSlug)).toEqual(originalOrder);
+  }, 50_000);
 });

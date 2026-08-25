@@ -42,7 +42,11 @@ import {
   SubstitutionProposalError,
   type SubstitutionReasonCode,
 } from "../../training/substitution-engine.js";
-import { createReflectionEngine } from "../../training/reflection-engine.js";
+import {
+  createReflectionEngine,
+  diffPlanContents,
+  type PlanActivationResult,
+} from "../../training/reflection-engine.js";
 import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
 import type { NutritionEstimateResult } from "../../tools/nutrition-estimate.js";
@@ -1448,6 +1452,7 @@ export function createHealthToolCatalog(
               response: {
                 trainingProposalId: readBack.id,
                 dayRole: proposal.dayRole,
+                planVersionId: proposal.planVersionId ?? null,
                 proposedExercises: proposal.proposedExercises,
                 blockedExercises: proposal.blockedExercises,
               },
@@ -1955,17 +1960,21 @@ export function createHealthToolCatalog(
           reason: { type: "string" },
           idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "reflectionId", "reason", "idempotencyKey"],
+        required: ["runHandle", "reflectionId", "changes", "reason", "idempotencyKey"],
       },
       execute: async (inv) => {
         const reflectionId = str(inv.args, "reflectionId");
+        const changes = inv.args["changes"];
+        if (!Array.isArray(changes) || changes.length === 0) {
+          throw new RangeError("changes must contain at least one material plan change");
+        }
         const result = await writes.execute(
           writeInput(inv, "health_propose_plan_change", reflectionId),
           async (tx) => {
             const proposed = await createReflectionEngine(tx as unknown as Db).proposeChildVersion({
               userId: inv.principalUserId,
               reflectionId,
-              changes: (inv.args["changes"] as Array<Record<string, unknown>> | undefined) ?? [],
+              changes: changes as Array<Record<string, unknown>>,
               reason: str(inv.args, "reason"),
             });
             const [readBack] = await tx.select().from(schema.planVersions)
@@ -2016,18 +2025,47 @@ export function createHealthToolCatalog(
             .where(and(eq(schema.planVersions.id, planVersionId), eq(schema.planVersions.userId, inv.principalUserId)))
             .limit(1);
           if (!version) return toolError("not_found", "plan version not found");
-          if (version.status !== "draft") {
-            return toolError("invalid_session_state", `version is ${version.status}, only drafts activate`);
+          if (version.status !== "draft" && version.status !== "superseded") {
+            return toolError("invalid_session_state", `version is ${version.status}, only a direct draft child or superseded parent can activate`);
           }
-          const parent = version.parentVersionId
-            ? (await db.select().from(schema.planVersions)
-                .where(eq(schema.planVersions.id, version.parentVersionId)).limit(1))[0]
-            : undefined;
+          const [assignment] = await db.select().from(schema.activePlanAssignments)
+            .where(and(
+              eq(schema.activePlanAssignments.userId, inv.principalUserId),
+              eq(schema.activePlanAssignments.scope, version.scope),
+            )).limit(1);
+          const [current] = assignment
+            ? await db.select().from(schema.planVersions)
+                .where(eq(schema.planVersions.id, assignment.planVersionId)).limit(1)
+            : [];
+          if (!current) return toolError("invalid_session_state", "active plan assignment is missing");
+          const direction = version.status === "draft" && version.parentVersionId === current.id
+            ? "forward"
+            : version.status === "superseded" && current.parentVersionId === version.id
+              ? "rollback"
+              : undefined;
+          if (!direction) {
+            return toolError(
+              "invalid_session_state",
+              "target must be the active version's direct draft child or direct superseded parent",
+            );
+          }
+          const targetContent = version.contentJson as Record<string, unknown>;
+          const storedChanges = Array.isArray(targetContent["changeSet"])
+            ? targetContent["changeSet"] as Array<Record<string, unknown>>
+            : [];
+          const diff = diffPlanContents(
+            current.contentJson,
+            version.contentJson,
+            direction === "forward"
+              ? storedChanges
+              : [{ kind: "rollback", targetVersionId: version.id }],
+          );
           return await makeConfirmation(
             "health_activate_plan_version", planVersionId, inv,
-            `激活将把当前训练计划切换到 v${version.versionNumber}（原因：${version.adjustmentReason ?? "n/a"}），父版本 ${parent?.versionNumber ?? "?"} 转为 superseded，可回滚。确认激活？`,
+            `训练计划切换 ${direction === "forward" ? "forward" : "rollback"}: `
+              + `v${current.versionNumber} → v${version.versionNumber}。完整变更：${JSON.stringify(diff)}。确认激活？`,
             ["确认激活", "暂不激活"],
-            { planVersionId },
+            { planVersionId, currentVersionId: current.id, direction, diff },
           );
         }
         const result = await requestStates.consume(
@@ -2039,14 +2077,20 @@ export function createHealthToolCatalog(
               writeInput(inv, "health_activate_plan_version", planVersionId),
               async (writeTx) => {
                 const confirmed = inv.confirmationChoice === "确认激活";
+                let activation: PlanActivationResult | undefined;
                 if (confirmed) {
-                  await createReflectionEngine(writeTx as unknown as Db)
-                    .activateChildVersion(inv.principalUserId, planVersionId);
+                  activation = await createReflectionEngine(writeTx as unknown as Db)
+                    .activateVersion(inv.principalUserId, planVersionId);
                 }
                 const [decision] = await writeTx.insert(schema.userDecisionEvents).values({
                   userId: inv.principalUserId,
                   decisionType: confirmed ? "accepted" : "rejected",
-                  subjectJson: { type: "plan_activation", planVersionId },
+                  subjectJson: {
+                    type: "plan_activation",
+                    planVersionId,
+                    direction: activation?.direction ?? "declined",
+                    previousVersionId: activation?.previousVersionId ?? null,
+                  },
                 }).returning();
                 if (!decision) throw new Error("plan activation decision insert failed");
                 const [outbox] = await writeTx.insert(schema.outboxEvents).values({
@@ -2057,6 +2101,8 @@ export function createHealthToolCatalog(
                   payloadJson: {
                     observedOn: await today(inv.principalUserId),
                     planVersionId,
+                    direction: activation?.direction ?? "declined",
+                    previousVersionId: activation?.previousVersionId ?? null,
                   },
                 }).returning({ id: schema.outboxEvents.id });
                 const [readBack] = await writeTx.select().from(schema.planVersions)
@@ -2067,7 +2113,13 @@ export function createHealthToolCatalog(
                 if (!outbox || !readBack) throw new Error("plan activation read-back failed");
                 return {
                   response: confirmed
-                    ? { planVersionId, activated: true, status: readBack.status }
+                    ? {
+                        planVersionId,
+                        activated: true,
+                        status: readBack.status,
+                        direction: activation!.direction,
+                        previousVersionId: activation!.previousVersionId,
+                      }
                     : { planVersionId, activated: false, declined: true },
                   factRefs: confirmed
                     ? [{ type: "plan_version", id: readBack.id }, { type: "user_decision", id: decision.id }]

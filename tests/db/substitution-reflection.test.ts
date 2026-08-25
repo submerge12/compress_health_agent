@@ -164,7 +164,11 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
     const proposal = await reflection.proposeChildVersion({
       userId: ctx.userId,
       reflectionId,
-      changes: [{ swap: "single_machine_row", position: "before_neutral_grip_pulldown" }],
+      changes: [{
+        kind: "reorder",
+        dayRole: "B",
+        order: ["chest_supported_row", "single_machine_row"],
+      }],
       reason: "根据本次反思调整动作顺序",
       previousVersionProblems: ["单手划船无感"],
       validationQuestions: ["顺序调整后垂直拉表现是否下降？"],
@@ -195,6 +199,12 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
     expect(parentAfter?.status).toBe("superseded");
     // Parent content immutable.
     expect(parentAfter?.contentJson).toEqual(parentBefore?.contentJson);
+    const next = await training.prepareSession(ctx.userId, today, "B");
+    expect(next.planVersionId).toBe(proposal.childVersionId);
+    expect(next.proposedExercises.slice(0, 2).map((exercise) => exercise.exerciseSlug)).toEqual([
+      "chest_supported_row",
+      "single_machine_row",
+    ]);
 
     const [assignment] = await db.select().from(schema.activePlanAssignments)
       .where(and(
