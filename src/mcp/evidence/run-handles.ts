@@ -159,8 +159,19 @@ export function createRunHandleService(db: Db) {
     arguments?: Record<string, unknown>;
     resultSummary?: Record<string, unknown>;
   }): Promise<{ sequence: number }> {
-    const run = await requireOwnedRun(db, input.userId, input.runHandle);
     return db.transaction(async (tx) => {
+      // The run row is the sequence allocator. Locking it serializes resource
+      // reads with write-command evidence and with run closure across every
+      // process, without relying on an in-memory counter.
+      const [run] = await tx.select().from(schema.agentRuns)
+        .where(and(
+          eq(schema.agentRuns.id, input.runHandle),
+          eq(schema.agentRuns.userId, input.userId),
+        ))
+        .limit(1)
+        .for("update");
+      if (!run) throw new RunHandleError("not_found_or_not_owned");
+      if (run.outcome !== "running") throw new RunHandleError("closed");
       const sequence = await nextSequence(tx, run.id);
       await tx.insert(schema.agentRunSteps).values({
         runId: run.id,
@@ -211,8 +222,12 @@ export function createRunHandleService(db: Db) {
         resourceUri: s.resourceUri,
         status: s.status,
         errorCode: s.errorCode,
+        aggregateType: s.aggregateType,
+        aggregateId: s.aggregateId,
         stateRevisionBefore: s.stateRevisionBefore,
         stateRevisionAfter: s.stateRevisionAfter,
+        argumentsRedacted: s.argumentsRedactedJson ?? {},
+        resultSummary: s.resultSummaryJson,
       })),
       receipts: receipts.map((receipt) => ({
         receiptId: receipt.id,
@@ -240,6 +255,7 @@ async function nextSequence(
   tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
   runId: string,
 ): Promise<number> {
+  // Caller must hold the matching agent_runs row FOR UPDATE.
   const [row] = await tx.select({ max: sql<number>`coalesce(max(${schema.agentRunSteps.sequence}), -1)::int` })
     .from(schema.agentRunSteps)
     .where(eq(schema.agentRunSteps.runId, runId));

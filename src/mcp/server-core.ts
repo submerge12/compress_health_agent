@@ -32,7 +32,7 @@ import { McpProtocolError } from "./errors.js";
 import { createPrincipalResolver, type ActorBindingOptions, type Principal } from "./auth/principal-resolver.js";
 import { createResourceCatalog } from "./resources/catalog.js";
 import { createHealthToolCatalog } from "./tools/catalog.js";
-import { createRunHandleService } from "./evidence/run-handles.js";
+import { createRunHandleService, RunHandleError } from "./evidence/run-handles.js";
 import { createRequestStateService } from "./input/request-state.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
@@ -132,25 +132,56 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         stage: "resource_read",
         mcpMethod: "resources/read",
         resourceUri: uri,
-        resultSummary: { contentCount: result.contents.length },
+        aggregateType: result.evidence.aggregateType,
+        aggregateId: result.evidence.aggregateId,
+        stateRevisionAfter: result.evidence.stateRevision,
+        resultSummary: result.evidence.resultSummary,
       });
       if (implicitRun) {
         await runs.endRun({ userId: principal.userId, runHandle, outcome: "completed" });
       }
       return {
         contents: result.contents,
-        _meta: { ...result._meta, "compass.health/runHandle": runHandle },
+        _meta: {
+          ...result._meta,
+          "compass.health/runHandle": runHandle,
+          "compass.health/evidence": {
+            aggregateType: result.evidence.aggregateType,
+            aggregateId: result.evidence.aggregateId,
+            ...(result.evidence.stateRevision !== undefined
+              ? { stateRevision: result.evidence.stateRevision }
+              : {}),
+          },
+        },
       };
     } catch (error) {
-      await runs.recordStep({
-        userId: principal.userId,
-        runHandle,
-        stage: "resource_read",
-        mcpMethod: "resources/read",
-        resourceUri: uri,
-        status: "failed",
-        errorCode: error instanceof McpProtocolError ? error.code : "internal",
-      });
+      if (error instanceof RunHandleError) {
+        throw ProtocolError.fromError(
+          ProtocolErrorCode.InvalidParams,
+          error.message,
+          { reason: error.reason },
+        );
+      }
+      try {
+        await runs.recordStep({
+          userId: principal.userId,
+          runHandle,
+          stage: "resource_read",
+          mcpMethod: "resources/read",
+          resourceUri: uri,
+          status: "failed",
+          errorCode: error instanceof McpProtocolError ? error.code : "internal",
+        });
+      } catch (recordError) {
+        if (recordError instanceof RunHandleError) {
+          throw ProtocolError.fromError(
+            ProtocolErrorCode.InvalidParams,
+            recordError.message,
+            { reason: recordError.reason },
+          );
+        }
+        throw recordError;
+      }
       if (implicitRun) {
         await runs.endRun({ userId: principal.userId, runHandle, outcome: "failed" });
       }

@@ -336,6 +336,17 @@ describe("MCP 2026-07-28 stdio wire", () => {
       expect(required.filter((name) => !names.has(name)), `${journey} missing tools`).toEqual([]);
     }
     expect(names).toContain("health_get_run_evidence");
+    for (const name of [
+      "health_get_daily_state",
+      "health_get_active_constraints",
+      "health_get_training_cycle",
+      "health_get_active_plan",
+      "health_search_training_media",
+      "health_get_projection_diagnostics",
+    ]) {
+      const readTool = discoveredTools.find((tool) => tool.name === name)!;
+      expect(readTool.inputSchema.required, `${name} formal run`).toContain("runHandle");
+    }
     expect(names).not.toContain("test_missing_capability");
     for (const tool of discoveredTools) {
       if (tool._meta?.["compass.health/risk"] === "read-only") continue;
@@ -934,6 +945,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     });
     expect((replayed.result?.structuredContent as { revived: number }).revived).toBeGreaterThan(0);
     const diagnostics = await client.request(toolCall(6, "health_get_projection_diagnostics", {
+      runHandle,
       date: "2026-08-24",
     }));
     expect(diagnostics.result?.structuredContent).toMatchObject({
@@ -979,12 +991,90 @@ describe("MCP 2026-07-28 stdio wire", () => {
 
     const evidence = await client.request(toolCall(8, "health_get_run_evidence", { runHandle }));
     const steps = (evidence.result?.structuredContent as {
-      steps: Array<{ stage: string; resourceUri: string | null }>;
+      steps: Array<{
+        stage: string;
+        resourceUri: string | null;
+        aggregateType: string | null;
+        resultSummary: Record<string, unknown> | null;
+      }>;
     }).steps;
     expect(steps).toEqual(expect.arrayContaining([
       expect.objectContaining({
         stage: "resource_read",
         resourceUri: "health://daily-state/2026-08-24",
+        aggregateType: "daily_state_projection",
+        resultSummary: expect.objectContaining({
+          localDate: "2026-08-24",
+          projectionStatus: "fresh",
+          hasState: true,
+        }),
+      }),
+    ]));
+  }, 30_000);
+
+  it("rejects Resource Read evidence append after the formal run is closed", async () => {
+    const binding = `mcp-wire-closed-evidence-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire closed evidence",
+      idempotencyKey: "wire-closed-evidence-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const firstRead = await client.request(resourceRead(2, "health://constraints/active/today", runHandle));
+    expect(firstRead.error).toBeUndefined();
+    await client.request(toolCall(3, "health_end_run", {
+      runHandle,
+      outcome: "completed",
+      idempotencyKey: "wire-closed-evidence-end",
+    }));
+    const before = await client.request(toolCall(4, "health_get_run_evidence", { runHandle }));
+    const beforeSteps = (before.result?.structuredContent as { steps: unknown[] }).steps;
+
+    const rejected = await client.request(resourceRead(5, "health://daily-state/today", runHandle));
+    expect(rejected.error).toBeDefined();
+    const after = await client.request(toolCall(6, "health_get_run_evidence", { runHandle }));
+    const afterSteps = (after.result?.structuredContent as {
+      steps: Array<{ sequence: number }>;
+    }).steps;
+    expect(afterSteps).toHaveLength(beforeSteps.length);
+    expect(new Set(afterSteps.map((step) => step.sequence)).size).toBe(afterSteps.length);
+  }, 25_000);
+
+  it("links explicit safety read tools to one formal run without custom Resource meta", async () => {
+    const binding = `mcp-wire-explicit-reads-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire explicit safety reads",
+      idempotencyKey: "wire-explicit-reads-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const calls: Array<[string, Record<string, unknown>]> = [
+      ["health_get_daily_state", { runHandle, date: "2026-08-24" }],
+      ["health_get_active_constraints", { runHandle, date: "2026-08-24" }],
+      ["health_get_training_cycle", { runHandle }],
+      ["health_get_active_plan", { runHandle }],
+    ];
+    for (const [index, [name, args]] of calls.entries()) {
+      const response = await client.request(toolCall(index + 2, name, args));
+      expect(response.error, name).toBeUndefined();
+      expect(response.result?.resultType, name).toBe("complete");
+    }
+
+    const evidence = await client.request(toolCall(6, "health_get_run_evidence", { runHandle }));
+    const steps = (evidence.result?.structuredContent as {
+      steps: Array<{ mcpName: string | null; resultSummary: Record<string, unknown> | null }>;
+    }).steps;
+    const names = new Set(steps.map((step) => step.mcpName));
+    for (const [name] of calls) expect(names).toContain(name);
+    expect(steps).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        mcpName: "health_get_active_constraints",
+        resultSummary: expect.objectContaining({
+          date: "2026-08-24",
+          constraintCount: 0,
+        }),
       }),
     ]));
   }, 30_000);
@@ -1025,6 +1115,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
       await sql.end({ timeout: 3 });
     }
     const diagnostics = await client.request(toolCall(4, "health_get_projection_diagnostics", {
+      runHandle,
       date: "2026-08-21",
     }));
     expect(diagnostics.result?.structuredContent).toMatchObject({
@@ -1695,6 +1786,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }));
     const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
     const searchArgs = {
+      runHandle,
       text: marker,
       movementPattern: "horizontal_push",
       bodyPart: "chest",

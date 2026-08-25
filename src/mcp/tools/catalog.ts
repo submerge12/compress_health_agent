@@ -47,6 +47,7 @@ import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
 import type { NutritionEstimateResult } from "../../tools/nutrition-estimate.js";
 import { createRunHandleService } from "../evidence/run-handles.js";
+import { createResourceCatalog } from "../resources/catalog.js";
 import {
   createRequestStateService,
   RequestStateError,
@@ -118,6 +119,7 @@ export function createHealthToolCatalog(
   const requestStates = createRequestStateService(db);
   const writes = createWriteCommandService(db);
   const getUserLocalDate = createUserLocalDateResolver(db, options.now);
+  const resourceCatalog = createResourceCatalog(db, repo, { now: options.now });
 
   const CONFIRMATION_TTL_MS = 10 * 60_000;
 
@@ -284,6 +286,32 @@ export function createHealthToolCatalog(
 
   async function today(userId: string): Promise<string> {
     return getUserLocalDate(userId);
+  }
+
+  async function trackedResourceBody(
+    invocation: ToolInvocation,
+    toolName: string,
+    uri: string,
+  ): Promise<unknown> {
+    const runHandle = str(invocation.args, "runHandle");
+    const result = await resourceCatalog.readResource({
+      userId: invocation.principalUserId,
+      externalUserId: "transport-verified",
+      actor: invocation.actor,
+    }, uri);
+    await runs.recordStep({
+      userId: invocation.principalUserId,
+      runHandle,
+      stage: "tool_call",
+      mcpMethod: "tools/call",
+      mcpName: toolName,
+      aggregateType: result.evidence.aggregateType,
+      aggregateId: result.evidence.aggregateId,
+      stateRevisionAfter: result.evidence.stateRevision,
+      arguments: invocation.args,
+      resultSummary: result.evidence.resultSummary,
+    });
+    return JSON.parse(result.contents[0]!.text) as unknown;
   }
 
   function addDays(date: string, days: number): string {
@@ -468,7 +496,7 @@ export function createHealthToolCatalog(
           endDate: ISO_DATE,
           runHandle: { type: "string" },
         },
-        required: ["startDate"],
+        required: ["startDate", "runHandle"],
       },
       execute: async (inv) => {
         const startDate = str(inv.args, "startDate");
@@ -479,20 +507,89 @@ export function createHealthToolCatalog(
             gte(schema.mealPlanEntries.planDate, startDate),
             lte(schema.mealPlanEntries.planDate, endDate),
           )).orderBy(schema.mealPlanEntries.planDate, schema.mealPlanEntries.mealType);
-        const runHandle = optStr(inv.args, "runHandle");
-        if (runHandle) {
-          await runs.recordStep({
-            userId: inv.principalUserId,
-            runHandle,
-            stage: "tool_call",
-            mcpMethod: "tools/call",
-            mcpName: "health_get_diet_plan",
-            arguments: inv.args,
-            resultSummary: { startDate, endDate, entryCount: entries.length },
-          });
-        }
+        await runs.recordStep({
+          userId: inv.principalUserId,
+          runHandle: str(inv.args, "runHandle"),
+          stage: "tool_call",
+          mcpMethod: "tools/call",
+          mcpName: "health_get_diet_plan",
+          aggregateType: "diet_plan",
+          aggregateId: `${inv.principalUserId}:${startDate}:${endDate}`,
+          arguments: inv.args,
+          resultSummary: { startDate, endDate, entryCount: entries.length },
+        });
         return complete({ startDate, endDate, entries });
       },
+    },
+    {
+      name: "health_get_daily_state",
+      description: "Read one projected daily health state inside a formal run.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { runHandle: { type: "string" }, date: ISO_DATE },
+        required: ["runHandle"],
+      },
+      execute: async (inv) => complete(
+        await trackedResourceBody(
+          inv,
+          "health_get_daily_state",
+          `health://daily-state/${optStr(inv.args, "date") ?? "today"}`,
+        ) as Record<string, unknown>,
+      ),
+    },
+    {
+      name: "health_get_active_constraints",
+      description: "Read active dated safety constraints inside a formal run.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { runHandle: { type: "string" }, date: ISO_DATE },
+        required: ["runHandle"],
+      },
+      execute: async (inv) => {
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
+        const constraints = await trackedResourceBody(
+          inv,
+          "health_get_active_constraints",
+          `health://constraints/active/${date}`,
+        );
+        return complete({ date, constraints: Array.isArray(constraints) ? constraints : [] });
+      },
+    },
+    {
+      name: "health_get_training_cycle",
+      description: "Read current cycle positions and next-day decision inside a formal run.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { runHandle: { type: "string" } },
+        required: ["runHandle"],
+      },
+      execute: async (inv) => complete(
+        await trackedResourceBody(
+          inv,
+          "health_get_training_cycle",
+          "health://training/cycles/current",
+        ) as Record<string, unknown>,
+      ),
+    },
+    {
+      name: "health_get_active_plan",
+      description: "Read the active compiled training plan inside a formal run.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { runHandle: { type: "string" } },
+        required: ["runHandle"],
+      },
+      execute: async (inv) => complete(
+        await trackedResourceBody(
+          inv,
+          "health_get_active_plan",
+          "health://plans/training/active",
+        ) as Record<string, unknown>,
+      ),
     },
     {
       name: "health_search_training_media",
@@ -506,7 +603,9 @@ export function createHealthToolCatalog(
           category: { type: "string" },
           text: { type: "string" },
           limit: { type: "number" },
+          runHandle: { type: "string" },
         },
+        required: ["runHandle"],
       },
       execute: async (inv) => {
         const segments = await createMediaRetrieval(db).search({
@@ -515,6 +614,20 @@ export function createHealthToolCatalog(
           ...(optStr(inv.args, "category") ? { category: optStr(inv.args, "category") } : {}),
           ...(optStr(inv.args, "text") ? { text: optStr(inv.args, "text") } : {}),
           ...(optNum(inv.args, "limit") ? { limit: Math.min(50, Math.max(1, Math.round(optNum(inv.args, "limit")!))) } : {}),
+        });
+        await runs.recordStep({
+          userId: inv.principalUserId,
+          runHandle: str(inv.args, "runHandle"),
+          stage: "tool_call",
+          mcpMethod: "tools/call",
+          mcpName: "health_search_training_media",
+          aggregateType: "training_media_search",
+          aggregateId: inv.principalUserId,
+          arguments: inv.args,
+          resultSummary: {
+            segmentCount: segments.length,
+            segmentIds: segments.map((segment) => segment.segmentId),
+          },
         });
         return complete({ segments });
       },
@@ -578,13 +691,30 @@ export function createHealthToolCatalog(
       risk: "read-only",
       inputSchema: {
         type: "object",
-        properties: { date: ISO_DATE },
+        properties: { runHandle: { type: "string" }, date: ISO_DATE },
+        required: ["runHandle"],
       },
-      execute: async (inv) => complete(await createProjectionWorker(db, repo)
-        .getDiagnostics(
-          inv.principalUserId,
-          optStr(inv.args, "date") ?? await today(inv.principalUserId),
-        )),
+      execute: async (inv) => {
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
+        const diagnostics = await createProjectionWorker(db, repo)
+          .getDiagnostics(inv.principalUserId, date);
+        await runs.recordStep({
+          userId: inv.principalUserId,
+          runHandle: str(inv.args, "runHandle"),
+          stage: "tool_call",
+          mcpMethod: "tools/call",
+          mcpName: "health_get_projection_diagnostics",
+          aggregateType: "projection_diagnostics",
+          aggregateId: `${inv.principalUserId}:${date}`,
+          arguments: inv.args,
+          resultSummary: {
+            date,
+            status: diagnostics.status,
+            outbox: diagnostics.outbox,
+          },
+        });
+        return complete(diagnostics);
+      },
     },
     {
       name: "health_replay_projection",

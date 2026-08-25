@@ -23,6 +23,12 @@ type Db = PostgresJsDatabase<typeof schema>;
 export interface ResourceReadResult {
   uri: string;
   contents: Array<{ uri: string; mimeType: string; text: string }>;
+  evidence: {
+    aggregateType: string;
+    aggregateId: string;
+    stateRevision?: number;
+    resultSummary: Record<string, unknown>;
+  };
   /** 2026-07-28 cache hints surfaced in _meta. */
   _meta?: { "compass.health/ttlMs"?: number; "compass.health/cacheScope"?: string };
 }
@@ -111,16 +117,18 @@ export function createResourceCatalog(
 
   async function readResource(principal: Principal, uri: string): Promise<ResourceReadResult> {
     const hints = cacheHintsForUri(uri);
-    const text = JSON.stringify(await readBody(principal, uri), null, 2);
+    const today = await getUserLocalDate(principal.userId);
+    const body = await readBody(principal, uri, today);
+    const text = JSON.stringify(body, null, 2);
     return {
       uri,
       contents: [{ uri, mimeType: "application/json", text }],
+      evidence: summarizeResourceRead(principal, uri, body, today),
       ...(hints ? { _meta: hints } : {}),
     };
   }
 
-  async function readBody(principal: Principal, uri: string): Promise<unknown> {
-    const today = await getUserLocalDate(principal.userId);
+  async function readBody(principal: Principal, uri: string, today: string): Promise<unknown> {
     if (uri === "health://profile") {
       const [user] = await db.select().from(schema.users)
         .where(eq(schema.users.id, principal.userId)).limit(1);
@@ -206,6 +214,134 @@ export function createResourceCatalog(
   }
 
   return { listResources, readResource };
+}
+
+function summarizeResourceRead(
+  principal: Principal,
+  uri: string,
+  body: unknown,
+  today: string,
+): ResourceReadResult["evidence"] {
+  const record = asRecord(body);
+  if (uri.startsWith("health://daily-state/")) {
+    const localDate = stringValue(record["localDate"]) ?? "unknown";
+    const projection = asRecord(record["projection"]);
+    const revision = numberValue(record["revision"]);
+    return {
+      aggregateType: "daily_state_projection",
+      aggregateId: `${principal.userId}:${localDate}`,
+      ...(revision !== undefined ? { stateRevision: revision } : {}),
+      resultSummary: {
+        localDate,
+        hasState: record["state"] !== null,
+        projectionStatus: stringValue(projection["status"]) ?? "unknown",
+        ...(revision !== undefined ? { revision } : {}),
+      },
+    };
+  }
+  if (uri.startsWith("health://constraints/active/")) {
+    const constraints = Array.isArray(body) ? body.map(asRecord) : [];
+    const date = resolvedDateTail(uri, "health://constraints/active/", today);
+    return {
+      aggregateType: "health_constraint_set",
+      aggregateId: `${principal.userId}:${date}`,
+      resultSummary: {
+        date,
+        constraintCount: constraints.length,
+        constraintIds: constraints
+          .map((constraint) => stringValue(constraint["id"]))
+          .filter((id): id is string => id !== undefined),
+      },
+    };
+  }
+  if (uri === "health://plans/training/active") {
+    const version = asRecord(record["version"]);
+    return {
+      aggregateType: "active_training_plan",
+      aggregateId: stringValue(version["id"]) ?? principal.userId,
+      resultSummary: {
+        active: record["active"] === true,
+        planVersionId: stringValue(version["id"]) ?? null,
+        versionNumber: numberValue(version["versionNumber"]) ?? null,
+      },
+    };
+  }
+  if (uri.startsWith("health://training/sessions/")) {
+    const session = asRecord(record["session"]);
+    const exercises = Array.isArray(record["exercisesWithSets"])
+      ? record["exercisesWithSets"] as unknown[]
+      : [];
+    return {
+      aggregateType: "training_session",
+      aggregateId: stringValue(session["id"]) ?? decodedTail(uri, "health://training/sessions/"),
+      resultSummary: {
+        status: stringValue(session["status"]) ?? "unknown",
+        exerciseCount: exercises.length,
+        setCount: exercises.reduce((count: number, item: unknown) => {
+          const sets = asRecord(item)["sets"];
+          return count + (Array.isArray(sets) ? sets.length : 0);
+        }, 0),
+      },
+    };
+  }
+  if (uri === "health://training/cycles/current") {
+    const positions = Array.isArray(record["positions"]) ? record["positions"] : [];
+    const decision = asRecord(record["decision"]);
+    return {
+      aggregateType: "training_cycle",
+      aggregateId: principal.userId,
+      resultSummary: {
+        positionCount: positions.length,
+        nextRole: stringValue(decision["decision"]) ?? null,
+        reasonCodes: Array.isArray(decision["reasonCodes"])
+          ? decision["reasonCodes"]
+          : [],
+      },
+    };
+  }
+  if (uri.startsWith("health://diet/logs/")) {
+    const date = resolvedDateTail(uri, "health://diet/logs/", today);
+    return {
+      aggregateType: "diet_log_set",
+      aggregateId: `${principal.userId}:${date}`,
+      resultSummary: { date, logCount: Array.isArray(body) ? body.length : 0 },
+    };
+  }
+  if (uri === "health://profile") {
+    return {
+      aggregateType: "user_profile",
+      aggregateId: principal.userId,
+      resultSummary: { found: true },
+    };
+  }
+  return {
+    aggregateType: "system_capabilities",
+    aggregateId: "compass-health",
+    resultSummary: { available: true },
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function stringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function decodedTail(uri: string, prefix: string): string {
+  return decodeURIComponent(uri.slice(prefix.length));
+}
+
+function resolvedDateTail(uri: string, prefix: string, today: string): string {
+  const value = decodedTail(uri, prefix).trim().toLowerCase();
+  return value === "" || value === "today" ? today : value;
 }
 
 function cacheHints(ttlMs: number) {

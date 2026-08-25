@@ -786,7 +786,7 @@ export const agentRunSteps = compass.table("agent_run_steps", {
   resultSummaryJson: jsonb("result_summary_json").$type<Record<string, unknown>>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
 }, (t) => [
-  index("agent_run_steps_run_idx").on(t.runId, t.sequence),
+  uniqueIndex("agent_run_steps_run_sequence_uidx").on(t.runId, t.sequence),
 ]);
 
 /** Durable MCP 2026 multi-round input state. The raw requestState is never stored. */
