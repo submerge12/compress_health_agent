@@ -17,6 +17,8 @@ import postgres from "postgres";
 import * as schema from "../../src/db/schema.js";
 import { initToolContext } from "../../src/tools/context.js";
 import { createProjectionWorker } from "../../src/domain/projection-worker.js";
+import { startEmbeddedProjectionWorker } from "../../src/domain/projection-worker-main.js";
+import { createDailyStateService } from "../../src/domain/daily-state.js";
 import { createTrainingService } from "../../src/training/training-service.js";
 
 const DATABASE_URL =
@@ -214,4 +216,101 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     // contention (a worker may see fewer claims if the other drained them).
     expect(totalProcessed).toBeGreaterThan(0);
   });
+
+  it("persists a claim before processing so a second worker cannot reclaim the event", async () => {
+    const [event] = await db.insert(schema.outboxEvents).values({
+      userId: ctx.userId,
+      aggregateType: "observation",
+      aggregateId: `lease-race-${Date.now()}`,
+      eventType: "observation.recorded",
+      payloadJson: { observedOn: today },
+    }).returning();
+    if (!event) throw new Error("lease race setup failed");
+
+    const lockPool = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let releaseLock!: () => void;
+    let reportLocked!: () => void;
+    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockTask = lockPool.begin(async (tx) => {
+      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
+      reportLocked();
+      await release;
+    });
+
+    try {
+      await locked;
+      const first = createProjectionWorker(ctx.db!, ctx.repo).runOnce(undefined, ctx.userId);
+      await waitForAttempts(event.id, 1);
+
+      const second = createProjectionWorker(ctx.db!, ctx.repo).runOnce(undefined, ctx.userId);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const [duringProcessing] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(duringProcessing?.status).toBe("processing");
+      expect(duringProcessing?.attempts).toBe(1);
+
+      releaseLock();
+      await Promise.all([first, second, lockTask]);
+
+      const [row] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(row?.status).toBe("done");
+      expect(row?.attempts).toBe(1);
+    } finally {
+      releaseLock();
+      await lockTask.catch(() => undefined);
+      await lockPool.end({ timeout: 3 });
+    }
+  }, 20_000);
+
+  it("continuously consumes a committed fact and makes its daily projection fresh", async () => {
+    const runtimeDate = "2026-08-26";
+    const before = await createDailyStateService(ctx.db!, ctx.repo)
+      .getDailyProjection(ctx.userId, runtimeDate);
+    await createDailyStateService(ctx.db!, ctx.repo).recordObservation({
+      userId: ctx.userId,
+      observedOn: runtimeDate,
+      kind: "sleep",
+      valueJson: { hours: 6.25 },
+      source: "projection-runtime-test",
+    }, { commandType: "observation.record", aggregateType: "observation" });
+
+    const runtime = startEmbeddedProjectionWorker({
+      db: ctx.db!,
+      repo: ctx.repo,
+      onlyUserId: ctx.userId,
+    });
+    try {
+      const diagnostics = await waitForFresh(runtimeDate);
+      expect(diagnostics.outbox).toMatchObject({ pending: 0, processing: 0, deadLetter: 0 });
+      expect(diagnostics.projection?.revision).toBeGreaterThan(before?.revision ?? -1);
+    } finally {
+      await runtime.stop();
+    }
+  }, 10_000);
+
+  async function waitForAttempts(eventId: string, minimum: number): Promise<void> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const [row] = await db.select({ attempts: schema.outboxEvents.attempts })
+        .from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, eventId));
+      if ((row?.attempts ?? 0) >= minimum) return;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    throw new Error(`event ${eventId} did not reach ${minimum} attempts`);
+  }
+
+  async function waitForFresh(localDate: string): Promise<Awaited<ReturnType<typeof worker.getDiagnostics>>> {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      const diagnostics = await worker.getDiagnostics(ctx.userId, localDate);
+      if (diagnostics.status === "fresh" && diagnostics.outbox.pending === 0
+          && diagnostics.outbox.processing === 0) return diagnostics;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error(`projection ${localDate} did not become fresh`);
+  }
 });

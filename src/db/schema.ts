@@ -407,14 +407,18 @@ export const outboxEvents = compass.table("outbox_events", {
   aggregateId: text("aggregate_id").notNull(),
   eventType: text("type").notNull(),
   payloadJson: jsonb("payload_json").$type<Record<string, unknown>>(),
-  status: text("status").notNull().default("pending"), // pending | done | dead_letter
+  status: text("status").notNull().default("pending"), // pending | processing | done | dead_letter
   attempts: integer("attempts").notNull().default(0),
   lastError: text("last_error"),
   availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+  processingStartedAt: timestamp("processing_started_at", { withTimezone: true }),
+  lockedBy: text("locked_by"),
+  lockExpiresAt: timestamp("lock_expires_at", { withTimezone: true }),
   processedAt: timestamp("processed_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
 }, (t) => [
   index("outbox_events_status_available_idx").on(t.status, t.availableAt),
+  index("outbox_events_claim_idx").on(t.status, t.availableAt, t.lockExpiresAt, t.createdAt),
 ]);
 
 export const interactionEvents = compass.table("interaction_events", {

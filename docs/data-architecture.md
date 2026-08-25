@@ -15,7 +15,7 @@ This is the source of truth for "what lives where." The constraint spec (`meal-p
 | 3 | **Actual logs** | What the user really ate / did | User (via logging) | **empty** |
 | 4 | **Profile & identity** | Who the user is, targets, preferences | User | **empty** until first use |
 
-Operational control-plane tables sit outside the five health-data layers. They do not become health facts: `agent_runs` / `agent_run_steps` hold journey evidence, `mcp_pending_input_requests` holds expiring MCP retry state, `mcp_write_receipts` holds idempotency/read-back receipts, and `outbox_events` / projection checkpoints coordinate derived read models.
+Operational control-plane tables sit outside the five health-data layers. They do not become health facts: `agent_runs` / `agent_run_steps` hold journey evidence, `mcp_pending_input_requests` holds expiring MCP retry state, `mcp_write_receipts` holds idempotency/read-back receipts, and `outbox_events` / projection checkpoints coordinate derived read models. Projection workers persist a `processing` lease before handling an outbox event; an expired lease is safe to reclaim after a crash.
 
 > **The one trap:** "start with an empty database" means **layers 1–4 user data are empty** — it does **not** mean skip layer 0. The reference catalog (layer 0) must be seeded, or the 25 presets can't compute nutrition and nothing works.
 

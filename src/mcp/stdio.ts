@@ -21,6 +21,7 @@ import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server
 
 import { initToolContext } from "../tools/context.js";
 import { assertSchemaReady } from "../db/migrate.js";
+import { startEmbeddedProjectionWorker } from "../domain/projection-worker-main.js";
 import { createHealthMcpServer } from "./server-core.js";
 
 async function main(): Promise<void> {
@@ -48,6 +49,19 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
+  const projectionMode = process.env.COMPASS_HEALTH_PROJECTION_WORKER_MODE
+    ?? (process.env.NODE_ENV === "test" ? "disabled" : "embedded");
+  const projection = projectionMode === "embedded"
+    ? startEmbeddedProjectionWorker({
+        db: ctx.db,
+        repo: ctx.repo,
+        onlyUserId: ctx.userId,
+        onError: (error) => process.stderr.write(
+          `compass-health MCP projection worker: ${error instanceof Error ? error.message : String(error)}\n`,
+        ),
+      })
+    : undefined;
+
   let handle: StdioServerHandle | undefined;
   handle = serveStdio(() => createHealthMcpServer({
       db: ctx.db!,
@@ -61,13 +75,16 @@ async function main(): Promise<void> {
         process.stderr.write(`compass-health MCP: protocol error: ${error.message}\n`);
       },
     });
-  process.stderr.write(`compass-health MCP: ready on stdio (binding=${externalUserId})\n`);
+  process.stderr.write(
+    `compass-health MCP: ready on stdio (binding=${externalUserId}, projection=${projectionMode})\n`,
+  );
 
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
     await handle?.close();
+    await projection?.stop();
     await ctx.close();
     process.exit(0);
   };

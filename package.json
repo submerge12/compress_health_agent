@@ -29,6 +29,7 @@
     "start": "tsx src/index.ts",
     "serve:display": "tsx src/server/serve.ts",
     "mcp:stdio": "tsx src/mcp/stdio.ts",
+    "projection:worker": "tsx src/domain/projection-worker-main.ts",
     "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
     "test:mcp:conformance": "tsx tests/mcp/run-official-conformance.ts",

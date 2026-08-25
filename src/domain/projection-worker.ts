@@ -11,7 +11,9 @@
  *   MAX_ATTEMPTS exhausted -> dead_letter (visible, replayable);
  * - a projection failure NEVER rolls back committed facts.
  */
-import { and, asc, desc, eq, lte, or, sql } from "drizzle-orm";
+import { randomUUID } from "node:crypto";
+
+import { and, asc, desc, eq, isNull, lte, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -23,6 +25,7 @@ type Db = PostgresJsDatabase<typeof schema>;
 
 const MAX_ATTEMPTS = 5;
 const BATCH_SIZE = 50;
+const DEFAULT_LEASE_MS = 30_000;
 
 /** Event types this worker knows how to project. */
 export const SUPPORTED_AGGREGATE_TYPES: ReadonlySet<string> = new Set([
@@ -60,9 +63,24 @@ export interface WorkerRunResult {
   requeued: number;
 }
 
-export function createProjectionWorker(db: Db, repo: Repository) {
+export interface ProjectionWorkerOptions {
+  workerId?: string;
+  leaseMs?: number;
+  batchSize?: number;
+  now?: () => Date;
+}
+
+export function createProjectionWorker(
+  db: Db,
+  repo: Repository,
+  options: ProjectionWorkerOptions = {},
+) {
   const dailyState: DailyStateService = createDailyStateService(db, repo);
   const resolveTimezone = createTimezoneResolver(db);
+  const workerId = options.workerId ?? `projection-${process.pid}-${randomUUID()}`;
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  const batchSize = options.batchSize ?? BATCH_SIZE;
+  const now = options.now ?? (() => new Date());
 
   function extractEventDay(event: typeof schema.outboxEvents.$inferSelect): string {
     const payloadDay = (event.payloadJson as { observedOn?: string; logDate?: string } | null)?.observedOn
@@ -70,19 +88,27 @@ export function createProjectionWorker(db: Db, repo: Repository) {
     return payloadDay ?? new Date().toISOString().slice(0, 10);
   }
 
-  /**
-   * Claim one pending event with FOR UPDATE SKIP LOCKED inside its own
-   * transaction. Returns undefined when the queue is drained (or contended).
-   */
+  /** Persist ownership before the row lock is released. Expired leases are reclaimable. */
   async function claimNext(
-    now: Date,
+    claimAt: Date,
     onlyUserId?: string,
   ): Promise<typeof schema.outboxEvents.$inferSelect | undefined> {
     return db.transaction(async (tx) => {
       const claimed = await tx.select().from(schema.outboxEvents)
         .where(and(
-          eq(schema.outboxEvents.status, "pending"),
-          lte(schema.outboxEvents.availableAt, now),
+          or(
+            and(
+              eq(schema.outboxEvents.status, "pending"),
+              lte(schema.outboxEvents.availableAt, claimAt),
+            ),
+            and(
+              eq(schema.outboxEvents.status, "processing"),
+              or(
+                isNull(schema.outboxEvents.lockExpiresAt),
+                lte(schema.outboxEvents.lockExpiresAt, claimAt),
+              ),
+            ),
+          ),
           ...(onlyUserId === undefined ? [] : [eq(schema.outboxEvents.userId, onlyUserId)]),
         ))
         .orderBy(asc(schema.outboxEvents.createdAt))
@@ -90,11 +116,38 @@ export function createProjectionWorker(db: Db, repo: Repository) {
         .for("update", { skipLocked: true });
       const row = claimed[0];
       if (!row) return undefined;
-      await tx.update(schema.outboxEvents)
-        .set({ attempts: row.attempts + 1 })
-        .where(eq(schema.outboxEvents.id, row.id));
-      return { ...row, attempts: row.attempts + 1 };
+      const [leased] = await tx.update(schema.outboxEvents)
+        .set({
+          status: "processing",
+          attempts: row.attempts + 1,
+          processingStartedAt: claimAt,
+          lockedBy: workerId,
+          lockExpiresAt: new Date(claimAt.getTime() + leaseMs),
+        })
+        .where(eq(schema.outboxEvents.id, row.id))
+        .returning();
+      return leased;
     });
+  }
+
+  function ownedEvent(eventId: string) {
+    return and(
+      eq(schema.outboxEvents.id, eventId),
+      eq(schema.outboxEvents.status, "processing"),
+      eq(schema.outboxEvents.lockedBy, workerId),
+    );
+  }
+
+  function startLeaseHeartbeat(eventId: string): () => void {
+    const intervalMs = Math.max(250, Math.floor(leaseMs / 3));
+    const timer = setInterval(() => {
+      const heartbeatAt = now();
+      void db.update(schema.outboxEvents)
+        .set({ lockExpiresAt: new Date(heartbeatAt.getTime() + leaseMs) })
+        .where(ownedEvent(eventId));
+    }, intervalMs);
+    timer.unref();
+    return () => clearInterval(timer);
   }
 
   async function processOne(event: typeof schema.outboxEvents.$inferSelect): Promise<boolean> {
@@ -112,7 +165,9 @@ export function createProjectionWorker(db: Db, repo: Repository) {
         await db.update(schema.outboxEvents).set({
           status: "dead_letter",
           lastError: `unsupported_event_type:${event.aggregateType}`,
-        }).where(eq(schema.outboxEvents.id, event.id));
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(ownedEvent(event.id));
         await db.insert(schema.interactionEvents).values({
           userId: event.userId,
           actor: "projection-worker",
@@ -128,30 +183,38 @@ export function createProjectionWorker(db: Db, repo: Repository) {
         await db.update(schema.outboxEvents).set({
           status: "dead_letter",
           lastError,
-        }).where(eq(schema.outboxEvents.id, event.id));
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(ownedEvent(event.id));
       } else {
         const delay = backoffMs(nextAttempt);
         await db.update(schema.outboxEvents).set({
+          status: "pending",
           lastError,
-          availableAt: new Date(Date.now() + delay),
-        }).where(eq(schema.outboxEvents.id, event.id));
+          availableAt: new Date(now().getTime() + delay),
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(ownedEvent(event.id));
       }
       return false;
     }
   }
 
-  async function runOnce(now = new Date(), onlyUserId?: string): Promise<WorkerRunResult> {
+  async function runOnce(runAt = now(), onlyUserId?: string): Promise<WorkerRunResult> {
     const result: WorkerRunResult = { processed: 0, succeeded: 0, deadLettered: 0, requeued: 0 };
-    for (let i = 0; i < BATCH_SIZE; i++) {
-      const event = await claimNext(now, onlyUserId);
+    for (let i = 0; i < batchSize; i++) {
+      const event = await claimNext(runAt, onlyUserId);
       if (!event) break;
       result.processed += 1;
-      const ok = await processOne(event);
+      const stopHeartbeat = startLeaseHeartbeat(event.id);
+      const ok = await processOne(event).finally(stopHeartbeat);
       if (ok) {
         await db.update(schema.outboxEvents).set({
           status: "done",
-          processedAt: new Date(),
-        }).where(eq(schema.outboxEvents.id, event.id));
+          processedAt: now(),
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(ownedEvent(event.id));
         result.succeeded += 1;
       } else {
         const [current] = await db.select({ status: schema.outboxEvents.status })
@@ -166,13 +229,19 @@ export function createProjectionWorker(db: Db, repo: Repository) {
   async function replayDeadLetters(userId?: string, localDate?: string): Promise<number> {
     const revived = await (userId === undefined
       ? db.update(schema.outboxEvents)
-          .set({ status: "pending", attempts: 0, lastError: null, availableAt: new Date() })
+          .set({
+            status: "pending", attempts: 0, lastError: null, availableAt: now(),
+            processingStartedAt: null, lockedBy: null, lockExpiresAt: null,
+          })
           .where(localDate === undefined
             ? eq(schema.outboxEvents.status, "dead_letter")
             : and(eq(schema.outboxEvents.status, "dead_letter"), eventMatchesDate(localDate)))
           .returning({ id: schema.outboxEvents.id })
       : db.update(schema.outboxEvents)
-          .set({ status: "pending", attempts: 0, lastError: null, availableAt: new Date() })
+          .set({
+            status: "pending", attempts: 0, lastError: null, availableAt: now(),
+            processingStartedAt: null, lockedBy: null, lockExpiresAt: null,
+          })
           .where(and(
             eq(schema.outboxEvents.status, "dead_letter"),
             eq(schema.outboxEvents.userId, userId),
@@ -230,8 +299,9 @@ export function createProjectionWorker(db: Db, repo: Repository) {
       )).limit(1);
     const [counts] = await db.select({
       pending: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'pending')::int`,
+      processing: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'processing')::int`,
       deadLetter: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'dead_letter')::int`,
-      oldestPendingAt: sql<Date | null>`min(${schema.outboxEvents.createdAt}) filter (where ${schema.outboxEvents.status} = 'pending')`,
+      oldestPendingAt: sql<Date | null>`min(${schema.outboxEvents.createdAt}) filter (where ${schema.outboxEvents.status} in ('pending', 'processing'))`,
     }).from(schema.outboxEvents)
       .where(and(
         eq(schema.outboxEvents.userId, userId),
@@ -254,10 +324,11 @@ export function createProjectionWorker(db: Db, repo: Repository) {
       .limit(20);
 
     const pending = counts?.pending ?? 0;
+    const processing = counts?.processing ?? 0;
     const deadLetter = counts?.deadLetter ?? 0;
     const status = checkpoint?.status === "failed" || deadLetter > 0
       ? "failed"
-      : pending > 0 || projection?.projectionStatus === "lagging"
+      : pending > 0 || processing > 0 || projection?.projectionStatus === "lagging"
         ? "lagging"
         : projection?.projectionStatus ?? checkpoint?.status ?? "missing";
     return {
@@ -277,6 +348,7 @@ export function createProjectionWorker(db: Db, repo: Repository) {
       } : null,
       outbox: {
         pending,
+        processing,
         deadLetter,
         oldestPendingAt: counts?.oldestPendingAt ?? null,
         failures,
