@@ -175,10 +175,21 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
       if (event) ids.push(event.id);
     }
 
-    // Two workers race over the same queue.
+    // Two workers race over the same queue. A single runOnce per worker can
+    // legitimately end early: claimNext sees "no pending row" while the other
+    // worker holds a claimed-but-not-yet-done event (SKIP LOCKED hides it).
+    // The invariant under test is terminal convergence, so keep giving both
+    // workers turns until the queue is fully done or a hard cap trips.
     const [w1, w2] = [createProjectionWorker(ctx.db!, ctx.repo), createProjectionWorker(ctx.db!, ctx.repo)];
-    const results = await Promise.all([w1.runOnce(), w2.runOnce()]);
-    const totalProcessed = results[0].processed + results[1].processed;
+    let totalProcessed = 0;
+    for (let round = 0; round < 20; round++) {
+      const results = await Promise.all([w1.runOnce(), w2.runOnce()]);
+      totalProcessed += results[0].processed + results[1].processed;
+      const [{ n }] = await db.select({ n: sql<number>`count(*)::int` })
+        .from(schema.outboxEvents)
+        .where(and(eq(schema.outboxEvents.userId, ctx.userId), eq(schema.outboxEvents.status, "pending")));
+      if (n === 0) break;
+    }
 
     // Every seeded event must be processed exactly once across both workers.
     for (const id of ids) {
