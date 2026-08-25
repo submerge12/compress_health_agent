@@ -139,7 +139,7 @@ describe.skipIf(!isDbAvailable)("training domain invariants", () => {
       sessionId: session.id,
       sessionExerciseId: firstExercise!.id,
       setNumber: 2,
-      pain: [{ location: "right_shoulder", severity: 2 }],
+      pain: [{ bodyPart: "right_shoulder", severity: "mild" }],
     });
     expect(s2.log.loadValue).toBeNull();
     expect(s2.log.rir).toBeNull();

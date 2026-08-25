@@ -23,6 +23,8 @@ export interface PainCommandInput {
   severityHint?: "mild" | "sharp" | "worsening" | "unstable" | "unknown";
   description?: string;
   journeyId?: string;
+  source?: string;
+  context?: Record<string, unknown>;
 }
 
 export interface PainCommandResult {
@@ -69,8 +71,9 @@ export function createPainCommand(db: Db) {
           bodyPart: input.bodyPart ?? null,
           severityHint: input.severityHint ?? "unknown",
           ...(input.description ? { description: input.description } : {}),
+          ...(input.context ? { context: input.context } : {}),
         },
-        source: "user",
+        source: input.source ?? "user",
         journeyId: input.journeyId ?? null,
       }).returning();
       if (!observation) throw new Error("pain observation insert returned no row");
@@ -93,7 +96,10 @@ export function createPainCommand(db: Db) {
         aggregateType: "constraint",
         aggregateId: constraint.id,
         eventType: "health.pain_recorded",
-        payloadJson: { observedOn: input.observedOn },
+        payloadJson: {
+          observedOn: input.observedOn,
+          ...(input.context ? { context: input.context } : {}),
+        },
       });
 
       await tx.insert(schema.userDecisionEvents).values({
@@ -105,6 +111,7 @@ export function createPainCommand(db: Db) {
           severity,
           observationId: observation.id,
           constraintId: constraint.id,
+          ...(input.context ? { context: input.context } : {}),
         },
         journeyId: input.journeyId ?? null,
       });

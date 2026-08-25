@@ -13,7 +13,7 @@
  * thin: they adapt the MCP surface to existing domain services — no health
  * rule lives here.
  */
-import { and, eq, gte, isNull, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull, lte, sql } from "drizzle-orm";
 
 import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
@@ -32,6 +32,7 @@ import { createHealthRecordingService } from "../../domain/health-recording-serv
 import { createMediaRetrieval } from "../../media/retrieval.js";
 import { createPainCommand } from "../../training/prepared-session.js";
 import { createTrainingService } from "../../training/training-service.js";
+import type { TrainingSetPainInput } from "../../training/training-service.js";
 import { createSubstitutionEngine, SubstitutionProposalError } from "../../training/substitution-engine.js";
 import { createReflectionEngine } from "../../training/reflection-engine.js";
 import { createCycleEngine } from "../../training/cycle-engine.js";
@@ -217,6 +218,31 @@ export function createHealthToolCatalog(
     if (v === undefined || v === null) return undefined;
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
+  }
+
+  function setPainEntries(args: Record<string, unknown>): TrainingSetPainInput[] {
+    const raw = args["pain"];
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) throw new RangeError("pain must be an array");
+    const allowed = new Set(["mild", "sharp", "worsening", "unstable", "unknown"]);
+    return raw.map((entry, index) => {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new RangeError(`pain[${index}] must be an object`);
+      }
+      const value = entry as Record<string, unknown>;
+      const bodyPart = typeof value["bodyPart"] === "string" ? value["bodyPart"].trim() : "";
+      const severity = typeof value["severity"] === "string" ? value["severity"] : "";
+      if (!bodyPart) throw new RangeError(`pain[${index}].bodyPart is required`);
+      if (!allowed.has(severity)) throw new RangeError(`pain[${index}].severity is invalid`);
+      const description = typeof value["description"] === "string"
+        ? value["description"].trim()
+        : "";
+      return {
+        bodyPart,
+        severity: severity as TrainingSetPainInput["severity"],
+        ...(description ? { description } : {}),
+      };
+    });
   }
 
   function acceptedSelections(responses: Record<string, unknown> | undefined): Record<string, string> {
@@ -1306,7 +1332,7 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_record_set",
-      description: "Record one training set. Reaching target sets auto-completes the exercise. Returns before/after revision.",
+      description: "Record one training set with optional muscle feel and pain feedback. Pain is escalated into an observation and active constraint.",
       risk: "revocable-write",
       inputSchema: {
         type: "object",
@@ -1319,6 +1345,23 @@ export function createHealthToolCatalog(
           loadUnit: { type: "string", enum: ["kg", "lb", "bodyweight"] },
           reps: { type: "number" },
           rir: { type: "number" },
+          targetMuscleFeel: { type: "integer", minimum: 1, maximum: 5 },
+          pain: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                bodyPart: { type: "string", minLength: 1 },
+                severity: {
+                  type: "string",
+                  enum: ["mild", "sharp", "worsening", "unstable", "unknown"],
+                },
+                description: { type: "string" },
+              },
+              required: ["bodyPart", "severity"],
+              additionalProperties: false,
+            },
+          },
           idempotencyKey: { type: "string" },
         },
         required: ["runHandle", "trainingSessionId", "sessionExerciseId", "setNumber", "idempotencyKey"],
@@ -1337,6 +1380,8 @@ export function createHealthToolCatalog(
               loadUnit: (optStr(inv.args, "loadUnit") as "kg" | "lb" | "bodyweight" | undefined) ?? null,
               reps: optNum(inv.args, "reps") ?? null,
               rir: optNum(inv.args, "rir") ?? null,
+              targetMuscleFeel: optNum(inv.args, "targetMuscleFeel") ?? null,
+              pain: setPainEntries(inv.args),
               idempotencyKey: str(inv.args, "idempotencyKey"),
               source: `mcp:${inv.actor}`,
             });
@@ -1357,20 +1402,31 @@ export function createHealthToolCatalog(
                 eq(schema.trainingSessions.id, sessionId),
                 eq(schema.trainingSessions.userId, inv.principalUserId),
               )).limit(1);
+            const painAggregateIds = recorded.painResults.map((pain) => pain.constraintId);
+            const outboxAggregateIds = [recorded.log.id, ...painAggregateIds];
             const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
               .where(and(
                 eq(schema.outboxEvents.userId, inv.principalUserId),
-                eq(schema.outboxEvents.aggregateId, recorded.log.id),
+                inArray(schema.outboxEvents.aggregateId, outboxAggregateIds),
               ));
             if (!readBack || outbox.length === 0) throw new Error("training set read-back failed");
             return {
               response: {
                 setId: readBack.id,
-                beforeRevision: recorded.beforeRevision,
-                afterRevision: recorded.afterRevision,
                 exerciseCompleted: recorded.exerciseCompleted,
+                factCommitted: true,
+                projectionStatus: "pending",
+                projectionRevision: null,
+                painEscalated: recorded.painResults.length > 0,
+                painConstraintIds: painAggregateIds,
               },
-              factRefs: [{ type: "training_set", id: readBack.id }],
+              factRefs: [
+                { type: "training_set", id: readBack.id },
+                ...recorded.painResults.flatMap((pain) => [
+                  { type: "pain_observation", id: pain.observationId },
+                  { type: "health_constraint", id: pain.constraintId },
+                ]),
+              ],
               outboxEventIds: outbox.map((event) => event.id),
             };
           },

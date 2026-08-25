@@ -16,7 +16,11 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as schema from "../db/schema.js";
 import { THREE_SPLIT_DAYS, DEFAULT_CYCLE } from "./three-split.js";
 import { NotOwnedError } from "./ownership.js";
-import { blockedPatternsForBodyPart } from "./prepared-session.js";
+import {
+  blockedPatternsForBodyPart,
+  createPainCommand,
+  type PainCommandResult,
+} from "./prepared-session.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 type SessionRow = typeof schema.trainingSessions.$inferSelect;
@@ -28,18 +32,13 @@ export class SessionStateError extends Error {
   }
 }
 
-export function createTrainingService(db: Db) {
-  /** Latest daily-state revision for the user across dates (−1 when none). */
-  async function currentDailyRevision(
-    tx: Parameters<Parameters<Db["transaction"]>[0]>[0],
-    userId: string,
-  ): Promise<number> {
-    const [row] = await tx.select({ max: sql<number>`coalesce(max(${schema.dailyHealthStateProjection.revision}), -1)::int` })
-      .from(schema.dailyHealthStateProjection)
-      .where(eq(schema.dailyHealthStateProjection.userId, userId));
-    return row?.max ?? -1;
-  }
+export interface TrainingSetPainInput {
+  bodyPart: string;
+  severity: "mild" | "sharp" | "worsening" | "unstable" | "unknown";
+  description?: string;
+}
 
+export function createTrainingService(db: Db) {
   /** Seed the reference program as data exactly once per user. */
   async function ensureUserProgram(userId: string): Promise<{ templateIds: string[]; planVersionId: string }> {
     const existing = await db.select().from(schema.trainingTemplates)
@@ -397,20 +396,18 @@ export function createTrainingService(db: Db) {
     reps?: number | null;
     rir?: number | null;
     targetMuscleFeel?: number | null;
-    pain?: Array<Record<string, unknown>>;
+    pain?: TrainingSetPainInput[];
     source?: string;
     idempotencyKey?: string;
   }): Promise<{
     log: typeof schema.trainingSetLogs.$inferSelect;
     replayed: boolean;
-    beforeRevision: number;
-    afterRevision: number;
     exerciseCompleted: boolean;
+    painResults: PainCommandResult[];
   }> {
-    // P0-4: ownership check, replay detection, insert, outbox, auto-done and
-    // revision bump all happen in ONE transaction; a retry with the same
-    // idempotency key or the same (exercise, setNumber) returns the original
-    // row untouched and emits nothing.
+    // Ownership check, replay detection, fact/outbox writes, pain escalation
+    // and auto-done all happen in ONE transaction. Projection revision is only
+    // assigned asynchronously by the projection worker, never fabricated here.
     return db.transaction(async (tx) => {
       const [session] = await tx.select().from(schema.trainingSessions)
         .where(and(eq(schema.trainingSessions.id, input.sessionId), eq(schema.trainingSessions.userId, input.userId)))
@@ -445,14 +442,11 @@ export function createTrainingService(db: Db) {
           return {
             log: existing,
             replayed: true,
-            beforeRevision: -1,
-            afterRevision: -1,
             exerciseCompleted: false,
+            painResults: [],
           };
         }
       }
-
-      const beforeRevision = await currentDailyRevision(tx, input.userId);
 
       const inserted = await tx.insert(schema.trainingSetLogs).values({
         sessionExerciseId: input.sessionExerciseId,
@@ -462,7 +456,7 @@ export function createTrainingService(db: Db) {
         reps: input.reps ?? null,
         rir: input.rir ?? null,
         targetMuscleFeel: input.targetMuscleFeel ?? null,
-        painJson: input.pain ?? [],
+        painJson: (input.pain ?? []).map((pain) => ({ ...pain })),
         source: input.source ?? "ui",
         idempotencyKey: input.idempotencyKey ?? null,
       }).onConflictDoNothing({
@@ -480,9 +474,8 @@ export function createTrainingService(db: Db) {
         return {
           log: existing,
           replayed: true,
-          beforeRevision: -1,
-          afterRevision: -1,
           exerciseCompleted: false,
+          painResults: [],
         };
       }
       const log = inserted[0];
@@ -513,20 +506,29 @@ export function createTrainingService(db: Db) {
         exerciseCompleted = true;
       }
 
-      // Pain entries attached to a set still escalate through the constraint
-      // path — a set log must never swallow a pain signal.
-      if ((input.pain?.length ?? 0) > 0) {
-        await tx.insert(schema.outboxEvents).values({
+      // A set-attached pain signal is a first-class domain command. It creates
+      // the observation, conservative constraint, decision audit and outbox in
+      // this same transaction instead of emitting an unprojectable placeholder.
+      const painResults: PainCommandResult[] = [];
+      for (const pain of input.pain ?? []) {
+        painResults.push(await createPainCommand(tx as unknown as Db).execute({
           userId: input.userId,
-          aggregateType: "observation",
-          aggregateId: log.id,
-          eventType: "health.pain_during_set",
-          payloadJson: { observedOn: session.sessionDate, sessionId: input.sessionId },
-        });
+          observedOn: session.sessionDate,
+          bodyPart: pain.bodyPart,
+          severityHint: pain.severity,
+          ...(pain.description ? { description: pain.description } : {}),
+          source: input.source ?? "training_set",
+          journeyId: session.journeyId ?? undefined,
+          context: {
+            trainingSessionId: input.sessionId,
+            sessionExerciseId: input.sessionExerciseId,
+            trainingSetId: log.id,
+            setNumber: input.setNumber,
+          },
+        }));
       }
 
-      const afterRevision = beforeRevision + 1;
-      return { log, replayed: false, beforeRevision, afterRevision, exerciseCompleted };
+      return { log, replayed: false, exerciseCompleted, painResults };
     });
   }
 

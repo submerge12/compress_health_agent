@@ -1179,6 +1179,114 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }
   }, 45_000);
 
+  it("records per-set feel and escalates pain through the constraint domain path", async () => {
+    const binding = `mcp-wire-set-pain-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire per-set feedback and pain escalation",
+      idempotencyKey: "wire-set-pain-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const prepared = await client.request(toolCall(2, "health_prepare_training", {
+      runHandle,
+      date: "2026-08-26",
+      day: "A",
+      idempotencyKey: "wire-set-pain-prepare",
+    }));
+    const trainingProposalId = (
+      prepared.result?.structuredContent as { trainingProposalId: string }
+    ).trainingProposalId;
+    const started = await client.request(toolCall(3, "health_start_training", {
+      runHandle,
+      trainingProposalId,
+      date: "2026-08-26",
+      dayRole: "A",
+      idempotencyKey: "wire-set-pain-start",
+    }));
+    const trainingSessionId = (
+      started.result?.structuredContent as { trainingSessionId: string }
+    ).trainingSessionId;
+    const initial = await client.request(resourceRead(
+      4,
+      `health://training/sessions/${trainingSessionId}`,
+      runHandle,
+    ));
+    const initialBody = JSON.parse(
+      (initial.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as { exercisesWithSets: Array<{ exercise: { id: string } }> };
+    const sessionExerciseId = initialBody.exercisesWithSets[0]!.exercise.id;
+
+    const recorded = await client.request(toolCall(5, "health_record_set", {
+      runHandle,
+      trainingSessionId,
+      sessionExerciseId,
+      setNumber: 1,
+      reps: 8,
+      targetMuscleFeel: 3,
+      pain: [{
+        bodyPart: "右肩",
+        severity: "mild",
+        description: "推起时不舒服",
+      }],
+      idempotencyKey: "wire-set-pain-record",
+    }));
+    expect(recorded.result?.resultType).toBe("complete");
+    expect(recorded.result?.structuredContent).toMatchObject({
+      factCommitted: true,
+      projectionStatus: "pending",
+      projectionRevision: null,
+      painEscalated: true,
+    });
+    expect(recorded.result?.structuredContent).not.toHaveProperty("beforeRevision");
+    expect(recorded.result?.structuredContent).not.toHaveProperty("afterRevision");
+
+    const sessionReadBack = await client.request(resourceRead(
+      6,
+      `health://training/sessions/${trainingSessionId}`,
+      runHandle,
+    ));
+    const sessionBody = JSON.parse(
+      (sessionReadBack.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as {
+      exercisesWithSets: Array<{
+        exercise: { id: string };
+        sets: Array<{
+          targetMuscleFeel: number | null;
+          painJson: Array<{ bodyPart: string; severity: string; description: string }>;
+        }>;
+      }>;
+    };
+    const recordedSet = sessionBody.exercisesWithSets
+      .find((entry) => entry.exercise.id === sessionExerciseId)!.sets[0]!;
+    expect(recordedSet.targetMuscleFeel).toBe(3);
+    expect(recordedSet.painJson).toEqual([{
+      bodyPart: "右肩",
+      severity: "mild",
+      description: "推起时不舒服",
+    }]);
+
+    const constraintReadBack = await client.request(resourceRead(
+      7,
+      "health://constraints/active/2026-08-26",
+      runHandle,
+    ));
+    const constraints = JSON.parse(
+      (constraintReadBack.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as Array<{
+      constraintType: string;
+      severity: string;
+      targetJson: { bodyPart?: string };
+    }>;
+    expect(constraints).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        constraintType: "pain",
+        severity: "warn",
+        targetJson: expect.objectContaining({ bodyPart: "右肩" }),
+      }),
+    ]));
+  }, 35_000);
+
   it("executes J05 substitution without stacking completed volume", async () => {
     const binding = `mcp-wire-j05-${process.pid}-${Date.now()}`;
     const client = new WireClient({ externalUserId: binding });
