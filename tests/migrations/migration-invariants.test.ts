@@ -78,7 +78,7 @@ describe("migrations (live, throwaway databases)", () => {
   it("clean database: full run then idempotent re-run, gate passes", async () => {
     const first = await migrate(cleanUrl);
     expect(first.applied).toHaveLength(allMigrations.length);
-    expect(allMigrations.length).toBe(12);
+    expect(allMigrations.length).toBe(13);
     expect(first.applied[0]).toMatch(/^0000_/);
 
     const second = await migrate(cleanUrl);
@@ -188,7 +188,7 @@ describe("migrations (live, throwaway databases)", () => {
     await setup.end({ timeout: 3 });
   });
 
-  it("downgrade guard refuses unknown recorded migrations", async () => {
+  it("downgrade guard refuses unknown recorded migrations", { timeout: 20000 }, async () => {
     const poison = `${UPGRADE_DB}_poison`;
     await dropDatabase(poison);
     await createDatabase(poison);

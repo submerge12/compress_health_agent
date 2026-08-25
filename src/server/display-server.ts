@@ -4,8 +4,13 @@ import type { ToolContext } from "../tools/context.js";
 import { createDailyStateService } from "../domain/daily-state.js";
 import { createDietLogService, NeedsConfirmationError, StateConflict } from "../domain/diet-log-service.js";
 import { createTrainingService } from "../training/training-service.js";
+import { createPainCommand, createPreparedSessionService, ProposalStaleError, blockedPatternsForBodyPart } from "../training/prepared-session.js";
 import { createSubstitutionEngine } from "../training/substitution-engine.js";
 import { NotOwnedError } from "../training/ownership.js";
+import { and, eq, isNull, sql } from "drizzle-orm";
+import * as schemaRef from "../db/schema.js";
+const trainingSessionsTable = schemaRef.trainingSessions;
+const trainingSessionExercisesTable = schemaRef.trainingSessionExercises;
 import { DomainHttpError, Errors } from "./domain-http-error.js";
 import { createReflectionEngine } from "../training/reflection-engine.js";
 import { createMediaIndexer, createMediaRetrieval } from "../media/retrieval.js";
@@ -325,65 +330,173 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
     return result;
   },
 
+  // ── WO-HS-06 / M20: unified pain command (observation + constraint) ──
+  "POST /api/v1/health/pain": async (ctx, _query, body) => {
+    const db = requireDailyStateDb(ctx);
+    const input = cast(body) as {
+      observedOn?: string;
+      bodyPart?: string;
+      severity?: string;
+      description?: string;
+      journeyId?: string;
+    };
+    const severityHint = input.severity as never;
+    if (severityHint !== undefined && !["mild", "sharp", "worsening", "unstable", "unknown"].includes(severityHint)) {
+      throw new RangeError("severity must be mild|sharp|worsening|unstable|unknown");
+    }
+    return createPainCommand(db).execute({
+      userId: ctx.userId,
+      observedOn: input.observedOn ?? new Date().toISOString().slice(0, 10),
+      bodyPart: input.bodyPart,
+      severityHint,
+      description: input.description,
+      journeyId: input.journeyId,
+    });
+  },
+
   // ── M06/M07 training (v1): prepare → start → sets → finish → reflect ──
   "GET /api/v1/training/prepare": async (ctx, query) => {
     const db = requireDailyStateDb(ctx);
     const date = requireQueryDate(query, "date");
     const dayParam = query.get("day");
     const day = dayParam === "A" || dayParam === "B" || dayParam === "C" ? dayParam : undefined;
-    return createTrainingService(db).prepareSession(ctx.userId, date, day);
+
+    const service = createTrainingService(db);
+    const proposal = await service.prepareSession(ctx.userId, date, day);
+
+    // WO-HS-06: body-part pain constraints additionally block pattern families.
+    const constraints = await db.select().from(schemaRef.healthConstraints).where(and(
+      eq(schemaRef.healthConstraints.userId, ctx.userId),
+      isNull(schemaRef.healthConstraints.liftedAt),
+      sql`${schemaRef.healthConstraints.activeFrom} <= ${date}`,
+    ));
+    const extraPatterns = new Set<string>();
+    for (const c of constraints) {
+      if (c.severity !== "block") continue;
+      const target = c.targetJson as { bodyPart?: string };
+      for (const pattern of blockedPatternsForBodyPart(target.bodyPart)) {
+        extraPatterns.add(pattern);
+      }
+    }
+    if (extraPatterns.size > 0) {
+      proposal.proposedExercises = proposal.proposedExercises.filter(
+        (e) => !extraPatterns.has(String(e.movementPattern)));
+      (proposal.blockedExercises as Array<Record<string, unknown>>).push(...[...extraPatterns].map((pattern) => ({
+        exerciseSlug: null,
+        movementPattern: pattern,
+        reason: "blocked_by_body_part_constraint",
+        suggestion: "rest_that_pattern",
+      })));
+    }
+
+    // Persist the filtered plan as a consumable proposal.
+    const dailyState = createDailyStateService(db, ctx.repo);
+    const current = await dailyState.getDailyProjection(ctx.userId, date);
+    const saved = await createPreparedSessionService(db).saveProposal({
+      userId: ctx.userId,
+      sessionDate: date,
+      dayRole: proposal.dayRole,
+      planVersionId: proposal.planVersionId ?? null,
+      dailyStateRevision: typeof current?.revision === "number" ? current.revision : -1,
+      proposedExercises: proposal.proposedExercises as unknown as Array<Record<string, unknown>>,
+      blockedExercises: proposal.blockedExercises as unknown as Array<Record<string, unknown>>,
+      activeConstraints: proposal.activeConstraints as unknown as Array<Record<string, unknown>>,
+    });
+    void schemaRef;
+    return { ...proposal, proposalId: saved.proposalId };
   },
 
   "POST /api/v1/training/sessions": async (ctx, _query, body) => {
     const db = requireDailyStateDb(ctx);
     const input = cast(body) as {
-      date: string;
-      dayRole: "A" | "B" | "C";
-      planVersionId?: string;
+      proposalId?: string;
+      date?: string;
+      dayRole?: "A" | "B" | "C";
       journeyId?: string;
     };
-    if (!input.date || !input.dayRole) throw new RangeError("date and dayRole are required");
-    return createTrainingService(db).startSession({
-      userId: ctx.userId,
-      sessionDate: input.date,
-      dayRole: input.dayRole,
-      planVersionId: input.planVersionId,
-      journeyId: input.journeyId,
-    });
-  },
-
-  "POST /api/v1/training/sets": async (ctx, _query, body) => {
-    const db = requireDailyStateDb(ctx);
-    const input = cast(body) as {
-      sessionId: string;
-      sessionExerciseId: string;
-      setNumber: number;
-      loadValue?: number;
-      loadUnit?: string;
-      reps?: number;
-      rir?: number;
-      targetMuscleFeel?: number;
-      pain?: Array<Record<string, unknown>>;
-      source?: string;
-      idempotencyKey?: string;
-    };
-    if (!input.sessionId || !input.sessionExerciseId || !input.setNumber) {
-      throw new RangeError("sessionId, sessionExerciseId and setNumber are required");
+    // WO-HS-06: starting requires a prepared proposal; the raw-template path
+    // is gone so constraint-filtered plans are what become sessions.
+    if (!input.proposalId) {
+      throw new DomainHttpError(400, "proposal_required", "call GET /api/v1/training/prepare first and pass proposalId");
     }
-    return createTrainingService(db).recordSet({
-      userId: ctx.userId,
-      sessionId: input.sessionId,
-      sessionExerciseId: input.sessionExerciseId,
-      setNumber: input.setNumber,
-      loadValue: input.loadValue ?? null,
-      loadUnit: (input.loadUnit as "kg" | "lb" | "bodyweight" | undefined) ?? null,
-      reps: input.reps ?? null,
-      rir: input.rir ?? null,
-      targetMuscleFeel: input.targetMuscleFeel ?? null,
-      pain: input.pain,
-      source: input.source,
-      idempotencyKey: input.idempotencyKey,
-    });
+    try {
+      const consumed = await createPreparedSessionService(db).consumeValidProposal({
+        userId: ctx.userId,
+        proposalId: input.proposalId,
+        sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
+        dayRole: input.dayRole ?? "A",
+      });
+      const items = ((consumed.proposalJson.proposedExercises ?? []) as Array<Record<string, unknown>>).map((raw) => {
+        const item = raw as { order?: unknown; exerciseSlug?: unknown; sets?: unknown;
+          repRangeLow?: unknown; repRangeHigh?: unknown; rirLow?: unknown; rirHigh?: unknown };
+        return {
+          order: Number(item.order ?? 0),
+          exerciseSlug: String(item.exerciseSlug ?? ""),
+          sets: Number(item.sets ?? 3),
+          repRangeLow: item.repRangeLow === undefined ? null : Number(item.repRangeLow),
+          repRangeHigh: item.repRangeHigh === undefined ? null : Number(item.repRangeHigh),
+          rirLow: item.rirLow === undefined ? null : Number(item.rirLow),
+          rirHigh: item.rirHigh === undefined ? null : Number(item.rirHigh),
+        };
+      });
+      const dayRoleMatch = String((consumed.proposalJson as { dayRole?: string }).dayRole ?? input.dayRole ?? "A").trim().toUpperCase();
+      const dayRole = (["A", "B", "C"].includes(dayRoleMatch) ? dayRoleMatch : "A") as "A" | "B" | "C";
+
+      try {
+        return await createTrainingService(db).startSessionFromProposal({
+          userId: ctx.userId,
+          sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
+          dayRole,
+          planVersionId: consumed.planVersionId ?? undefined,
+          exercises: items.map((item, index) => ({
+            order: item.order || index + 1,
+            exerciseSlug: item.exerciseSlug,
+            sets: item.sets,
+            repRangeLow: item.repRangeLow === null ? undefined : item.repRangeLow,
+            repRangeHigh: item.repRangeHigh === null ? undefined : item.repRangeHigh,
+            rirLow: item.rirLow === null ? undefined : item.rirLow,
+            rirHigh: item.rirHigh === null ? undefined : item.rirHigh,
+          })),
+          journeyId: input.journeyId,
+        });
+      } catch (inner) {
+        if (inner instanceof RangeError && String(inner.message).includes("no template")) {
+          // Proposal-driven start does not need the template; fall through to
+          // the proposal-based creation below.
+        } else {
+          throw inner;
+        }
+      }
+
+      // Proposal-based session creation without template lookup.
+      const [session] = await db.insert(trainingSessionsTable).values({
+        userId: ctx.userId,
+        sessionDate: input.date ?? new Date().toISOString().slice(0, 10),
+        planVersionId: consumed.planVersionId ?? null,
+        status: "in_progress",
+        startedAt: new Date(),
+        journeyId: input.journeyId ?? null,
+      }).returning();
+      if (!session) throw new Error("session insert returned no row");
+      if (items.length > 0) {
+        await db.insert(trainingSessionExercisesTable).values(items.map((item) => ({
+          sessionId: session.id,
+          exerciseSlug: item.exerciseSlug,
+          orderIndex: item.order,
+          targetSets: item.sets,
+          targetRepRangeLow: item.repRangeLow ?? null,
+          targetRepRangeHigh: item.repRangeHigh ?? null,
+          targetRirLow: item.rirLow ?? null,
+          targetRirHigh: item.rirHigh ?? null,
+        })));
+      }
+      return session;
+    } catch (error) {
+      if (error instanceof ProposalStaleError) {
+        throw Errors.conflict("proposal_stale", `training proposal is stale (${error.reason}); re-run prepare`);
+      }
+      throw error;
+    }
   },
 
   "GET /api/v1/training/sessions": async (ctx, query) => {

@@ -638,3 +638,20 @@ export const segmentFeedback = compass.table("segment_feedback", {
   note: text("note"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
 });
+
+export const preparedTrainingProposals = compass.table("prepared_training_proposals", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  sessionDate: date("session_date").notNull(),
+  dayRole: text("day_role").notNull(),
+  sourceDailyStateRevision: integer("source_daily_state_revision").notNull().default(-1),
+  planVersionId: uuid("plan_version_id"),
+  proposalJson: jsonb("proposal_json").$type<Record<string, unknown>>().notNull(),
+  constraintsSnapshotJson: jsonb("constraints_snapshot_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull().default(sql`now() + interval '12 hours'`),
+  status: text("status").notNull().default("pending"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true })
+}, (t) => [
+  index("prepared_training_proposals_user_idx").on(t.userId, t.sessionDate, t.status),
+]);
