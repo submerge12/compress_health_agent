@@ -60,6 +60,8 @@ export interface DietCorrectionInput {
   reason?: string;
   journeyId?: string;
   idempotencyKey?: string;
+  /** Caller already resolved every ambiguous food candidate. */
+  overrideEstimate?: NutritionEstimateResult;
 }
 
 export function createDietLogService(db: Db, repo: Repository) {
@@ -74,6 +76,31 @@ export function createDietLogService(db: Db, repo: Repository) {
       (estimate.unmatched?.length ?? 0) > 0 ||
       estimate.uncertain === true;
     return { status: needsConfirmation ? "needs_confirmation" : "ok", estimate };
+  }
+
+  async function previewCorrection(ctx: ToolContext, input: {
+    userId: string;
+    originalLogId: string;
+    description?: string;
+    mealType?: string;
+  }) {
+    const [original] = await db.select().from(schema.dietLogs)
+      .where(and(
+        eq(schema.dietLogs.id, input.originalLogId),
+        eq(schema.dietLogs.userId, input.userId),
+      ))
+      .limit(1);
+    if (!original) throw new RangeError("original log not found");
+    if (original.supersededById !== null) throw new StateConflict(-1);
+
+    const description = input.description ?? original.description;
+    const mealType = input.mealType ?? original.mealType;
+    const result = await preview(ctx, {
+      description,
+      date: original.logDate,
+      mealType,
+    });
+    return { ...result, original, description, mealType };
   }
 
   async function assertRevision(userId: string, logDate: string, expectedRevision?: number): Promise<void> {
@@ -93,6 +120,7 @@ export function createDietLogService(db: Db, repo: Repository) {
 
   return {
     preview,
+    previewCorrection,
 
     /**
      * Commit a reviewed estimate as a diet fact. Idempotent per
@@ -190,6 +218,7 @@ export function createDietLogService(db: Db, repo: Repository) {
               .where(and(
                 eq(schema.dietLogs.id, original.supersededById),
                 eq(schema.dietLogs.correctionOfId, original.id),
+                eq(schema.dietLogs.idempotencyKey, input.idempotencyKey),
               ))
               .limit(1);
             if (priorRevision) return { original, revised: priorRevision };
@@ -211,8 +240,17 @@ export function createDietLogService(db: Db, repo: Repository) {
 
         const description = input.description ?? original.description;
         const mealType = input.mealType ?? original.mealType;
-        const estimate = await handleNutritionEstimate(ctx, { description });
-        const uncertain = (estimate.needsConfirmation?.length ?? 0) > 0 || estimate.uncertain === true;
+        const estimate = input.overrideEstimate
+          ?? await handleNutritionEstimate(ctx, { description });
+        const unresolved =
+          (estimate.needsConfirmation?.length ?? 0) > 0
+          || (estimate.unmatched?.length ?? 0) > 0;
+        if (unresolved && input.overrideEstimate === undefined) {
+          throw new NeedsConfirmationError(estimate);
+        }
+        const uncertain =
+          unresolved
+          || estimate.uncertain === true;
 
         const [revised] = await tx.insert(schema.dietLogs).values({
           userId: input.userId,

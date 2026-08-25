@@ -1279,6 +1279,142 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }
   }, 30_000);
 
+  it("keeps an ambiguous meal correction pending until its chosen candidate is confirmed", async () => {
+    const binding = `mcp-wire-correct-meal-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire ambiguous meal correction",
+      idempotencyKey: "wire-run-correct-meal",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const logged = await client.request(toolCall(2, "health_log_meal", {
+      runHandle,
+      date: "2026-08-18",
+      mealType: "lunch",
+      description: "牛肉150克",
+      idempotencyKey: "wire-correct-meal-base",
+    }));
+    const originalLogId = (logged.result?.structuredContent as { dietLogId: string }).dietLogId;
+    expect(originalLogId).toEqual(expect.any(String));
+
+    const args = {
+      runHandle,
+      dietLogId: originalLogId,
+      mealType: "lunch",
+      description: "150g rice",
+      reason: "实际吃的是米饭",
+      idempotencyKey: "wire-correct-meal-candidate",
+    };
+    const pending = await client.request(toolCall(3, "health_correct_meal", args));
+    expect(pending.result?.resultType).toBe("input_required");
+    const requestState = pending.result?.requestState as string;
+    const requests = pending.result?.inputRequests as Record<string, {
+      params: { requestedSchema: { properties: { choice: { enum: string[] } } } };
+    }>;
+    expect(Object.keys(requests)).toEqual(["candidate_0"]);
+    const offered = requests.candidate_0!.params.requestedSchema.properties.choice.enum;
+    expect(offered.length).toBeGreaterThan(0);
+    const chosen = offered.at(-1)!;
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [beforeConfirmation] = await sql`
+        SELECT
+          superseded_by_id,
+          (SELECT count(*)::int
+             FROM compass_health.diet_logs revision
+            WHERE revision.correction_of_id = original.id) AS revision_count,
+          (SELECT count(*)::int
+             FROM compass_health.mcp_write_receipts receipt
+            WHERE receipt.user_id = original.user_id
+              AND receipt.tool_name = 'health_correct_meal'
+              AND receipt.idempotency_key = 'wire-correct-meal-candidate') AS receipt_count
+        FROM compass_health.diet_logs original
+        WHERE original.id = ${originalLogId}::uuid`;
+      expect(beforeConfirmation).toMatchObject({
+        superseded_by_id: null,
+        revision_count: 0,
+        receipt_count: 0,
+      });
+
+      const completed = await client.request(toolCall(4, "health_correct_meal", args, {
+        requestState,
+        inputResponses: {
+          candidate_0: { action: "accept", content: { choice: chosen } },
+        },
+      }));
+      expect(completed.result?.resultType).toBe("complete");
+      const body = completed.result?.structuredContent as {
+        correctedLogId: string;
+        supersededLogId: string;
+        receiptId: string;
+        replayed: boolean;
+      };
+      expect(body).toMatchObject({
+        correctedLogId: expect.any(String),
+        supersededLogId: originalLogId,
+        receiptId: expect.any(String),
+        replayed: false,
+      });
+
+      const reused = await client.request(toolCall(5, "health_correct_meal", args, {
+        requestState,
+        inputResponses: {
+          candidate_0: { action: "accept", content: { choice: chosen } },
+        },
+      }));
+      expect(reused.result?.resultType).toBe("complete");
+      expect(reused.result?.structuredContent).toMatchObject({
+        correctedLogId: body.correctedLogId,
+        supersededLogId: originalLogId,
+        receiptId: body.receiptId,
+        replayed: true,
+      });
+
+      const directReplay = await client.request(toolCall(6, "health_correct_meal", args));
+      expect(directReplay.result?.resultType).toBe("complete");
+      expect(directReplay.result?.structuredContent).toMatchObject({
+        correctedLogId: body.correctedLogId,
+        supersededLogId: originalLogId,
+        receiptId: body.receiptId,
+        replayed: true,
+      });
+
+      const [afterConfirmation] = await sql`
+        SELECT
+          original.superseded_by_id,
+          revision.ingredients_json,
+          revision.uncertain,
+          (SELECT count(*)::int
+             FROM compass_health.diet_logs sibling
+            WHERE sibling.correction_of_id = original.id) AS revision_count,
+          (SELECT count(*)::int
+             FROM compass_health.outbox_events event
+            WHERE event.aggregate_id = revision.id::text
+              AND event.type = 'diet.correct') AS outbox_count,
+          (SELECT count(*)::int
+             FROM compass_health.mcp_write_receipts receipt
+            WHERE receipt.user_id = original.user_id
+              AND receipt.tool_name = 'health_correct_meal'
+              AND receipt.idempotency_key = 'wire-correct-meal-candidate') AS receipt_count
+        FROM compass_health.diet_logs original
+        JOIN compass_health.diet_logs revision
+          ON revision.id = original.superseded_by_id
+        WHERE original.id = ${originalLogId}::uuid`;
+      expect(afterConfirmation?.superseded_by_id).toBe(body.correctedLogId);
+      expect(afterConfirmation?.ingredients_json).toEqual([{ slug: chosen, grams: 150 }]);
+      expect(afterConfirmation).toMatchObject({
+        uncertain: false,
+        revision_count: 1,
+        outbox_count: 1,
+        receipt_count: 1,
+      });
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 30_000);
+
   it("applies independent choices for multiple ambiguous meal segments", async () => {
     const binding = `mcp-wire-multi-meal-${process.pid}-${Date.now()}`;
     const client = new WireClient({ externalUserId: binding });

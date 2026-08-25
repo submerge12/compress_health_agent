@@ -55,6 +55,7 @@ import { createResourceCatalog } from "../resources/catalog.js";
 import {
   createRequestStateService,
   RequestStateError,
+  type HealthTransaction,
   type PendingInputBinding,
 } from "../input/request-state.js";
 import { createWriteCommandService, WriteCommandError } from "../writes/command.js";
@@ -106,6 +107,71 @@ function toolError(code: string, message: string): ToolOutcome {
     isError: true,
     content: [{ type: "text", text: JSON.stringify({ error: code, message }) }],
     structured: { error: code, message },
+  };
+}
+
+interface MealCorrectionConfirmationPayload {
+  originalLogId: string;
+  description: string;
+  mealType: string;
+  reason: string;
+  estimate: NutritionEstimateResult;
+}
+
+class MealCorrectionInputRequired extends Error {
+  constructor(readonly payload: MealCorrectionConfirmationPayload) {
+    super("meal correction needs candidate confirmation");
+  }
+}
+
+/** MCP form shape shared by meal creation and correction resolution. */
+function nutritionResolutionRequest(estimate: NutritionEstimateResult): {
+  prompt: string;
+  inputRequests: Record<string, unknown>;
+} {
+  const promptItems = [
+    ...(estimate.needsConfirmation ?? []).map((diagnostic) => diagnostic.segment),
+    ...(estimate.unmatched ?? []).map((diagnostic) => `${diagnostic.segment} (未匹配)`),
+  ];
+  const inputRequests: Record<string, unknown> = {};
+  (estimate.needsConfirmation ?? []).forEach((diagnostic, index) => {
+    inputRequests[`candidate_${index}`] = {
+      method: "elicitation/create",
+      params: {
+        mode: "form",
+        message: `请选择“${diagnostic.segment}”对应的食物`,
+        requestedSchema: {
+          type: "object",
+          properties: {
+            choice: {
+              type: "string",
+              enum: diagnostic.candidates
+                .map((candidate) => candidate.slug || candidate.label)
+                .filter((candidate) => candidate !== ""),
+            },
+          },
+          required: ["choice"],
+        },
+      },
+    };
+  });
+  (estimate.unmatched ?? []).forEach((diagnostic, index) => {
+    inputRequests[`unmatched_${index}`] = {
+      method: "elicitation/create",
+      params: {
+        mode: "form",
+        message: `请输入“${diagnostic.segment}”对应的明确食物名称`,
+        requestedSchema: {
+          type: "object",
+          properties: { choice: { type: "string" } },
+          required: ["choice"],
+        },
+      },
+    };
+  });
+  return {
+    prompt: `这些食材需要确认：${promptItems.join("、") || "份量不确定"}`,
+    inputRequests,
   };
 }
 
@@ -330,6 +396,47 @@ export function createHealthToolCatalog(
       throw new Error("tool context user mismatch");
     }
     return context;
+  }
+
+  async function persistDietCorrection(
+    tx: HealthTransaction,
+    invocation: ToolInvocation,
+    context: ToolContext,
+    payload: MealCorrectionConfirmationPayload,
+    overrideEstimate: NutritionEstimateResult,
+  ) {
+    const txDb = tx as unknown as Db;
+    const txCtx: ToolContext = { ...context, db: txDb, repo: createRepository(txDb) };
+    const corrected = await createDietLogService(txDb, txCtx.repo).correct(txCtx, {
+      userId: invocation.principalUserId,
+      originalLogId: payload.originalLogId,
+      description: payload.description,
+      mealType: payload.mealType,
+      reason: payload.reason,
+      idempotencyKey: str(invocation.args, "idempotencyKey"),
+      overrideEstimate,
+    });
+    const [readBack] = await tx.select().from(schema.dietLogs)
+      .where(and(
+        eq(schema.dietLogs.id, corrected.revised.id),
+        eq(schema.dietLogs.userId, invocation.principalUserId),
+      )).limit(1);
+    const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+      .where(and(
+        eq(schema.outboxEvents.userId, invocation.principalUserId),
+        eq(schema.outboxEvents.aggregateId, corrected.revised.id),
+        eq(schema.outboxEvents.eventType, "diet.correct"),
+      ));
+    if (!readBack || outbox.length !== 1) throw new Error("diet correction read-back failed");
+    return {
+      response: {
+        correctedLogId: readBack.id,
+        supersededLogId: corrected.original.id,
+        caloriesKcal: readBack.caloriesKcal,
+      },
+      factRefs: [{ type: "diet_log", id: readBack.id }],
+      outboxEventIds: outbox.map((event) => event.id),
+    };
   }
 
   const toolDefs: Array<{
@@ -962,56 +1069,12 @@ export function createHealthToolCatalog(
             mealType: str(inv.args, "mealType"),
           });
           if (previewResult.status === "needs_confirmation") {
-            const estimate = previewResult.estimate as {
-              needsConfirmation?: Array<{ segment?: string; candidates?: Array<{ slug?: string; label?: string }> }>;
-              unmatched?: Array<{ segment?: string }>;
-            };
-            const promptItems = [
-              ...(estimate.needsConfirmation ?? []).map((n) => n.segment ?? "item"),
-              ...(estimate.unmatched ?? []).map((n) => `${n.segment ?? "item"} (未匹配)`,
-              ),
-            ];
             const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
             const mealType = str(inv.args, "mealType");
-            const inputRequests: Record<string, unknown> = {};
-            (estimate.needsConfirmation ?? []).forEach((diagnostic, index) => {
-              inputRequests[`candidate_${index}`] = {
-                method: "elicitation/create",
-                params: {
-                  mode: "form",
-                  message: `请选择“${diagnostic.segment ?? "item"}”对应的食物`,
-                  requestedSchema: {
-                    type: "object",
-                    properties: {
-                      choice: {
-                        type: "string",
-                        enum: (diagnostic.candidates ?? [])
-                          .map((candidate) => candidate.slug ?? candidate.label ?? "")
-                          .filter((candidate) => candidate !== ""),
-                      },
-                    },
-                    required: ["choice"],
-                  },
-                },
-              };
-            });
-            (estimate.unmatched ?? []).forEach((diagnostic, index) => {
-              inputRequests[`unmatched_${index}`] = {
-                method: "elicitation/create",
-                params: {
-                  mode: "form",
-                  message: `请输入“${diagnostic.segment ?? "item"}”对应的明确食物名称`,
-                  requestedSchema: {
-                    type: "object",
-                    properties: { choice: { type: "string" } },
-                    required: ["choice"],
-                  },
-                },
-              };
-            });
+            const resolution = nutritionResolutionRequest(previewResult.estimate);
             return await makeConfirmation(
               "health_log_meal", `diet:${date}:${mealType}`, inv,
-              `这些食材需要确认：${promptItems.join("、") || "份量不确定"}`,
+              resolution.prompt,
               [],
               {
                 date,
@@ -1019,7 +1082,7 @@ export function createHealthToolCatalog(
                 description: str(inv.args, "description"),
                 estimate: previewResult.estimate as unknown as Record<string, unknown>,
               },
-              inputRequests,
+              resolution.inputRequests,
             );
           }
 
@@ -1040,6 +1103,7 @@ export function createHealthToolCatalog(
                 idempotencyKey,
                 ...(optNum(inv.args, "expectedRevision") !== undefined
                   ? { expectedRevision: optNum(inv.args, "expectedRevision") } : {}),
+                overrideEstimate: previewResult.estimate,
               });
               const [readBack] = await tx.select().from(schema.dietLogs)
                 .where(and(
@@ -1088,45 +1152,80 @@ export function createHealthToolCatalog(
         required: ["runHandle", "dietLogId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_correct_meal");
-        const ctx = await buildToolContext(inv.principalUserId);
-        const originalLogId = str(inv.args, "dietLogId");
-        const result = await writes.execute(
-          writeInput(inv, "health_correct_meal", originalLogId),
-          async (tx) => {
-            const txDb = tx as unknown as Db;
-            const txCtx: ToolContext = { ...ctx, db: txDb };
-            const corrected = await createDietLogService(txDb, repo).correct(txCtx, {
-              userId: inv.principalUserId,
-              originalLogId,
-              ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
-              ...(optStr(inv.args, "mealType") ? { mealType: optStr(inv.args, "mealType") } : {}),
-              reason: optStr(inv.args, "reason") ?? "mcp correction",
-              idempotencyKey: str(inv.args, "idempotencyKey"),
-            });
-            const [readBack] = await tx.select().from(schema.dietLogs)
-              .where(and(
-                eq(schema.dietLogs.id, corrected.revised.id),
-                eq(schema.dietLogs.userId, inv.principalUserId),
-              )).limit(1);
-            const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
-              .where(and(
-                eq(schema.outboxEvents.userId, inv.principalUserId),
-                eq(schema.outboxEvents.aggregateId, corrected.revised.id),
-              ));
-            if (!readBack || outbox.length === 0) throw new Error("diet correction read-back failed");
-            return {
-              response: {
-                correctedLogId: readBack.id,
-                supersededLogId: corrected.original.id,
-                caloriesKcal: readBack.caloriesKcal,
+        try {
+          await requireRun(inv.principalUserId, inv.args, "health_correct_meal");
+          const ctx = await buildToolContext(inv.principalUserId);
+          const originalLogId = str(inv.args, "dietLogId");
+
+          if (inv.requestState !== undefined) {
+            const committed = await requestStates.consume(
+              inv.requestState,
+              pendingBinding("health_correct_meal", originalLogId, inv),
+              async (tx, pending) => {
+                const payload = pending.payloadJson as unknown as MealCorrectionConfirmationPayload;
+                const txDb = tx as unknown as Db;
+                const txCtx: ToolContext = { ...ctx, db: txDb, repo: createRepository(txDb) };
+                const resolved = await resolveConfirmedFoodCandidates(
+                  txCtx,
+                  payload.estimate,
+                  acceptedSelections(inv.inputResponses),
+                );
+                return writes.executeInTransaction(
+                  tx,
+                  writeInput(inv, "health_correct_meal", originalLogId),
+                  (writeTx) => persistDietCorrection(writeTx, inv, txCtx, payload, resolved),
+                );
               },
-              factRefs: [{ type: "diet_log", id: readBack.id }],
-              outboxEventIds: outbox.map((event) => event.id),
-            };
-          },
-        );
-        return complete(result.response);
+            );
+            return complete(committed.response);
+          }
+
+          const result = await writes.execute(
+            writeInput(inv, "health_correct_meal", originalLogId),
+            async (tx) => {
+              const txDb = tx as unknown as Db;
+              const txCtx: ToolContext = { ...ctx, db: txDb, repo: createRepository(txDb) };
+              const correctionPreview = await createDietLogService(txDb, txCtx.repo).previewCorrection(txCtx, {
+                userId: inv.principalUserId,
+                originalLogId,
+                ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
+                ...(optStr(inv.args, "mealType") ? { mealType: optStr(inv.args, "mealType") } : {}),
+              });
+              const payload: MealCorrectionConfirmationPayload = {
+                originalLogId,
+                description: correctionPreview.description,
+                mealType: correctionPreview.mealType,
+                reason: optStr(inv.args, "reason") ?? "mcp correction",
+                estimate: correctionPreview.estimate,
+              };
+              if (correctionPreview.status === "needs_confirmation") {
+                throw new MealCorrectionInputRequired(payload);
+              }
+              return persistDietCorrection(tx, inv, txCtx, payload, correctionPreview.estimate);
+            },
+          );
+          return complete(result.response);
+        } catch (error) {
+          if (error instanceof MealCorrectionInputRequired) {
+            const resolution = nutritionResolutionRequest(error.payload.estimate);
+            return await makeConfirmation(
+              "health_correct_meal",
+              str(inv.args, "dietLogId"),
+              inv,
+              resolution.prompt,
+              [],
+              error.payload as unknown as Record<string, unknown>,
+              resolution.inputRequests,
+            );
+          }
+          if (error instanceof NeedsConfirmationError) {
+            return toolError("proposal_stale", "nutrition estimate changed; retry the original call");
+          }
+          if (error instanceof StateConflict) {
+            return toolError("state_conflict", error.message);
+          }
+          throw error;
+        }
       },
     },
     {

@@ -150,6 +150,30 @@ describe.skipIf(!isDbAvailable)("diet log v2 invariants", () => {
     expect(log.caloriesKcal).toBe(300);
   });
 
+  it("refuses an unresolved correction without superseding the original", async () => {
+    const { log } = await service.commit(ctx, {
+      userId: ctx.userId,
+      logDate: today,
+      mealType: "lunch",
+      description: "牛肉150克",
+      idempotencyKey: "j01-correct-ambiguous-base",
+    });
+
+    await expect(service.correct(ctx, {
+      userId: ctx.userId,
+      originalLogId: log.id,
+      description: "150g rice",
+      idempotencyKey: "j01-correct-ambiguous-revision",
+    })).rejects.toBeInstanceOf(NeedsConfirmationError);
+
+    const [original] = await db.select().from(schema.dietLogs)
+      .where(eq(schema.dietLogs.id, log.id));
+    const revisions = await db.select().from(schema.dietLogs)
+      .where(eq(schema.dietLogs.correctionOfId, log.id));
+    expect(original?.supersededById).toBeNull();
+    expect(revisions).toHaveLength(0);
+  });
+
   it("correction creates a linked revision; effective listing excludes superseded", async () => {
     const { log } = await service.commit(ctx, {
       userId: ctx.userId,
