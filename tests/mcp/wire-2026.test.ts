@@ -458,6 +458,10 @@ describe("MCP 2026-07-28 stdio wire", () => {
         VALUES (${user!.id}::uuid, ${scope}, 'active', '{}'::jsonb, 1)
         RETURNING id`;
       parentId = String(parent!.id);
+      await sql`
+        INSERT INTO compass_health.active_plan_assignments
+          (user_id, scope, plan_version_id)
+        VALUES (${user!.id}::uuid, ${scope}, ${parentId}::uuid)`;
       const drafts = await sql`
         INSERT INTO compass_health.plan_versions
           (user_id, scope, status, parent_version_id, content_json, version_number)
