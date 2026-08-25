@@ -185,10 +185,10 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     for (let round = 0; round < 20; round++) {
       const results = await Promise.all([w1.runOnce(), w2.runOnce()]);
       totalProcessed += results[0].processed + results[1].processed;
-      const [{ n }] = await db.select({ n: sql<number>`count(*)::int` })
+      const [pending] = await db.select({ n: sql<number>`count(*)::int` })
         .from(schema.outboxEvents)
         .where(and(eq(schema.outboxEvents.userId, ctx.userId), eq(schema.outboxEvents.status, "pending")));
-      if (n === 0) break;
+      if ((pending?.n ?? 0) === 0) break;
     }
 
     // Every seeded event must be processed exactly once across both workers.
