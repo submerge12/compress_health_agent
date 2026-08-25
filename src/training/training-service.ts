@@ -16,6 +16,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as schema from "../db/schema.js";
 import { THREE_SPLIT_DAYS, DEFAULT_CYCLE } from "./three-split.js";
 import { NotOwnedError } from "./ownership.js";
+import { blockedPatternsForBodyPart } from "./prepared-session.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 type SessionRow = typeof schema.trainingSessions.$inferSelect;
@@ -178,8 +179,12 @@ export function createTrainingService(db: Db) {
       constraints
         .filter((c) => c.severity === "block")
         .flatMap((c) => {
-          const target = c.targetJson as { movementPattern?: string };
-          return target.movementPattern ? [target.movementPattern] : [];
+          const target = c.targetJson as { movementPattern?: string; bodyPart?: string };
+          const direct = target.movementPattern ? [target.movementPattern] : [];
+          // WO-HS-06: pain commands store bodyPart scope; expand to pattern
+          // families here so service-level filtering matches the route layer.
+          const byBodyPart = blockedPatternsForBodyPart(target.bodyPart);
+          return [...direct, ...byBodyPart];
         }),
     );
 
