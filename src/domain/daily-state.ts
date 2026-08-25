@@ -365,6 +365,10 @@ export function createDailyStateService(db: Db, repo: Repository) {
       .where(and(
         eq(schema.outboxEvents.userId, userId),
         eq(schema.outboxEvents.status, "pending"),
+        or(
+          sql`${schema.outboxEvents.payloadJson} ->> 'observedOn' = ${localDate}`,
+          sql`${schema.outboxEvents.payloadJson} ->> 'logDate' = ${localDate}`,
+        ),
       ));
 
     return {

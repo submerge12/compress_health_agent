@@ -37,6 +37,8 @@ export interface ActorBindingOptions {
   externalUserId?: string;
   /** Actor label recorded on runs/steps (default codex-primary). */
   actor?: string;
+  /** Internal invariant: startup ToolContext must resolve to this same user. */
+  expectedUserId?: string;
 }
 
 export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
@@ -61,8 +63,10 @@ export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
       const row = created ?? (await db.select().from(schema.users)
         .where(eq(schema.users.externalId, binding)).limit(1))[0];
       if (!row) throw new McpProtocolError("internal", "user provisioning failed");
+      assertExpectedUser(row.id, options.expectedUserId);
       return { userId: row.id, externalUserId: binding, actor: verifiedActor(options) };
     }
+    assertExpectedUser(user.id, options.expectedUserId);
     return { userId: user.id, externalUserId: binding, actor: verifiedActor(options) };
   }
 
@@ -73,4 +77,10 @@ export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
 function verifiedActor(options: ActorBindingOptions): string {
   const actor = options.actor?.trim();
   return actor ? actor : "codex-primary";
+}
+
+function assertExpectedUser(actualUserId: string, expectedUserId: string | undefined): void {
+  if (expectedUserId !== undefined && actualUserId !== expectedUserId) {
+    throw new McpProtocolError("unauthorized_actor", "principal and ToolContext user mismatch");
+  }
 }

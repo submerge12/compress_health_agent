@@ -23,11 +23,12 @@ import {
   CandidateSelectionError,
   createDietLogService,
   NeedsConfirmationError,
-  resolveConfirmedFoodCandidate,
+  resolveConfirmedFoodCandidates,
   StateConflict,
 } from "../../domain/diet-log-service.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
 import { createProjectionWorker } from "../../domain/projection-worker.js";
+import { createHealthRecordingService } from "../../domain/health-recording-service.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
 import { createPainCommand } from "../../training/prepared-session.js";
 import { createTrainingService } from "../../training/training-service.js";
@@ -54,6 +55,7 @@ export interface ToolInvocation {
   args: Record<string, unknown>;
   requestState?: string;
   confirmationChoice?: string;
+  inputResponses?: Record<string, unknown>;
 }
 
 export interface ToolOutcome {
@@ -96,7 +98,7 @@ function toolError(code: string, message: string): ToolOutcome {
 export function createHealthToolCatalog(
   db: Db,
   repo: Repository,
-  options: { toolContext?: ToolContext } = {},
+  options: { toolContext?: ToolContext; conformanceProfile?: boolean } = {},
 ) {
   const runs = createRunHandleService(db);
   const diet = createDietLogService(db, repo);
@@ -112,6 +114,7 @@ export function createHealthToolCatalog(
     prompt: string,
     choices: string[],
     payload: Record<string, unknown>,
+    inputRequests?: Record<string, unknown>,
   ): Promise<ToolOutcome> {
     const issued = await requestStates.issue({
       toolName,
@@ -123,6 +126,7 @@ export function createHealthToolCatalog(
       arguments: invocation.args,
       prompt,
       choices,
+      ...(inputRequests ? { inputRequests } : {}),
       payload,
       ttlMs: CONFIRMATION_TTL_MS,
     });
@@ -213,6 +217,17 @@ export function createHealthToolCatalog(
     if (v === undefined || v === null) return undefined;
     const n = Number(v);
     return Number.isFinite(n) ? n : undefined;
+  }
+
+  function acceptedSelections(responses: Record<string, unknown> | undefined): Record<string, string> {
+    const selections: Record<string, string> = {};
+    for (const [key, raw] of Object.entries(responses ?? {})) {
+      const response = raw as { action?: unknown; content?: { choice?: unknown } };
+      if (response.action === "accept" && typeof response.content?.choice === "string") {
+        selections[key] = response.content.choice;
+      }
+    }
+    return selections;
   }
 
   function today(): string {
@@ -531,7 +546,7 @@ export function createHealthToolCatalog(
           async (tx) => {
             const txDb = tx as unknown as Db;
             const worker = createProjectionWorker(txDb, createRepository(txDb));
-            const revived = await worker.replayDeadLetters(inv.principalUserId);
+            const revived = await worker.replayDeadLetters(inv.principalUserId, date);
             await worker.rebuildUserProjection(inv.principalUserId, date);
             const [projection] = await tx.select().from(schema.dailyHealthStateProjection)
               .where(and(
@@ -672,10 +687,10 @@ export function createHealthToolCatalog(
                 };
                 const txDb = tx as unknown as Db;
                 const txCtx: ToolContext = { ...ctx, db: txDb };
-                const resolved = await resolveConfirmedFoodCandidate(
+                const resolved = await resolveConfirmedFoodCandidates(
                   txCtx,
                   payload.estimate,
-                  inv.confirmationChoice,
+                  acceptedSelections(inv.inputResponses),
                 );
                 return writes.executeInTransaction(
                   tx,
@@ -737,20 +752,53 @@ export function createHealthToolCatalog(
             ];
             const date = optStr(inv.args, "date") ?? today();
             const mealType = str(inv.args, "mealType");
+            const inputRequests: Record<string, unknown> = {};
+            (estimate.needsConfirmation ?? []).forEach((diagnostic, index) => {
+              inputRequests[`candidate_${index}`] = {
+                method: "elicitation/create",
+                params: {
+                  mode: "form",
+                  message: `请选择“${diagnostic.segment ?? "item"}”对应的食物`,
+                  requestedSchema: {
+                    type: "object",
+                    properties: {
+                      choice: {
+                        type: "string",
+                        enum: (diagnostic.candidates ?? [])
+                          .map((candidate) => candidate.slug ?? candidate.label ?? "")
+                          .filter((candidate) => candidate !== ""),
+                      },
+                    },
+                    required: ["choice"],
+                  },
+                },
+              };
+            });
+            (estimate.unmatched ?? []).forEach((diagnostic, index) => {
+              inputRequests[`unmatched_${index}`] = {
+                method: "elicitation/create",
+                params: {
+                  mode: "form",
+                  message: `请输入“${diagnostic.segment ?? "item"}”对应的明确食物名称`,
+                  requestedSchema: {
+                    type: "object",
+                    properties: { choice: { type: "string" } },
+                    required: ["choice"],
+                  },
+                },
+              };
+            });
             return await makeConfirmation(
               "health_log_meal", `diet:${date}:${mealType}`, inv,
               `这些食材需要确认：${promptItems.join("、") || "份量不确定"}`,
-              (estimate.needsConfirmation ?? [])
-                .flatMap((n) => n.candidates ?? [])
-                .map((candidate) => candidate.slug ?? candidate.label ?? "")
-                .filter((candidate) => candidate !== "")
-                .slice(0, 5),
+              [],
               {
                 date,
                 mealType,
                 description: str(inv.args, "description"),
                 estimate: previewResult.estimate as unknown as Record<string, unknown>,
               },
+              inputRequests,
             );
           }
 
@@ -793,16 +841,7 @@ export function createHealthToolCatalog(
           return complete(committed.response);
         } catch (error) {
           if (error instanceof NeedsConfirmationError) {
-            const date = optStr(inv.args, "date") ?? today();
-            const mealType = str(inv.args, "mealType");
-            return await makeConfirmation(
-              "health_log_meal",
-              `diet:${date}:${mealType}`,
-              inv,
-              String(error.message),
-              [],
-              { date, mealType, description: str(inv.args, "description"), estimate: error.estimate as unknown as Record<string, unknown> },
-            );
+            return toolError("proposal_stale", "nutrition estimate changed; retry the original call");
           }
           if (error instanceof StateConflict) {
             return toolError("state_conflict", error.message);
@@ -884,36 +923,18 @@ export function createHealthToolCatalog(
         required: ["runHandle", "amountMl", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const amount = optNum(inv.args, "amountMl");
-        if (amount === undefined || amount <= 0 || amount > 10000) {
-          return toolError("validation_failed", "amountMl must be 1..10000");
-        }
         const date = optStr(inv.args, "date") ?? today();
         const result = await writes.execute(writeInput(inv, "health_record_water", date), async (tx) => {
-          const [log] = await tx.insert(schema.waterLogs).values({
+          const recorded = await createHealthRecordingService(tx as unknown as Db).recordWater({
             userId: inv.principalUserId,
-            logDate: date,
-            amountMl: Math.round(amount),
+            date,
+            amountMl: inv.args["amountMl"],
             source: `mcp:${inv.actor}`,
-          }).returning();
-          if (!log) throw new Error("water insert returned no row");
-          const [outbox] = await tx.insert(schema.outboxEvents).values({
-            userId: inv.principalUserId,
-            aggregateType: "water_log",
-            aggregateId: log.id,
-            eventType: "health.water_recorded",
-            payloadJson: { observedOn: date },
-          }).returning({ id: schema.outboxEvents.id });
-          const [readBack] = await tx.select().from(schema.waterLogs)
-            .where(and(
-              eq(schema.waterLogs.id, log.id),
-              eq(schema.waterLogs.userId, inv.principalUserId),
-            )).limit(1);
-          if (!outbox || !readBack) throw new Error("water write read-back failed");
+          });
           return {
-            response: { waterLogId: readBack.id, amountMl: readBack.amountMl },
-            factRefs: [{ type: "water_log", id: readBack.id }],
-            outboxEventIds: [outbox.id],
+            response: { waterLogId: recorded.log.id, amountMl: recorded.log.amountMl },
+            factRefs: [{ type: "water_log", id: recorded.log.id }],
+            outboxEventIds: [recorded.outboxId],
           };
         });
         return complete(result.response);
@@ -936,39 +957,21 @@ export function createHealthToolCatalog(
         required: ["runHandle", "activityType", "durationMinutes", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const duration = optNum(inv.args, "durationMinutes");
-        if (duration === undefined || duration <= 0 || duration > 600) {
-          return toolError("validation_failed", "durationMinutes must be 1..600");
-        }
         const date = optStr(inv.args, "date") ?? today();
         const result = await writes.execute(
           writeInput(inv, "health_record_activity", date),
           async (tx) => {
-            const [log] = await tx.insert(schema.exerciseLogs).values({
+            const recorded = await createHealthRecordingService(tx as unknown as Db).recordActivity({
               userId: inv.principalUserId,
-              logDate: date,
-              activityType: str(inv.args, "activityType"),
-              durationMinutes: Math.round(duration),
-              caloriesBurnedKcal: optNum(inv.args, "caloriesBurnedKcal") ?? 0,
-            }).returning();
-            if (!log) throw new Error("activity insert returned no row");
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
-              userId: inv.principalUserId,
-              aggregateType: "activity_log",
-              aggregateId: log.id,
-              eventType: "health.activity_recorded",
-              payloadJson: { observedOn: date },
-            }).returning({ id: schema.outboxEvents.id });
-            const [readBack] = await tx.select().from(schema.exerciseLogs)
-              .where(and(
-                eq(schema.exerciseLogs.id, log.id),
-                eq(schema.exerciseLogs.userId, inv.principalUserId),
-              )).limit(1);
-            if (!outbox || !readBack) throw new Error("activity write read-back failed");
+              date,
+              activityType: inv.args["activityType"],
+              durationMinutes: inv.args["durationMinutes"],
+              caloriesBurnedKcal: inv.args["caloriesBurnedKcal"],
+            });
             return {
-              response: { activityId: readBack.id, durationMinutes: readBack.durationMinutes },
-              factRefs: [{ type: "activity_log", id: readBack.id }],
-              outboxEventIds: [outbox.id],
+              response: { activityId: recorded.log.id, durationMinutes: recorded.log.durationMinutes },
+              factRefs: [{ type: "activity_log", id: recorded.log.id }],
+              outboxEventIds: [recorded.outboxId],
             };
           },
         );
@@ -990,39 +993,21 @@ export function createHealthToolCatalog(
         required: ["runHandle", "hours", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const hours = optNum(inv.args, "hours");
-        if (hours === undefined || hours < 0 || hours > 24) {
-          return toolError("validation_failed", "hours must be 0..24");
-        }
         const date = optStr(inv.args, "date") ?? today();
         const result = await writes.execute(
           writeInput(inv, "health_record_sleep", date),
           async (tx) => {
-            const [observation] = await tx.insert(schema.healthObservationEvents).values({
+            const recorded = await createHealthRecordingService(tx as unknown as Db).recordSleep({
               userId: inv.principalUserId,
-              observedOn: date,
-              kind: "sleep",
-              valueJson: { hours },
+              date,
+              hours: inv.args["hours"],
               source: `mcp:${inv.actor}`,
-            }).returning();
-            if (!observation) throw new Error("sleep observation insert returned no row");
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
-              userId: inv.principalUserId,
-              aggregateType: "observation",
-              aggregateId: observation.id,
-              eventType: "health.sleep_recorded",
-              payloadJson: { observedOn: date },
-            }).returning({ id: schema.outboxEvents.id });
-            const [readBack] = await tx.select().from(schema.healthObservationEvents)
-              .where(and(
-                eq(schema.healthObservationEvents.id, observation.id),
-                eq(schema.healthObservationEvents.userId, inv.principalUserId),
-              )).limit(1);
-            if (!outbox || !readBack) throw new Error("sleep write read-back failed");
+            });
+            const hours = (recorded.observation.valueJson as { hours: number }).hours;
             return {
-              response: { observationId: readBack.id, hours },
-              factRefs: [{ type: "observation", id: readBack.id }],
-              outboxEventIds: [outbox.id],
+              response: { observationId: recorded.observation.id, hours },
+              factRefs: [{ type: "observation", id: recorded.observation.id }],
+              outboxEventIds: [recorded.outboxId],
             };
           },
         );
@@ -1046,44 +1031,23 @@ export function createHealthToolCatalog(
         required: ["runHandle", "level", "scope", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const level = optNum(inv.args, "level");
-        if (level === undefined || level < 1 || level > 5) {
-          return toolError("validation_failed", "level must be 1..5 (structured fatigue is required)");
-        }
         const date = optStr(inv.args, "date") ?? today();
-        const valueJson = {
-          level,
-          scope: str(inv.args, "scope"),
-          ...(optStr(inv.args, "feedback") ? { feedback: optStr(inv.args, "feedback") } : {}),
-        };
         const result = await writes.execute(
           writeInput(inv, "health_record_fatigue", date),
           async (tx) => {
-            const [observation] = await tx.insert(schema.healthObservationEvents).values({
+            const recorded = await createHealthRecordingService(tx as unknown as Db).recordFatigue({
               userId: inv.principalUserId,
-              observedOn: date,
-              kind: "fatigue",
-              valueJson,
+              date,
+              level: inv.args["level"],
+              scope: inv.args["scope"],
+              feedback: inv.args["feedback"],
               source: `mcp:${inv.actor}`,
-            }).returning();
-            if (!observation) throw new Error("fatigue observation insert returned no row");
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
-              userId: inv.principalUserId,
-              aggregateType: "observation",
-              aggregateId: observation.id,
-              eventType: "health.fatigue_recorded",
-              payloadJson: { observedOn: date },
-            }).returning({ id: schema.outboxEvents.id });
-            const [readBack] = await tx.select().from(schema.healthObservationEvents)
-              .where(and(
-                eq(schema.healthObservationEvents.id, observation.id),
-                eq(schema.healthObservationEvents.userId, inv.principalUserId),
-              )).limit(1);
-            if (!outbox || !readBack) throw new Error("fatigue write read-back failed");
+            });
+            const value = recorded.observation.valueJson as { level: number; scope: string };
             return {
-              response: { observationId: readBack.id, level, scope: valueJson.scope },
-              factRefs: [{ type: "observation", id: readBack.id }],
-              outboxEventIds: [outbox.id],
+              response: { observationId: recorded.observation.id, level: value.level, scope: value.scope },
+              factRefs: [{ type: "observation", id: recorded.observation.id }],
+              outboxEventIds: [recorded.outboxId],
             };
           },
         );
@@ -1193,43 +1157,20 @@ export function createHealthToolCatalog(
               writeInput(inv, "health_lift_constraint", constraintId),
               async (writeTx) => {
                 const confirmed = inv.confirmationChoice === "确认解除";
-                if (confirmed) {
-                  const updated = await writeTx.update(schema.healthConstraints)
-                    .set({ liftedAt: new Date(), liftedByActor: `mcp:${inv.actor}`, updatedAt: new Date() })
-                    .where(and(
-                      eq(schema.healthConstraints.id, constraintId),
-                      eq(schema.healthConstraints.userId, inv.principalUserId),
-                      isNull(schema.healthConstraints.liftedAt),
-                    )).returning({ id: schema.healthConstraints.id });
-                  if (updated.length !== 1) throw new RequestStateError("target_changed");
-                }
-                const [decision] = await writeTx.insert(schema.userDecisionEvents).values({
+                const resolved = await createPainCommand(writeTx as unknown as Db).resolveLift({
                   userId: inv.principalUserId,
-                  decisionType: confirmed ? "accepted" : "rejected",
-                  subjectJson: { type: "constraint_lift", constraintId },
-                }).returning();
-                if (!decision) throw new Error("constraint decision insert returned no row");
-                const [outbox] = await writeTx.insert(schema.outboxEvents).values({
-                  userId: inv.principalUserId,
-                  aggregateType: confirmed ? "constraint" : "user_decision",
-                  aggregateId: confirmed ? constraintId : decision.id,
-                  eventType: confirmed ? "constraint.lifted" : "constraint.lift_declined",
-                  payloadJson: { observedOn: constraint.activeFrom, constraintId },
-                }).returning({ id: schema.outboxEvents.id });
-                const [readBack] = await writeTx.select().from(schema.healthConstraints)
-                  .where(and(
-                    eq(schema.healthConstraints.id, constraintId),
-                    eq(schema.healthConstraints.userId, inv.principalUserId),
-                  )).limit(1);
-                if (!outbox || !readBack) throw new Error("constraint lift read-back failed");
+                  constraintId,
+                  actor: `mcp:${inv.actor}`,
+                  confirmed,
+                });
                 return {
                   response: confirmed
                     ? { constraintId, lifted: true, liftedBy: `mcp:${inv.actor}` }
                     : { constraintId, lifted: false, declined: true },
                   factRefs: confirmed
-                    ? [{ type: "constraint", id: readBack.id }, { type: "user_decision", id: decision.id }]
-                    : [{ type: "user_decision", id: decision.id }],
-                  outboxEventIds: [outbox.id],
+                    ? [{ type: "constraint", id: resolved.constraint.id }, { type: "user_decision", id: resolved.decisionId }]
+                    : [{ type: "user_decision", id: resolved.decisionId }],
+                  outboxEventIds: [resolved.outboxId],
                 };
               },
             );
@@ -1803,6 +1744,71 @@ export function createHealthToolCatalog(
       },
     },
   ];
+
+  if (options.conformanceProfile) {
+    toolDefs.push({
+      name: "test_missing_capability",
+      description: "Official conformance diagnostic for missing sampling capability.",
+      risk: "read-only",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async () => ({
+        resultType: "input_required",
+        content: [],
+        structured: {
+          inputRequests: {
+            sample: {
+              method: "sampling/createMessage",
+              params: {
+                messages: [{ role: "user", content: { type: "text", text: "conformance" } }],
+                maxTokens: 1,
+              },
+            },
+          },
+        },
+      }),
+    });
+    toolDefs.push({
+      name: "test_input_required_result_request_state",
+      description: "Official conformance diagnostic for MCP requestState round trips.",
+      risk: "read-only",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
+      execute: async (inv) => {
+        if (inv.requestState === undefined) {
+          return {
+            resultType: "input_required",
+            content: [],
+            structured: {
+              inputRequests: {
+                confirm: {
+                  method: "elicitation/create",
+                  params: {
+                    mode: "form",
+                    message: "Please confirm",
+                    requestedSchema: {
+                      type: "object",
+                      properties: { ok: { type: "boolean" } },
+                      required: ["ok"],
+                    },
+                  },
+                },
+              },
+              requestState: "conformance-state-v1",
+            },
+          };
+        }
+        const confirmed = (inv.inputResponses?.confirm as {
+          action?: unknown;
+          content?: { ok?: unknown };
+        } | undefined);
+        if (inv.requestState !== "conformance-state-v1"
+            || confirmed?.action !== "accept"
+            || confirmed.content?.ok !== true) {
+          return toolError("validation_failed", "conformance requestState or response mismatch");
+        }
+        return complete({ status: "state-ok" });
+      },
+    });
+  }
 
   return {
     toolDefs,

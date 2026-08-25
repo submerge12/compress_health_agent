@@ -74,7 +74,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     }).returning();
     if (!event) throw new Error("setup failed");
 
-    const result = await worker.runOnce();
+    const result = await worker.runOnce(undefined, ctx.userId);
 
     const [row] = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.id, event.id));
     expect(row?.status).toBe("dead_letter");
@@ -114,7 +114,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     // Drain until this event is done (other tests' events may interleave).
     let after: typeof schema.outboxEvents.$inferSelect | undefined;
     for (let i = 0; i < 5; i++) {
-      await worker.runOnce();
+      await worker.runOnce(undefined, ctx.userId);
       const rows = await db.select().from(schema.outboxEvents).where(eq(schema.outboxEvents.id, event.id));
       after = rows[0];
       if (after?.status === "done") break;
@@ -145,7 +145,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     // Session emits a training_session outbox event on finish.
     await training.finishSession(ctx.userId, session.id, "completed");
 
-    const run = await worker.runOnce();
+    const run = await worker.runOnce(undefined, ctx.userId);
     expect(run.succeeded).toBeGreaterThan(0);
 
     // Concurrent tests share this user's queue; assert against a deterministic
@@ -183,7 +183,10 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     const [w1, w2] = [createProjectionWorker(ctx.db!, ctx.repo), createProjectionWorker(ctx.db!, ctx.repo)];
     let totalProcessed = 0;
     for (let round = 0; round < 20; round++) {
-      const results = await Promise.all([w1.runOnce(), w2.runOnce()]);
+      const results = await Promise.all([
+        w1.runOnce(undefined, ctx.userId),
+        w2.runOnce(undefined, ctx.userId),
+      ]);
       totalProcessed += results[0].processed + results[1].processed;
       const [pending] = await db.select({ n: sql<number>`count(*)::int` })
         .from(schema.outboxEvents)

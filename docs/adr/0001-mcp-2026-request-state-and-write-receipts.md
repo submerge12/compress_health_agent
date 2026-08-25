@@ -12,7 +12,7 @@ MCP 2026-07-28 removes protocol sessions and server-to-client confirmation reque
 - Persist pending input requests in PostgreSQL. Return a 256-bit opaque `requestState`; store only its SHA-256 hash.
 - Bind each pending request to the verified user and actor, run handle, tool, target, canonical argument hash, idempotency key, and expiry.
 - Consume `requestState`, apply the domain mutation, append outbox rows, and write the MCP receipt in one PostgreSQL transaction.
-- Route MCP mutations through the write-command module. Its interface requires a run handle, a user-scoped idempotency key, fact references, outbox event IDs, and transaction-local read-back.
+- Route MCP mutations through the write-command module. Its interface requires a run handle, a user-scoped idempotency key, fact references, and outbox event IDs. Before commit, the module re-reads every named outbox row and the durable receipt, and returns the stored receipt response.
 - Keep health rules in existing domain modules. The MCP modules adapt wire fields and transaction metadata only.
 
 `health_begin_run` is the bootstrap exception to the run-handle requirement. It still requires an idempotency key and creates its run fact, outbox event, receipt, and first evidence step in one transaction.

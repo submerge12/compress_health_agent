@@ -63,11 +63,15 @@ async function main(): Promise<void> {
     });
   process.stderr.write(`compass-health MCP: ready on stdio (binding=${externalUserId})\n`);
 
+  let shuttingDown = false;
   const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     await handle?.close();
     await ctx.close();
     process.exit(0);
   };
+  process.stdin.once("end", () => void shutdown());
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }

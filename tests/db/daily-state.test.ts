@@ -117,7 +117,7 @@ describe.skipIf(!isDbAvailable)("daily-state invariants", () => {
       await db.update(schema.outboxEvents)
         .set({ attempts: i })
         .where(eq(schema.outboxEvents.id, event.id));
-      await worker.runOnce();
+      await worker.runOnce(undefined, ctx.userId);
       const [current] = await db.select().from(schema.outboxEvents)
         .where(eq(schema.outboxEvents.id, event.id));
       if (current?.status === "dead_letter") break;
@@ -134,7 +134,7 @@ describe.skipIf(!isDbAvailable)("daily-state invariants", () => {
     if (afterFailures?.status === "dead_letter") {
       const revived = await worker.replayDeadLetters();
       expect(revived).toBeGreaterThanOrEqual(1);
-      const result = await worker.runOnce();
+      const result = await worker.runOnce(undefined, ctx.userId);
       expect(result.succeeded).toBeGreaterThanOrEqual(1);
     }
 

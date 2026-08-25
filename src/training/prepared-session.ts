@@ -126,7 +126,43 @@ export function createPainCommand(db: Db) {
     if (cas.length === 0) throw new Error("constraint already lifted or not owned");
   }
 
-  return { execute, lift };
+  async function resolveLift(input: {
+    userId: string;
+    constraintId: string;
+    actor: string;
+    confirmed: boolean;
+  }) {
+    const [constraint] = await db.select().from(schema.healthConstraints).where(and(
+      eq(schema.healthConstraints.id, input.constraintId),
+      eq(schema.healthConstraints.userId, input.userId),
+      isNull(schema.healthConstraints.liftedAt),
+    )).limit(1);
+    if (!constraint) throw new RangeError("constraint not found or already lifted");
+    if (input.confirmed) {
+      await lift(input.userId, input.constraintId, input.actor);
+    }
+    const [decision] = await db.insert(schema.userDecisionEvents).values({
+      userId: input.userId,
+      decisionType: input.confirmed ? "accepted" : "rejected",
+      subjectJson: { type: "constraint_lift", constraintId: input.constraintId },
+    }).returning();
+    if (!decision) throw new Error("constraint decision insert returned no row");
+    const [outbox] = await db.insert(schema.outboxEvents).values({
+      userId: input.userId,
+      aggregateType: input.confirmed ? "constraint" : "user_decision",
+      aggregateId: input.confirmed ? input.constraintId : decision.id,
+      eventType: input.confirmed ? "constraint.lifted" : "constraint.lift_declined",
+      payloadJson: { observedOn: constraint.activeFrom, constraintId: input.constraintId },
+    }).returning({ id: schema.outboxEvents.id });
+    const [readBack] = await db.select().from(schema.healthConstraints).where(and(
+      eq(schema.healthConstraints.id, input.constraintId),
+      eq(schema.healthConstraints.userId, input.userId),
+    )).limit(1);
+    if (!outbox || !readBack) throw new Error("constraint lift read-back failed");
+    return { constraint: readBack, decisionId: decision.id, outboxId: outbox.id };
+  }
+
+  return { execute, lift, resolveLift };
 }
 
 /** Body-part → blocked movement patterns (conservative mapping). */

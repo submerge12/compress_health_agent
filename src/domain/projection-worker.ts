@@ -11,7 +11,7 @@
  *   MAX_ATTEMPTS exhausted -> dead_letter (visible, replayable);
  * - a projection failure NEVER rolls back committed facts.
  */
-import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lte, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -46,6 +46,13 @@ function backoffMs(attempt: number): number {
   return table[Math.min(attempt, table.length - 1)] ?? 120_000;
 }
 
+function eventMatchesDate(localDate: string) {
+  return or(
+    sql`${schema.outboxEvents.payloadJson} ->> 'observedOn' = ${localDate}`,
+    sql`${schema.outboxEvents.payloadJson} ->> 'logDate' = ${localDate}`,
+  )!;
+}
+
 export interface WorkerRunResult {
   processed: number;
   succeeded: number;
@@ -67,12 +74,16 @@ export function createProjectionWorker(db: Db, repo: Repository) {
    * Claim one pending event with FOR UPDATE SKIP LOCKED inside its own
    * transaction. Returns undefined when the queue is drained (or contended).
    */
-  async function claimNext(now: Date): Promise<typeof schema.outboxEvents.$inferSelect | undefined> {
+  async function claimNext(
+    now: Date,
+    onlyUserId?: string,
+  ): Promise<typeof schema.outboxEvents.$inferSelect | undefined> {
     return db.transaction(async (tx) => {
       const claimed = await tx.select().from(schema.outboxEvents)
         .where(and(
           eq(schema.outboxEvents.status, "pending"),
           lte(schema.outboxEvents.availableAt, now),
+          ...(onlyUserId === undefined ? [] : [eq(schema.outboxEvents.userId, onlyUserId)]),
         ))
         .orderBy(asc(schema.outboxEvents.createdAt))
         .limit(1)
@@ -129,10 +140,10 @@ export function createProjectionWorker(db: Db, repo: Repository) {
     }
   }
 
-  async function runOnce(now = new Date()): Promise<WorkerRunResult> {
+  async function runOnce(now = new Date(), onlyUserId?: string): Promise<WorkerRunResult> {
     const result: WorkerRunResult = { processed: 0, succeeded: 0, deadLettered: 0, requeued: 0 };
     for (let i = 0; i < BATCH_SIZE; i++) {
-      const event = await claimNext(now);
+      const event = await claimNext(now, onlyUserId);
       if (!event) break;
       result.processed += 1;
       const ok = await processOne(event);
@@ -152,15 +163,21 @@ export function createProjectionWorker(db: Db, repo: Repository) {
     return result;
   }
 
-  async function replayDeadLetters(userId?: string): Promise<number> {
+  async function replayDeadLetters(userId?: string, localDate?: string): Promise<number> {
     const revived = await (userId === undefined
       ? db.update(schema.outboxEvents)
           .set({ status: "pending", attempts: 0, lastError: null, availableAt: new Date() })
-          .where(eq(schema.outboxEvents.status, "dead_letter"))
+          .where(localDate === undefined
+            ? eq(schema.outboxEvents.status, "dead_letter")
+            : and(eq(schema.outboxEvents.status, "dead_letter"), eventMatchesDate(localDate)))
           .returning({ id: schema.outboxEvents.id })
       : db.update(schema.outboxEvents)
           .set({ status: "pending", attempts: 0, lastError: null, availableAt: new Date() })
-          .where(and(eq(schema.outboxEvents.status, "dead_letter"), eq(schema.outboxEvents.userId, userId)))
+          .where(and(
+            eq(schema.outboxEvents.status, "dead_letter"),
+            eq(schema.outboxEvents.userId, userId),
+            ...(localDate === undefined ? [] : [eventMatchesDate(localDate)]),
+          ))
           .returning({ id: schema.outboxEvents.id }));
     return revived.length;
   }
@@ -216,7 +233,10 @@ export function createProjectionWorker(db: Db, repo: Repository) {
       deadLetter: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'dead_letter')::int`,
       oldestPendingAt: sql<Date | null>`min(${schema.outboxEvents.createdAt}) filter (where ${schema.outboxEvents.status} = 'pending')`,
     }).from(schema.outboxEvents)
-      .where(eq(schema.outboxEvents.userId, userId));
+      .where(and(
+        eq(schema.outboxEvents.userId, userId),
+        eventMatchesDate(localDate),
+      ));
     const failures = await db.select({
       id: schema.outboxEvents.id,
       aggregateType: schema.outboxEvents.aggregateType,
@@ -228,6 +248,7 @@ export function createProjectionWorker(db: Db, repo: Repository) {
       .where(and(
         eq(schema.outboxEvents.userId, userId),
         eq(schema.outboxEvents.status, "dead_letter"),
+        eventMatchesDate(localDate),
       ))
       .orderBy(desc(schema.outboxEvents.createdAt))
       .limit(20);

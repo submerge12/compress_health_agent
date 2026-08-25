@@ -11,6 +11,7 @@ const DATABASE_URL =
 const PROTOCOL_VERSION = "2026-07-28";
 const externalUserId = `mcp-wire-${process.pid}-${Date.now()}`;
 const testExternalUserIds = new Set([externalUserId]);
+const testMediaAssetIds = new Set<string>();
 const codexFixture = JSON.parse(readFileSync(
   new URL("./fixtures/codex-2026-conformance.json", import.meta.url),
   "utf8",
@@ -150,6 +151,9 @@ afterAll(async () => {
       }
       await sql`DELETE FROM compass_health.users WHERE external_id = ${id}`;
     }
+    for (const assetId of testMediaAssetIds) {
+      await sql`DELETE FROM compass_health.media_assets WHERE id = ${assetId}::uuid`;
+    }
   } finally {
     await sql.end({ timeout: 3 });
   }
@@ -229,6 +233,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
       expect(required.filter((name) => !names.has(name)), `${journey} missing tools`).toEqual([]);
     }
     expect(names).toContain("health_get_run_evidence");
+    expect(names).not.toContain("test_missing_capability");
     for (const tool of discoveredTools) {
       if (tool._meta?.["compass.health/risk"] === "read-only") continue;
       expect(tool.inputSchema.required, `${tool.name} idempotency`).toContain("idempotencyKey");
@@ -732,6 +737,56 @@ describe("MCP 2026-07-28 stdio wire", () => {
     ]));
   }, 30_000);
 
+  it("does not leak projection lag or failures across dates", async () => {
+    const binding = `mcp-wire-projection-date-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire projection date isolation",
+      idempotencyKey: "wire-run-projection-date",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const water = await client.request(toolCall(2, "health_record_water", {
+      runHandle,
+      amountMl: 111,
+      date: "2026-08-20",
+      idempotencyKey: "wire-water-projection-date",
+    }));
+    const waterLogId = (water.result?.structuredContent as { waterLogId: string }).waterLogId;
+    const unaffected = await client.request(resourceRead(
+      3,
+      "health://daily-state/2026-08-21",
+      runHandle,
+    ));
+    const unaffectedBody = JSON.parse(
+      (unaffected.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as { projection: { status: string } };
+    expect(unaffectedBody.projection.status).toBe("missing");
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      await sql`
+        UPDATE compass_health.outbox_events
+        SET status = 'dead_letter', last_error = 'other-date-failure'
+        WHERE aggregate_id = ${waterLogId}`;
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+    const diagnostics = await client.request(toolCall(4, "health_get_projection_diagnostics", {
+      date: "2026-08-21",
+    }));
+    expect(diagnostics.result?.structuredContent).toMatchObject({
+      status: "missing",
+      outbox: { pending: 0, deadLetter: 0 },
+    });
+    const replay = await client.request(toolCall(5, "health_replay_projection", {
+      runHandle,
+      date: "2026-08-21",
+      idempotencyKey: "wire-replay-projection-date",
+    }));
+    expect(replay.result?.structuredContent).toMatchObject({ revived: 0 });
+  }, 25_000);
+
   it("filters the Constraints Resource by activeFrom and activeTo", async () => {
     const client = new WireClient();
     clients.push(client);
@@ -832,17 +887,18 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const pending = await client.request(toolCall(2, "health_log_meal", args));
     expect(pending.result?.resultType).toBe("input_required");
     const requestState = pending.result?.requestState as string;
-    const requests = pending.result?.inputRequests as {
-      confirmation: { params: { requestedSchema: { properties: { choice: { enum: string[] } } } } };
-    };
-    const offered = requests.confirmation.params.requestedSchema.properties.choice.enum;
+    const requests = pending.result?.inputRequests as Record<string, {
+      params: { requestedSchema: { properties: { choice: { enum: string[] } } } };
+    }>;
+    const requestKey = Object.keys(requests)[0]!;
+    const offered = requests[requestKey]!.params.requestedSchema.properties.choice.enum;
     expect(offered.length).toBeGreaterThan(0);
     const chosen = offered[0]!;
 
     const completed = await client.request(toolCall(3, "health_log_meal", args, {
       requestState,
       inputResponses: {
-        confirmation: { action: "accept", content: { choice: chosen } },
+        [requestKey]: { action: "accept", content: { choice: chosen } },
       },
     }));
     expect(completed.result?.resultType).toBe("complete");
@@ -852,10 +908,14 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const reused = await client.request(toolCall(4, "health_log_meal", args, {
       requestState,
       inputResponses: {
-        confirmation: { action: "accept", content: { choice: chosen } },
+        [requestKey]: { action: "accept", content: { choice: chosen } },
       },
     }));
-    expect(reused.error?.code).toBe(-32602);
+    expect(reused.result?.resultType).toBe("complete");
+    expect(reused.result?.structuredContent).toMatchObject({
+      dietLogId: body.dietLogId,
+      replayed: true,
+    });
 
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     try {
@@ -868,6 +928,58 @@ describe("MCP 2026-07-28 stdio wire", () => {
       expect(rows).toHaveLength(1);
       const ingredients = rows[0]?.ingredients_json as Array<{ slug: string }>;
       expect(ingredients.map((item) => item.slug)).toEqual([chosen]);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 30_000);
+
+  it("applies independent choices for multiple ambiguous meal segments", async () => {
+    const binding = `mcp-wire-multi-meal-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire multi-item meal confirmation",
+      idempotencyKey: "wire-run-multi-meal",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const args = {
+      runHandle,
+      date: "2026-08-19",
+      mealType: "dinner",
+      description: "150g rice、100g mystery food",
+      idempotencyKey: "wire-multi-meal",
+    };
+    const pending = await client.request(toolCall(2, "health_log_meal", args));
+    const requests = pending.result?.inputRequests as Record<string, {
+      params: { requestedSchema: { properties: { choice: { enum?: string[] } } } };
+    }>;
+    expect(Object.keys(requests).sort()).toEqual(["candidate_0", "unmatched_0"]);
+    const offered = requests.candidate_0!.params.requestedSchema.properties.choice.enum!;
+    const selected = offered[0]!;
+    const completed = await client.request(toolCall(3, "health_log_meal", args, {
+      requestState: pending.result?.requestState as string,
+      inputResponses: {
+        candidate_0: { action: "accept", content: { choice: selected } },
+        unmatched_0: { action: "accept", content: { choice: "牛肉" } },
+      },
+    }));
+    expect(completed.result?.resultType).toBe("complete");
+    const completedBody = completed.result?.structuredContent as {
+      dietLogId?: string;
+      error?: string;
+      message?: string;
+    };
+    expect(completedBody.error, completedBody.message).toBeUndefined();
+    const dietLogId = completedBody.dietLogId;
+    expect(dietLogId).toEqual(expect.any(String));
+    if (!dietLogId) throw new Error("expected dietLogId after multi-item confirmation");
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [row] = await sql`
+        SELECT ingredients_json FROM compass_health.diet_logs WHERE id = ${dietLogId}::uuid`;
+      const slugs = (row!.ingredients_json as Array<{ slug: string }>).map((item) => item.slug);
+      expect(slugs).toEqual(expect.arrayContaining([selected, "牛肉"]));
+      expect(slugs).toHaveLength(2);
     } finally {
       await sql.end({ timeout: 3 });
     }
@@ -957,4 +1069,242 @@ describe("MCP 2026-07-28 stdio wire", () => {
       await sql.end({ timeout: 3 });
     }
   }, 45_000);
+
+  it("executes J05 substitution without stacking completed volume", async () => {
+    const binding = `mcp-wire-j05-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire J05 substitution",
+      idempotencyKey: "wire-j05-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const prepared = await client.request(toolCall(2, "health_prepare_training", {
+      runHandle,
+      date: "2026-08-18",
+      day: "B",
+      idempotencyKey: "wire-j05-prepare",
+    }));
+    const proposalId = (prepared.result?.structuredContent as { trainingProposalId: string }).trainingProposalId;
+    const started = await client.request(toolCall(3, "health_start_training", {
+      runHandle,
+      trainingProposalId: proposalId,
+      date: "2026-08-18",
+      dayRole: "B",
+      idempotencyKey: "wire-j05-start",
+    }));
+    const sessionId = (started.result?.structuredContent as { trainingSessionId: string }).trainingSessionId;
+    const initial = await client.request(resourceRead(4, `health://training/sessions/${sessionId}`, runHandle));
+    const initialBody = JSON.parse(
+      (initial.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as { exercisesWithSets: Array<{ exercise: { id: string; targetSets: number } }> };
+    const original = initialBody.exercisesWithSets[0]!.exercise;
+    await client.request(toolCall(5, "health_record_set", {
+      runHandle,
+      trainingSessionId: sessionId,
+      sessionExerciseId: original.id,
+      setNumber: 1,
+      reps: 8,
+      idempotencyKey: "wire-j05-set-1",
+    }));
+    const proposed = await client.request(toolCall(6, "health_propose_substitution", {
+      runHandle,
+      trainingSessionId: sessionId,
+      sessionExerciseId: original.id,
+      idempotencyKey: "wire-j05-propose-substitution",
+    }));
+    const proposal = proposed.result?.structuredContent as {
+      substitutionProposalId: string;
+      remainingSets: number;
+      candidates: Array<{ slug: string }>;
+    };
+    expect(proposal.remainingSets).toBe(original.targetSets - 1);
+    expect(proposal.candidates.length).toBeGreaterThan(0);
+    const applied = await client.request(toolCall(7, "health_apply_substitution", {
+      runHandle,
+      substitutionProposalId: proposal.substitutionProposalId,
+      chosenSlug: proposal.candidates[0]!.slug,
+      reason: "equipment occupied",
+      idempotencyKey: "wire-j05-apply-substitution",
+    }));
+    const replacementId = (applied.result?.structuredContent as { replacementId: string }).replacementId;
+    const readBack = await client.request(resourceRead(8, `health://training/sessions/${sessionId}`, runHandle));
+    const readBackBody = JSON.parse(
+      (readBack.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as {
+      exercisesWithSets: Array<{
+        exercise: { id: string; replacementForId: string | null; targetSets: number };
+        sets: Array<{ id: string }>;
+      }>;
+    };
+    const replacement = readBackBody.exercisesWithSets.find((entry) => entry.exercise.id === replacementId)!;
+    const originalReadBack = readBackBody.exercisesWithSets.find((entry) => entry.exercise.id === original.id)!;
+    expect(replacement.exercise.replacementForId).toBe(original.id);
+    expect(replacement.exercise.targetSets).toBe(proposal.remainingSets);
+    expect(originalReadBack.sets).toHaveLength(1);
+  }, 35_000);
+
+  it("executes J03 REST acknowledgement through the explicit cycle", async () => {
+    const binding = `mcp-wire-j03-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire J03 rest acknowledgement",
+      idempotencyKey: "wire-j03-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [user] = await sql`SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      const [cycle] = await sql`
+        INSERT INTO compass_health.training_cycle_instances (user_id, status)
+        VALUES (${user!.id}::uuid, 'active') RETURNING id`;
+      await sql`
+        INSERT INTO compass_health.training_cycle_positions
+          (cycle_instance_id, user_id, position_index, position_role, status, position_date)
+        VALUES
+          (${cycle!.id}::uuid, ${user!.id}::uuid, 0, 'A', 'completed', '2026-08-16'),
+          (${cycle!.id}::uuid, ${user!.id}::uuid, 1, 'B', 'completed', '2026-08-17')`;
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+    const acknowledged = await client.request(toolCall(2, "health_acknowledge_rest", {
+      runHandle,
+      date: "2026-08-18",
+      idempotencyKey: "wire-j03-rest",
+    }));
+    expect(acknowledged.result?.structuredContent).toMatchObject({
+      acknowledged: true,
+      positionIndex: 2,
+      status: "skipped_rest",
+    });
+  }, 20_000);
+
+  it("executes J06 media search and feedback without exposing local paths", async () => {
+    const binding = `mcp-wire-j06-${process.pid}-${Date.now()}`;
+    const marker = `wire-j06-${process.pid}-${Date.now()}`;
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let segmentId = "";
+    try {
+      const [asset] = await sql`
+        INSERT INTO compass_health.media_assets
+          (kind, trainer, source_role, title, local_path, sha256, duration_ms,
+           probe_status, full_decode_status, usable_video_until_ms, content_type, bytes)
+        VALUES
+          ('video', 'tanchengyi', 'technique_details', ${marker}, 'C:\\private\\fixture.mp4',
+           ${marker}, 60000, 'ok', 'ok', 60000, 'video/mp4', 1)
+        RETURNING id`;
+      testMediaAssetIds.add(String(asset!.id));
+      const [pairing] = await sql`
+        INSERT INTO compass_health.media_pairings
+          (video_asset_id, match_method, completeness, usable_until_ms)
+        VALUES (${asset!.id}::uuid, 'manifest', 'complete', 60000)
+        RETURNING id`;
+      const [segment] = await sql`
+        INSERT INTO compass_health.video_segments
+          (pairing_id, start_ms, end_ms, trainer, source_role, title, category,
+           cues_text, review_status)
+        VALUES
+          (${pairing!.id}::uuid, 1000, 5000, 'tanchengyi', 'technique_details',
+           ${marker}, 'correction', ${`${marker} bench cue`}, 'confirmed')
+        RETURNING id`;
+      segmentId = String(segment!.id);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire J06 media",
+      idempotencyKey: "wire-j06-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const searched = await client.request(toolCall(2, "health_search_training_media", {
+      text: marker,
+      limit: 5,
+    }));
+    const segments = (searched.result?.structuredContent as {
+      segments: Array<{ segmentId: string; streamUrl: string; localPath?: string }>;
+    }).segments;
+    expect(segments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ segmentId, streamUrl: `/api/v1/media/segments/${segmentId}/stream` }),
+    ]));
+    expect(segments.find((segment) => segment.segmentId === segmentId)?.localPath).toBeUndefined();
+
+    const feedback = await client.request(toolCall(3, "health_record_media_feedback", {
+      runHandle,
+      segmentId,
+      helpful: true,
+      note: "clear cue",
+      idempotencyKey: "wire-j06-feedback",
+    }));
+    expect(feedback.result?.structuredContent).toMatchObject({ segmentId, helpful: true });
+  }, 25_000);
+
+  it("executes J07 reflection, child proposal, and confirmed activation", async () => {
+    const binding = `mcp-wire-j07-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire J07 plan evolution",
+      idempotencyKey: "wire-j07-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const prepared = await client.request(toolCall(2, "health_prepare_training", {
+      runHandle,
+      date: "2026-08-15",
+      day: "A",
+      idempotencyKey: "wire-j07-prepare",
+    }));
+    const proposalId = (prepared.result?.structuredContent as { trainingProposalId: string }).trainingProposalId;
+    const started = await client.request(toolCall(3, "health_start_training", {
+      runHandle,
+      trainingProposalId: proposalId,
+      date: "2026-08-15",
+      dayRole: "A",
+      idempotencyKey: "wire-j07-start",
+    }));
+    const sessionId = (started.result?.structuredContent as { trainingSessionId: string }).trainingSessionId;
+    await client.request(toolCall(4, "health_finish_training", {
+      runHandle,
+      trainingSessionId: sessionId,
+      finalStatus: "interrupted",
+      idempotencyKey: "wire-j07-finish",
+    }));
+    const reflected = await client.request(toolCall(5, "health_record_reflection", {
+      runHandle,
+      trainingSessionId: sessionId,
+      bestCueRefs: [],
+      proposedAdjustments: [],
+      idempotencyKey: "wire-j07-reflection",
+    }));
+    const reflectionId = (reflected.result?.structuredContent as { reflectionId: string }).reflectionId;
+    const proposed = await client.request(toolCall(6, "health_propose_plan_change", {
+      runHandle,
+      reflectionId,
+      changes: [],
+      reason: "wire J07 validation",
+      idempotencyKey: "wire-j07-propose-plan",
+    }));
+    const childVersionId = (proposed.result?.structuredContent as { childVersionId: string }).childVersionId;
+    const activationArgs = {
+      runHandle,
+      planVersionId: childVersionId,
+      idempotencyKey: "wire-j07-activate",
+    };
+    const pending = await client.request(toolCall(7, "health_activate_plan_version", activationArgs));
+    expect(pending.result?.resultType).toBe("input_required");
+    const activated = await client.request(toolCall(8, "health_activate_plan_version", activationArgs, {
+      requestState: pending.result?.requestState as string,
+      inputResponses: {
+        confirmation: { action: "accept", content: { choice: "确认激活" } },
+      },
+    }));
+    expect(activated.result?.structuredContent).toMatchObject({
+      planVersionId: childVersionId,
+      activated: true,
+      status: "active",
+    });
+  }, 35_000);
 });

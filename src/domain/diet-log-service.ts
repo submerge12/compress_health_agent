@@ -23,6 +23,8 @@ import type { Repository } from "../db/repository.js";
 import { handleNutritionEstimate } from "../tools/handlers.js";
 import type { NutritionEstimateResult } from "../tools/nutrition-estimate.js";
 import type { ToolContext } from "../tools/context.js";
+import { aggregateNutrition } from "../engine/nutrition.js";
+import type { NutritionEntry } from "../engine/types.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 type DietLogRow = typeof schema.dietLogs.$inferSelect;
@@ -269,32 +271,74 @@ export function createDietLogService(db: Db, repo: Repository) {
 }
 
 /** Resolve one user-selected candidate into a clean nutrition estimate. */
-export async function resolveConfirmedFoodCandidate(
+export async function resolveConfirmedFoodCandidates(
   ctx: ToolContext,
   estimate: NutritionEstimateResult,
-  choice: string | undefined,
+  selections: Record<string, string>,
 ): Promise<NutritionEstimateResult> {
-  if (!choice) throw new CandidateSelectionError("confirmation_response_missing");
   const diagnostics = estimate.needsConfirmation ?? [];
-  const selectedDiagnostic = diagnostics.find((diagnostic) =>
-    diagnostic.candidates.some((candidate) => candidate.slug === choice || candidate.label === choice));
-  const selected = selectedDiagnostic?.candidates.find((candidate) =>
-    candidate.slug === choice || candidate.label === choice);
-  const unmatched = estimate.unmatched?.[0];
-  const segment = selectedDiagnostic?.segment ?? unmatched?.segment;
-  if (!segment) throw new CandidateSelectionError("candidate_not_offered");
+  const unmatched = estimate.unmatched ?? [];
+  const items: NutritionEntry[] = estimate.items.map((item) => ({ ...item }));
+  diagnostics.forEach((diagnostic, index) => {
+    const choice = selections[`candidate_${index}`];
+    if (!choice) throw new CandidateSelectionError(`confirmation_response_missing_${index}`);
+    const selected = diagnostic.candidates.find((candidate) =>
+      candidate.slug === choice || candidate.label === choice);
+    if (!selected) throw new CandidateSelectionError(`candidate_not_offered_${index}`);
+    const food = ctx.catalog.foods.find((entry) => entry.slug === selected.slug);
+    if (!food) throw new CandidateSelectionError(`candidate_missing_from_catalog_${selected.slug}`);
+    items.push({ slug: selected.slug, grams: gramsForSelection(diagnostic.segment, food, ctx) });
+  });
+  for (let index = 0; index < unmatched.length; index++) {
+    const diagnostic = unmatched[index]!;
+    const choice = selections[`unmatched_${index}`];
+    if (!choice) throw new CandidateSelectionError(`unmatched_response_missing_${index}`);
+    const weight = diagnostic.segment.match(/\d+(?:\.\d+)?\s*(?:g|grams?|克)/i)?.[0] ?? "";
+    const resolved = await handleNutritionEstimate(ctx, {
+      description: `${choice}${weight}`,
+    });
+    if ((resolved.needsConfirmation?.length ?? 0) > 0 || (resolved.unmatched?.length ?? 0) > 0) {
+      throw new CandidateSelectionError(`unmatched_choice_did_not_resolve_${index}`);
+    }
+    items.push(...resolved.items);
+  }
 
-  const weight = segment.match(/\d+(?:\.\d+)?\s*(?:g|grams?|克)/i)?.[0] ?? "";
-  const replacement = `${selected?.label ?? choice}${weight ? ` ${weight}` : ""}`;
-  const description = estimate.description.replace(segment, replacement);
-  const resolved = await handleNutritionEstimate(ctx, { description });
-  if ((resolved.needsConfirmation?.length ?? 0) > 0 || (resolved.unmatched?.length ?? 0) > 0) {
-    throw new CandidateSelectionError("candidate_did_not_resolve");
+  const merged = [...items.reduce((bySlug, item) => {
+    bySlug.set(item.slug, (bySlug.get(item.slug) ?? 0) + item.grams);
+    return bySlug;
+  }, new Map<string, number>())].map(([slug, grams]) => ({ slug, grams }));
+  const totals = aggregateNutrition({
+    foods: merged,
+    foodRecords: ctx.catalog.foods,
+    requireWeightType: true,
+  }).total;
+  return {
+    description: estimate.description,
+    items: merged,
+    kcal: totals.kcal,
+    proteinGrams: totals.proteinGrams,
+    carbsGrams: totals.carbsGrams,
+    fatGrams: totals.fatGrams,
+    sodiumMg: totals.sodiumMg,
+    micronutrients: totals.micronutrients,
+  };
+}
+
+function gramsForSelection(
+  segment: string,
+  food: ToolContext["catalog"]["foods"][number],
+  ctx: ToolContext,
+): number {
+  const grams = segment.match(/(\d+(?:\.\d+)?)\s*(?:g|grams?|克)/i);
+  if (grams?.[1]) return Number(grams[1]);
+  const counted = segment.match(/(\d+(?:\.\d+)?)\s*([A-Za-z\u4e00-\u9fff]+)/);
+  if (counted?.[1] && counted[2]) {
+    const unit = ctx.catalog.naturalUnits.find((entry) =>
+      entry.foodSlug === food.slug
+      && (entry.unit === counted[2] || entry.aliases?.includes(counted[2]!)));
+    if (unit) return Number(counted[1]) * unit.grams;
   }
-  if (selected && !resolved.items.some((item) => item.slug === selected.slug)) {
-    throw new CandidateSelectionError("candidate_not_applied");
-  }
-  return resolved;
+  return food.defaultGrams ?? 100;
 }
 
 export class CandidateSelectionError extends Error {

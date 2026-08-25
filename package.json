@@ -31,6 +31,7 @@
     "mcp:stdio": "tsx src/mcp/stdio.ts",
     "smoke:exports": "pnpm build && node tests/smoke/resolve-package-exports.mjs",
     "test": "vitest run",
+    "test:mcp:conformance": "tsx tests/mcp/run-official-conformance.ts",
     "typecheck": "tsc --noEmit",
     "db:push": "drizzle-kit push",
     "db:seed": "tsx src/db/run-seed.ts",
@@ -47,6 +48,8 @@
   },
   "devDependencies": {
     "@modelcontextprotocol/client": "^2.0.0",
+    "@modelcontextprotocol/conformance": "0.2.0-alpha.11",
+    "@modelcontextprotocol/node": "^2.0.0",
     "@types/node": "^22.19.21",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.22.4",

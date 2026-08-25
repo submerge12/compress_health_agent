@@ -29,6 +29,7 @@ export interface PendingInputBinding {
 export interface IssueInputRequest extends PendingInputBinding {
   prompt: string;
   choices: string[];
+  inputRequests?: Record<string, unknown>;
   payload: Record<string, unknown>;
   ttlMs?: number;
 }
@@ -73,17 +74,26 @@ export function createRequestStateService(db: Db) {
     binding: { userId: string; verifiedActor: string },
   ): Promise<string> {
     if (!requestState.startsWith("mcp_rs_")) throw new RequestStateError("malformed");
-    const [row] = await db.select({
-      userId: schema.mcpPendingInputRequests.userId,
-      verifiedActor: schema.mcpPendingInputRequests.verifiedActor,
-      status: schema.mcpPendingInputRequests.status,
-      expiresAt: schema.mcpPendingInputRequests.expiresAt,
-    }).from(schema.mcpPendingInputRequests)
+    const [row] = await db.select().from(schema.mcpPendingInputRequests)
       .where(eq(schema.mcpPendingInputRequests.requestStateHash, stateHash(requestState)))
       .limit(1);
     if (!row) throw new RequestStateError("unknown");
     if (row.userId !== binding.userId) throw new RequestStateError("user_mismatch");
     if (row.verifiedActor !== binding.verifiedActor) throw new RequestStateError("actor_mismatch");
+    if (row.status === "consumed") {
+      const [receipt] = await db.select({ id: schema.mcpWriteReceipts.id })
+        .from(schema.mcpWriteReceipts)
+        .where(and(
+          eq(schema.mcpWriteReceipts.userId, row.userId),
+          eq(schema.mcpWriteReceipts.runId, row.runId),
+          eq(schema.mcpWriteReceipts.verifiedActor, row.verifiedActor),
+          eq(schema.mcpWriteReceipts.toolName, row.toolName),
+          eq(schema.mcpWriteReceipts.scopeKey, row.targetId),
+          eq(schema.mcpWriteReceipts.idempotencyKey, row.idempotencyKey),
+          eq(schema.mcpWriteReceipts.argumentHash, row.argumentHash),
+        )).limit(1);
+      if (receipt) return requestState;
+    }
     if (row.status !== "pending" || row.expiresAt <= new Date()) {
       throw new RequestStateError("expired_or_consumed");
     }
@@ -96,7 +106,7 @@ export function createRequestStateService(db: Db) {
     const requestedSchema = input.choices.length > 0
       ? { type: "object", properties: { choice: { type: "string", enum: input.choices } }, required: ["choice"] }
       : { type: "object", properties: { choice: { type: "string" } }, required: ["choice"] };
-    const inputRequests = {
+    const inputRequests = input.inputRequests ?? {
       confirmation: {
         method: "elicitation/create",
         params: {
@@ -138,16 +148,6 @@ export function createRequestStateService(db: Db) {
         .limit(1)
         .for("update");
       if (!row) throw new RequestStateError("unknown");
-      if (row.status !== "pending" || row.consumedAt !== null) {
-        throw new RequestStateError("already_consumed");
-      }
-      if (row.expiresAt <= new Date()) {
-        await tx.update(schema.mcpPendingInputRequests)
-          .set({ status: "expired", updatedAt: new Date() })
-          .where(eq(schema.mcpPendingInputRequests.id, row.id));
-        throw new RequestStateError("expired");
-      }
-
       const mismatch =
         row.userId !== binding.userId ? "user"
           : row.verifiedActor !== binding.verifiedActor ? "actor"
@@ -158,6 +158,16 @@ export function createRequestStateService(db: Db) {
                     : row.idempotencyKey !== binding.idempotencyKey ? "idempotency_key"
                       : undefined;
       if (mismatch) throw new RequestStateError(`${mismatch}_mismatch`);
+
+      if (row.status === "consumed" && row.consumedAt !== null) {
+        return effect(tx, {
+          id: row.id,
+          payloadJson: row.payloadJson,
+          inputRequestsJson: row.inputRequestsJson,
+        });
+      }
+      if (row.status !== "pending") throw new RequestStateError("not_pending");
+      if (row.expiresAt <= new Date()) throw new RequestStateError("expired");
 
       const result = await effect(tx, {
         id: row.id,

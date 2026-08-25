@@ -13,6 +13,8 @@
 import {
   acceptedContent,
   inputRequired,
+  ProtocolError,
+  ProtocolErrorCode,
   Server,
   type InputRequests,
   type Resource,
@@ -39,11 +41,16 @@ export interface CreateHealthMcpServerOptions extends ActorBindingOptions {
   db: Db;
   repo: Repository;
   toolContext: ToolContext;
+  /** Test-only official conformance diagnostics; never enabled by stdio. */
+  conformanceProfile?: boolean;
 }
 
 export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Server {
   const { db, repo } = options;
-  const principalResolver = createPrincipalResolver(db, options);
+  const principalResolver = createPrincipalResolver(db, {
+    ...options,
+    expectedUserId: options.toolContext.userId,
+  });
   const resources = createResourceCatalog(db, repo);
   const runs = createRunHandleService(db);
   const requestStates = createRequestStateService(db);
@@ -68,10 +75,12 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         "resources/read": { ttlMs: 0, cacheScope: "private" },
       },
       requestState: {
-        verify: (state) => requestStates.verify(state, {
-          userId: options.toolContext.userId,
-          verifiedActor,
-        }),
+        verify: (state) => options.conformanceProfile && state === "conformance-state-v1"
+          ? state
+          : requestStates.verify(state, {
+              userId: options.toolContext.userId,
+              verifiedActor,
+            }),
       },
     },
   );
@@ -102,7 +111,19 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
       implicitRun = true;
     }
     try {
-      const result = await resources.readResource(principal, uri);
+      let result: Awaited<ReturnType<typeof resources.readResource>>;
+      try {
+        result = await resources.readResource(principal, uri);
+      } catch (error) {
+        if (error instanceof McpProtocolError && error.code === "not_found") {
+          throw ProtocolError.fromError(
+            ProtocolErrorCode.InvalidParams,
+            error.message,
+            { uri },
+          );
+        }
+        throw error;
+      }
       await runs.recordStep({
         userId: principal.userId,
         runHandle,
@@ -136,7 +157,10 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
   });
 
   // ── tools/list: P1 read tool + P2 canonical write tools ──
-  const tools = createHealthToolCatalog(db, repo, { toolContext: options.toolContext });
+  const tools = createHealthToolCatalog(db, repo, {
+    toolContext: options.toolContext,
+    conformanceProfile: options.conformanceProfile,
+  });
   server.setRequestHandler("tools/list", async () => {
     return {
       tools: [
@@ -179,18 +203,21 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         args: params.arguments ?? {},
         ...(typeof requestState === "string" ? { requestState } : {}),
         ...(confirmation?.choice ? { confirmationChoice: confirmation.choice } : {}),
+        ...(ctx.mcpReq.inputResponses ? {
+          inputResponses: ctx.mcpReq.inputResponses as Record<string, unknown>,
+        } : {}),
       });
       if (outcome.resultType === "input_required") {
         const pending = outcome.structured as {
           requestState?: string;
           inputRequests?: Record<string, unknown>;
         } | undefined;
-        if (!pending?.requestState || !pending.inputRequests) {
-          throw new McpProtocolError("internal", "input_required outcome has no request state");
+        if (!pending?.inputRequests) {
+          throw new McpProtocolError("internal", "input_required outcome has no input requests");
         }
         return inputRequired({
           inputRequests: pending.inputRequests as InputRequests,
-          requestState: pending.requestState,
+          ...(pending.requestState ? { requestState: pending.requestState } : {}),
         });
       }
       return {

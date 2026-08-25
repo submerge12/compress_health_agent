@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../../db/schema.js";
@@ -55,6 +55,11 @@ export function createWriteCommandService(db: Db) {
   async function beginRun(input: BeginRunInput): Promise<WriteCommandResult> {
     const argumentHash = hashArguments(input.arguments);
     return db.transaction(async (tx) => {
+      const [ownedUser] = await tx.select({ id: schema.users.id }).from(schema.users)
+        .where(eq(schema.users.id, input.userId))
+        .limit(1)
+        .for("update");
+      if (!ownedUser) throw new WriteCommandError("write_contract_failed", "verified user vanished");
       const [existing] = await tx.select().from(schema.mcpWriteReceipts)
         .where(and(
           eq(schema.mcpWriteReceipts.userId, input.userId),
@@ -117,6 +122,12 @@ export function createWriteCommandService(db: Db) {
         outboxEventIdsJson: [outbox.id],
         responseJson: response,
       });
+      const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
+        eq(schema.mcpWriteReceipts.id, receiptId),
+        eq(schema.mcpWriteReceipts.userId, input.userId),
+        eq(schema.mcpWriteReceipts.runId, run.id),
+      )).limit(1);
+      if (!storedReceipt) throw new WriteCommandError("write_contract_failed", "begin-run receipt read-back failed");
       await tx.insert(schema.agentRunSteps).values({
         runId: run.id,
         sequence: 0,
@@ -127,7 +138,7 @@ export function createWriteCommandService(db: Db) {
         argumentsRedactedJson: redactArguments(input.arguments),
         resultSummaryJson: { receiptId, outboxEventId: outbox.id },
       });
-      return { response, replayed: false, receiptId };
+      return { response: storedReceipt.responseJson, replayed: false, receiptId };
     });
   }
 
@@ -209,6 +220,18 @@ export function createWriteCommandService(db: Db) {
         outboxEventIdsJson: mutation.outboxEventIds,
         responseJson: response,
       });
+      const outboxReadBack = await tx.select({ id: schema.outboxEvents.id })
+        .from(schema.outboxEvents)
+        .where(inArray(schema.outboxEvents.id, mutation.outboxEventIds));
+      if (outboxReadBack.length !== mutation.outboxEventIds.length) {
+        throw new WriteCommandError("write_contract_failed", "outbox read-back did not match mutation");
+      }
+      const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
+        eq(schema.mcpWriteReceipts.id, receiptId),
+        eq(schema.mcpWriteReceipts.userId, input.userId),
+        eq(schema.mcpWriteReceipts.runId, input.runHandle),
+      )).limit(1);
+      if (!storedReceipt) throw new WriteCommandError("write_contract_failed", "write receipt read-back failed");
 
       const [sequenceRow] = await tx.select({
         max: sql<number>`coalesce(max(${schema.agentRunSteps.sequence}), -1)::int`,
@@ -228,7 +251,7 @@ export function createWriteCommandService(db: Db) {
         },
       });
 
-    return { response, replayed: false, receiptId };
+    return { response: storedReceipt.responseJson, replayed: false, receiptId };
   }
 
   return { beginRun, execute, executeInTransaction };
