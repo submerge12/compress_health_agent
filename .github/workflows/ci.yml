@@ -54,7 +54,14 @@ jobs:
         run: pnpm build
 
       - name: Migrate service database (gate proof)
-        run: pnpm db:migrate
+        run: |
+          pnpm exec tsx -e "
+            import postgres from 'postgres';
+            const admin = postgres(process.env.DATABASE_URL!.replace(/\/[^/]*$/, '/postgres'), { max: 1 });
+            await admin\`CREATE DATABASE compass_health\`.catch(() => undefined);
+            await admin.end();
+          "
+          pnpm db:migrate
 
       - name: Unit + domain tests (includes migration invariants on throwaway DBs)
         run: pnpm test
