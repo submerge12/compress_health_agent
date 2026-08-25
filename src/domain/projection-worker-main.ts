@@ -110,4 +110,3 @@ if (invokedPath === resolve(fileURLToPath(import.meta.url))) {
     process.exit(1);
   });
 }
-

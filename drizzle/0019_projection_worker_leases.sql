@@ -7,4 +7,3 @@ ALTER TABLE "compass_health"."outbox_events"
 
 CREATE INDEX IF NOT EXISTS "outbox_events_claim_idx"
   ON "compass_health"."outbox_events" ("status", "available_at", "lock_expires_at", "created_at");
-
