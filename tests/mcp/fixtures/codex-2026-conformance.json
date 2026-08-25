@@ -1,0 +1,15 @@
+{
+  "source": "https://github.com/openai/codex/tree/46aa019e805352c9d7fd9a740cbf7f8b9aeb162d/scripts/mcp_conformance",
+  "protocolVersion": "2026-07-28",
+  "discovery": {
+    "resultType": "complete",
+    "supportedVersions": ["2026-07-28"]
+  },
+  "completeResultType": "complete",
+  "mrtr": {
+    "pendingResultType": "input_required",
+    "inputRequestKey": "confirmation",
+    "inputRequestMethod": "elicitation/create",
+    "acceptedChoice": "确认解除"
+  }
+}

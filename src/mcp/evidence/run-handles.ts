@@ -184,9 +184,14 @@ export function createRunHandleService(db: Db) {
 
   async function getRun(userId: string, runHandle: string) {
     const run = await requireOwnedRun(db, userId, runHandle);
-    const steps = await db.select().from(schema.agentRunSteps)
-      .where(eq(schema.agentRunSteps.runId, run.id))
-      .orderBy(schema.agentRunSteps.sequence);
+    const [steps, receipts] = await Promise.all([
+      db.select().from(schema.agentRunSteps)
+        .where(eq(schema.agentRunSteps.runId, run.id))
+        .orderBy(schema.agentRunSteps.sequence),
+      db.select().from(schema.mcpWriteReceipts)
+        .where(eq(schema.mcpWriteReceipts.runId, run.id))
+        .orderBy(schema.mcpWriteReceipts.createdAt),
+    ]);
     return {
       run: {
         runHandle: run.id,
@@ -208,6 +213,14 @@ export function createRunHandleService(db: Db) {
         errorCode: s.errorCode,
         stateRevisionBefore: s.stateRevisionBefore,
         stateRevisionAfter: s.stateRevisionAfter,
+      })),
+      receipts: receipts.map((receipt) => ({
+        receiptId: receipt.id,
+        toolName: receipt.toolName,
+        scopeKey: receipt.scopeKey,
+        factRefs: receipt.factRefsJson,
+        outboxEventIds: receipt.outboxEventIdsJson,
+        createdAt: receipt.createdAt,
       })),
     };
   }

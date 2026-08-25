@@ -268,6 +268,42 @@ export function createDietLogService(db: Db, repo: Repository) {
   };
 }
 
+/** Resolve one user-selected candidate into a clean nutrition estimate. */
+export async function resolveConfirmedFoodCandidate(
+  ctx: ToolContext,
+  estimate: NutritionEstimateResult,
+  choice: string | undefined,
+): Promise<NutritionEstimateResult> {
+  if (!choice) throw new CandidateSelectionError("confirmation_response_missing");
+  const diagnostics = estimate.needsConfirmation ?? [];
+  const selectedDiagnostic = diagnostics.find((diagnostic) =>
+    diagnostic.candidates.some((candidate) => candidate.slug === choice || candidate.label === choice));
+  const selected = selectedDiagnostic?.candidates.find((candidate) =>
+    candidate.slug === choice || candidate.label === choice);
+  const unmatched = estimate.unmatched?.[0];
+  const segment = selectedDiagnostic?.segment ?? unmatched?.segment;
+  if (!segment) throw new CandidateSelectionError("candidate_not_offered");
+
+  const weight = segment.match(/\d+(?:\.\d+)?\s*(?:g|grams?|克)/i)?.[0] ?? "";
+  const replacement = `${selected?.label ?? choice}${weight ? ` ${weight}` : ""}`;
+  const description = estimate.description.replace(segment, replacement);
+  const resolved = await handleNutritionEstimate(ctx, { description });
+  if ((resolved.needsConfirmation?.length ?? 0) > 0 || (resolved.unmatched?.length ?? 0) > 0) {
+    throw new CandidateSelectionError("candidate_did_not_resolve");
+  }
+  if (selected && !resolved.items.some((item) => item.slug === selected.slug)) {
+    throw new CandidateSelectionError("candidate_not_applied");
+  }
+  return resolved;
+}
+
+export class CandidateSelectionError extends Error {
+  readonly code = "proposal_stale";
+  constructor(readonly reason: string) {
+    super(`food candidate rejected: ${reason}`);
+  }
+}
+
 export class NeedsConfirmationError extends Error {
   readonly code = "needs_confirmation";
   constructor(readonly estimate: NutritionEstimateResult) {

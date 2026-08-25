@@ -17,7 +17,7 @@
  * STDIO mode never listens on a port and never reads bearer tokens: the OS
  * user that launched the process IS the principal.
  */
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 
 import { initToolContext } from "../tools/context.js";
 import { assertSchemaReady } from "../db/migrate.js";
@@ -48,18 +48,23 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const server = createHealthMcpServer({
-    db: ctx.db,
-    repo: ctx.repo,
-    externalUserId,
-    actor: process.env.COMPASS_HEALTH_ACTOR,
-  });
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  let handle: StdioServerHandle | undefined;
+  handle = serveStdio(() => createHealthMcpServer({
+      db: ctx.db!,
+      repo: ctx.repo,
+      toolContext: ctx,
+      externalUserId,
+      actor: process.env.COMPASS_HEALTH_ACTOR,
+    }), {
+      legacy: "reject",
+      onerror: (error) => {
+        process.stderr.write(`compass-health MCP: protocol error: ${error.message}\n`);
+      },
+    });
   process.stderr.write(`compass-health MCP: ready on stdio (binding=${externalUserId})\n`);
 
   const shutdown = async () => {
+    await handle?.close();
     await ctx.close();
     process.exit(0);
   };

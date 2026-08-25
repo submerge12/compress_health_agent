@@ -225,13 +225,17 @@ export function createMediaRetrieval(db: Db) {
     }));
   }
 
-  async function recordFeedback(userId: string, segmentId: string, helpful: boolean, note?: string): Promise<void> {
-    await db.insert(schema.segmentFeedback).values({ userId, segmentId, helpful, note: note ?? null });
+  async function recordFeedback(userId: string, segmentId: string, helpful: boolean, note?: string): Promise<{ feedbackId: string }> {
+    const [feedback] = await db.insert(schema.segmentFeedback)
+      .values({ userId, segmentId, helpful, note: note ?? null })
+      .returning({ id: schema.segmentFeedback.id });
+    if (!feedback) throw new Error("media feedback insert returned no row");
     await db.update(schema.videoSegments).set(
       helpful
         ? { helpfulCount: sql`${schema.videoSegments.helpfulCount} + 1`, updatedAt: new Date() }
         : { notHelpfulCount: sql`${schema.videoSegments.notHelpfulCount} + 1`, updatedAt: new Date() },
     ).where(eq(schema.videoSegments.id, segmentId));
+    return { feedbackId: feedback.id };
   }
 
   return { search, recordFeedback };

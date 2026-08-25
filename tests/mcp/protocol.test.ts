@@ -1,21 +1,17 @@
 /**
- * P1 acceptance: MCP protocol surface over the SDK InMemory transport.
+ * MCP 2026 acceptance through the v2 fetch-shaped wire handler.
  *
  * Gates (plan §十七.1):
- * - initialize negotiates a supported protocol version;
- * - server/discover (2026-07-28 self-description) returns capabilities and
- *   refuses unsupported versions;
+ * - server/discover selects 2026-07-28 without initialize;
  * - resources/list is deterministic and complete;
  * - resources/read scopes by the bound principal — another user's session
  *   URI is 404, never leaked;
  * - tools/call works for the P1 read tool and rejects unknown names;
- * - no session state: a fresh client can read immediately after initialize
- *   (every request is self-contained).
+ * - every request is self-contained and session-free.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { z } from "zod/v4";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { createMcpHandler } from "@modelcontextprotocol/server";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
@@ -39,6 +35,7 @@ describe.skipIf(!isDbAvailable)("MCP server core (P1)", () => {
   let ctx: Awaited<ReturnType<typeof initToolContext>>;
   const externalUserId = `mcp-p1-${Date.now()}`;
   let client: Client;
+  let handler: ReturnType<typeof createMcpHandler>;
 
   beforeAll(async () => {
     ctx = await initToolContext({
@@ -48,46 +45,37 @@ describe.skipIf(!isDbAvailable)("MCP server core (P1)", () => {
       timezone: "Asia/Shanghai",
     });
     if (!ctx.db) throw new Error("db context required");
-    const server = createHealthMcpServer({
-      db: ctx.db,
-      repo: ctx.repo,
-      externalUserId,
+    handler = createMcpHandler(() => createHealthMcpServer({
+        db: ctx.db!,
+        repo: ctx.repo,
+        toolContext: ctx,
+        externalUserId,
+      }), { legacy: "reject" });
+    client = new Client(
+      { name: "p1-test", version: "0.0.1" },
+      { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+    );
+    const transport = new StreamableHTTPClientTransport(new URL("http://test.local/mcp"), {
+      fetch: (url, init) => handler.fetch(new Request(url, init)),
     });
-    client = new Client({ name: "p1-test", version: "0.0.1" });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    await client.connect(transport);
   });
 
   afterAll(async () => {
+    await client.close();
+    await handler.close();
     await db.delete(schema.users).where(eq(schema.users.externalId, externalUserId));
     await ctx.close();
     await pool.end({ timeout: 3 });
   });
 
-  it("initialize negotiates a supported protocol version and discover works", async () => {
+  it("discovers the 2026 protocol without initialize", async () => {
     const info = client.getServerVersion();
     expect(info).toBeDefined();
-    expect(SUPPORTED_PROTOCOL_VERSIONS).toContain("2025-11-25");
-
-    const discoverSchema = z.object({
-      protocolVersion: z.string(),
-      server: z.object({ name: z.string(), version: z.string() }),
-      capabilities: z.looseObject({}),
-      stateModel: z.looseObject({}),
-    });
-    const discover = await client.request(
-      { method: "server/discover", params: {} } as never,
-      discoverSchema,
-    );
-    expect(discover.server.name).toBe("compass-health");
-    expect(discover.protocolVersion).toBe("2025-11-25");
-    expect(discover.stateModel.sessions).toContain("self-contained");
-
-    // Unsupported protocol versions are refused with a machine-readable code.
-    await expect(client.request(
-      { method: "server/discover", params: { protocolVersion: "1999-01-01" } } as never,
-      discoverSchema,
-    )).rejects.toThrow(/protocol_version_mismatch|not supported/);
+    expect(info?.name).toBe("compass-health");
+    expect(client.getProtocolEra()).toBe("modern");
+    expect(SUPPORTED_PROTOCOL_VERSIONS).toEqual(["2026-07-28"]);
+    expect(client.getDiscoverResult()?.supportedVersions).toEqual(["2026-07-28"]);
   });
 
   it("resources/list is deterministic and covers the P1 catalog", async () => {

@@ -293,5 +293,23 @@ export function createCycleEngine(db: Db) {
       .orderBy(asc(schema.trainingCyclePositions.createdAt));
   }
 
-  return { decide, recordCycleOutcome, listPositions };
+  async function acknowledgeRest(input: {
+    userId: string;
+    onDate: string;
+    reasonCode?: string;
+  }): Promise<CycleDecision & { cycleInstanceId: string; positionIndex: number }> {
+    const decision = await decide(input.userId, input.onDate);
+    if (decision.decision !== "REST") {
+      throw new RangeError(`current cycle decision is ${decision.decision}, not REST`);
+    }
+    const position = await recordCycleOutcome({
+      userId: input.userId,
+      outcome: "skipped_readiness",
+      reasonCode: input.reasonCode ?? decision.reasonCodes.join("|"),
+      onDate: input.onDate,
+    });
+    return { ...decision, ...position };
+  }
+
+  return { decide, recordCycleOutcome, listPositions, acknowledgeRest };
 }

@@ -6,51 +6,54 @@
  * - revocable-write: direct execution, reversible via correction tools;
  * - proposal: persists a handle, never mutates;
  * - confirmation-required (MRTR): first call returns resultType
- *   "input_required" with a durable request; the retry must repeat the SAME
- *   idempotency key + confirm token, else proposal_stale.
+ *   "input_required" with durable requestState; the retry repeats the same
+ *   original call and supplies inputResponses.
  *
  * Every write tool requires a runHandle (health_begin_run). Tool bodies stay
  * thin: they adapt the MCP surface to existing domain services — no health
  * rule lives here.
  */
-import { z } from "zod/v4";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, gte, isNull, lte, sql } from "drizzle-orm";
 
 import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
-import type { Repository } from "../../db/repository.js";
+import { createRepository, type Repository } from "../../db/repository.js";
 import type { ToolContext } from "../../tools/context.js";
-import { createDietLogService, NeedsConfirmationError, StateConflict } from "../../domain/diet-log-service.js";
+import {
+  CandidateSelectionError,
+  createDietLogService,
+  NeedsConfirmationError,
+  resolveConfirmedFoodCandidate,
+  StateConflict,
+} from "../../domain/diet-log-service.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
+import { createProjectionWorker } from "../../domain/projection-worker.js";
+import { createMediaRetrieval } from "../../media/retrieval.js";
 import { createPainCommand } from "../../training/prepared-session.js";
 import { createTrainingService } from "../../training/training-service.js";
 import { createSubstitutionEngine, SubstitutionProposalError } from "../../training/substitution-engine.js";
 import { createReflectionEngine } from "../../training/reflection-engine.js";
+import { createCycleEngine } from "../../training/cycle-engine.js";
+import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
+import type { NutritionEstimateResult } from "../../tools/nutrition-estimate.js";
 import { createRunHandleService } from "../evidence/run-handles.js";
+import {
+  createRequestStateService,
+  RequestStateError,
+  type PendingInputBinding,
+} from "../input/request-state.js";
+import { createWriteCommandService, WriteCommandError } from "../writes/command.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
-const ISO_DATE = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
-
-/** A pending MRTR request: durable until expiresAt, then proposal_stale. */
-interface ConfirmationRequest {
-  toolName: string;
-  runHandle: string;
-  userId: string;
-  idempotencyKey: string;
-  /** What the user must approve, human-readable. */
-  prompt: string;
-  choices: string[];
-  /** Payload the retry re-uses (already validated, never client-supplied). */
-  payload: Record<string, unknown>;
-  createdAt: Date;
-  expiresAt: Date;
-}
+const ISO_DATE = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
 
 export interface ToolInvocation {
   principalUserId: string;
   actor: string;
   args: Record<string, unknown>;
+  requestState?: string;
+  confirmationChoice?: string;
 }
 
 export interface ToolOutcome {
@@ -70,9 +73,8 @@ function complete(structured: Record<string, unknown>): ToolOutcome {
 }
 
 function inputRequired(request: {
-  prompt: string;
-  choices: string[];
-  confirmationId: string;
+  requestState: string;
+  inputRequests: Record<string, unknown>;
   expiresAt: string;
 }): ToolOutcome {
   return {
@@ -91,51 +93,87 @@ function toolError(code: string, message: string): ToolOutcome {
   };
 }
 
-export function createHealthToolCatalog(db: Db, repo: Repository) {
+export function createHealthToolCatalog(
+  db: Db,
+  repo: Repository,
+  options: { toolContext?: ToolContext } = {},
+) {
   const runs = createRunHandleService(db);
   const diet = createDietLogService(db, repo);
-  const dailyState = createDailyStateService(db, repo);
-  const pain = createPainCommand(db);
-  const training = createTrainingService(db);
-  const substitution = createSubstitutionEngine(db);
-  const reflection = createReflectionEngine(db);
-
-  /**
-   * MRTR pending confirmations, keyed by confirmationId. Durable across
-   * processes would want a table; the payload is already validated and the
-   * domain re-validates on retry, so an in-process map with expiry keeps the
-   * P2 surface honest without a new migration.
-   */
-  const pendingConfirmations = new Map<string, ConfirmationRequest>();
+  const requestStates = createRequestStateService(db);
+  const writes = createWriteCommandService(db);
 
   const CONFIRMATION_TTL_MS = 10 * 60_000;
 
-  function makeConfirmation(
+  async function makeConfirmation(
     toolName: string,
+    targetId: string,
     invocation: ToolInvocation,
     prompt: string,
     choices: string[],
     payload: Record<string, unknown>,
-  ): ToolOutcome {
-    const confirmationId = `confirm_${crypto.randomUUID()}`;
-    const now = new Date();
-    pendingConfirmations.set(confirmationId, {
+  ): Promise<ToolOutcome> {
+    const issued = await requestStates.issue({
       toolName,
-      runHandle: String(invocation.args["runHandle"] ?? ""),
+      targetId,
+      runHandle: str(invocation.args, "runHandle"),
       userId: invocation.principalUserId,
-      idempotencyKey: String(invocation.args["idempotencyKey"] ?? crypto.randomUUID()),
+      verifiedActor: invocation.actor,
+      idempotencyKey: str(invocation.args, "idempotencyKey"),
+      arguments: invocation.args,
       prompt,
       choices,
       payload,
-      createdAt: now,
-      expiresAt: new Date(now.getTime() + CONFIRMATION_TTL_MS),
+      ttlMs: CONFIRMATION_TTL_MS,
+    });
+    await runs.recordStep({
+      userId: invocation.principalUserId,
+      runHandle: str(invocation.args, "runHandle"),
+      stage: "confirmation",
+      mcpMethod: "tools/call",
+      mcpName: toolName,
+      aggregateType: "pending_input_request",
+      aggregateId: targetId,
+      arguments: invocation.args,
+      resultSummary: { targetId, expiresAt: issued.expiresAt },
     });
     return inputRequired({
-      prompt,
-      choices,
-      confirmationId,
-      expiresAt: new Date(now.getTime() + CONFIRMATION_TTL_MS).toISOString(),
+      requestState: issued.requestState,
+      inputRequests: issued.inputRequests,
+      expiresAt: issued.expiresAt,
     });
+  }
+
+  function pendingBinding(
+    toolName: string,
+    targetId: string,
+    invocation: ToolInvocation,
+  ): PendingInputBinding {
+    return {
+      userId: invocation.principalUserId,
+      verifiedActor: invocation.actor,
+      runHandle: str(invocation.args, "runHandle"),
+      toolName,
+      targetId,
+      idempotencyKey: str(invocation.args, "idempotencyKey"),
+      arguments: invocation.args,
+    };
+  }
+
+  function writeInput(invocation: ToolInvocation, toolName: string, scopeKey: string) {
+    const runHandle = invocation.args["runHandle"];
+    if (typeof runHandle !== "string" || runHandle.trim() === "") {
+      throw new Error("run_handle_required: call health_begin_run first; writes without a run are not accepted");
+    }
+    return {
+      userId: invocation.principalUserId,
+      verifiedActor: invocation.actor,
+      runHandle: runHandle.trim(),
+      toolName,
+      scopeKey,
+      idempotencyKey: str(invocation.args, "idempotencyKey"),
+      arguments: invocation.args,
+    };
   }
 
   /** Require a valid run handle for write tools; records the step. */
@@ -181,28 +219,18 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
     return new Date().toISOString().slice(0, 10);
   }
 
-  let sharedContext: ToolContext | null = null;
+  function addDays(date: string, days: number): string {
+    const value = new Date(`${date}T00:00:00.000Z`);
+    value.setUTCDate(value.getUTCDate() + days);
+    return value.toISOString().slice(0, 10);
+  }
 
-  /**
-   * One shared ToolContext per server process (the STDIO server is
-   * single-user by binding). The nutrition estimator needs the meal catalog,
-   * which only initToolContext loads.
-   */
   async function buildToolContext(userId: string): Promise<ToolContext> {
-    if (sharedContext && sharedContext.userId === userId) return sharedContext;
-    const { initToolContext } = await import("../../tools/context.js");
-    sharedContext = await initToolContext({
-      externalUserId: `mcp-bound:${userId}`,
-      locale: "zh",
-      databaseUrl: process.env.DATABASE_URL ?? "postgres://compass:compass@localhost:5433/compass_health",
-      timezone: "Asia/Shanghai",
-    });
-    if (sharedContext.userId !== userId) {
-      // The bound user already exists (principal resolver provisioned it);
-      // initToolContext found a different row only if the binding drifted.
+    const context = options.toolContext;
+    if (!context || context.userId !== userId) {
       throw new Error("tool context user mismatch");
     }
-    return sharedContext;
+    return context;
   }
 
   const toolDefs: Array<{
@@ -215,28 +243,32 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
     {
       name: "health_begin_run",
       description: "Start a tracked health journey. Returns the runHandle every write tool requires.",
-      risk: "read-only",
+      risk: "state-change",
       inputSchema: {
         type: "object",
         properties: {
           objective: { type: "string", description: "What this journey tries to do (one line)." },
           inputChannel: { type: "string", enum: ["gpt-live", "xiaomi-voice", "mcp", "web"] },
+          idempotencyKey: { type: "string" },
         },
-        required: ["objective"],
+        required: ["objective", "idempotencyKey"],
       },
       execute: async (inv) => {
-        return complete(await runs.beginRun({
+        const result = await writes.beginRun({
           userId: inv.principalUserId,
           objective: str(inv.args, "objective"),
           inputChannel: optStr(inv.args, "inputChannel") ?? "mcp",
-          actor: inv.actor,
-        }));
+          verifiedActor: inv.actor,
+          idempotencyKey: str(inv.args, "idempotencyKey"),
+          arguments: inv.args,
+        });
+        return complete(result.response);
       },
     },
     {
       name: "health_end_run",
       description: "Close a run with its outcome and the user's acceptance signal.",
-      risk: "read-only",
+      risk: "state-change",
       inputSchema: {
         type: "object",
         properties: {
@@ -244,26 +276,368 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           outcome: { type: "string", enum: ["completed", "failed", "abandoned"] },
           responseSummary: { type: "string" },
           userAccepted: { type: "boolean" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "outcome"],
+        required: ["runHandle", "outcome", "idempotencyKey"],
       },
       execute: async (inv) => {
         const outcome = str(inv.args, "outcome") as "completed" | "failed" | "abandoned";
         if (!["completed", "failed", "abandoned"].includes(outcome)) {
           return toolError("validation_failed", "outcome must be completed|failed|abandoned");
         }
-        return complete(await runs.endRun({
-          userId: inv.principalUserId,
-          runHandle: str(inv.args, "runHandle"),
-          outcome,
-          responseSummary: optStr(inv.args, "responseSummary"),
-          userAccepted: inv.args["userAccepted"] === true,
-        }));
+        const runHandle = str(inv.args, "runHandle");
+        const result = await writes.execute(
+          writeInput(inv, "health_end_run", runHandle),
+          async (tx) => {
+            const [updated] = await tx.update(schema.agentRuns).set({
+              outcome,
+              finishedAt: new Date(),
+              updatedAt: new Date(),
+              ...(optStr(inv.args, "responseSummary")
+                ? { responseSummary: optStr(inv.args, "responseSummary")!.slice(0, 1000) }
+                : {}),
+            }).where(and(
+              eq(schema.agentRuns.id, runHandle),
+              eq(schema.agentRuns.userId, inv.principalUserId),
+              eq(schema.agentRuns.outcome, "running"),
+            )).returning();
+            if (!updated) throw new WriteCommandError("run_handle_invalid", "run is already closed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "user_decision",
+              aggregateId: runHandle,
+              eventType: "agent.run_ended",
+              payloadJson: { outcome, journeyId: updated.journeyId },
+            }).returning({ id: schema.outboxEvents.id });
+            const [count] = await tx.select({ n: sql<number>`count(*)::int` })
+              .from(schema.agentRunSteps)
+              .where(eq(schema.agentRunSteps.runId, runHandle));
+            if (!outbox) throw new Error("run end outbox insert failed");
+            return {
+              response: { runHandle, outcome: updated.outcome, stepCount: (count?.n ?? 0) + 1 },
+              factRefs: [{ type: "agent_run", id: runHandle }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
+      },
+    },
+    {
+      name: "health_generate_diet_plan",
+      description: "Generate and persist a seven-day diet plan through the existing smart meal planner.",
+      risk: "state-change",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runHandle: { type: "string" },
+          startDate: ISO_DATE,
+          idempotencyKey: { type: "string" },
+        },
+        required: ["runHandle", "idempotencyKey"],
+      },
+      execute: async (inv) => {
+        const ctx = await buildToolContext(inv.principalUserId);
+        const startDate = optStr(inv.args, "startDate") ?? addDays(today(), 1);
+        const endDate = addDays(startDate, 6);
+        const result = await writes.execute(
+          writeInput(inv, "health_generate_diet_plan", startDate),
+          async (tx) => {
+            const txDb = tx as unknown as Db;
+            const txRepo = createRepository(txDb);
+            const txCtx: ToolContext = { ...ctx, db: txDb, repo: txRepo };
+            const generated = await handleSmartGenerateMealPlan(txCtx, { startDate });
+            const rows = await tx.select().from(schema.mealPlanEntries)
+              .where(and(
+                eq(schema.mealPlanEntries.userId, inv.principalUserId),
+                gte(schema.mealPlanEntries.planDate, startDate),
+                lte(schema.mealPlanEntries.planDate, endDate),
+              ));
+            const factRefs: Array<{ type: string; id: string }> = rows.map((row) => ({
+              type: "meal_plan_entry",
+              id: row.id,
+            }));
+            if (factRefs.length === 0) {
+              const [decision] = await tx.insert(schema.userDecisionEvents).values({
+                userId: inv.principalUserId,
+                decisionType: "modified",
+                subjectJson: { type: "diet_plan_generation", startDate, status: generated.status },
+              }).returning();
+              if (!decision) throw new Error("diet plan attempt fact insert failed");
+              factRefs.push({ type: "user_decision", id: decision.id });
+            }
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "user_decision",
+              aggregateId: startDate,
+              eventType: "diet.plan_generated",
+              payloadJson: { observedOn: startDate, endDate, status: generated.status, entries: rows.length },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("diet plan outbox insert failed");
+            return {
+              response: {
+                startDate,
+                endDate,
+                entryCount: rows.length,
+                generation: generated,
+              } as unknown as Record<string, unknown>,
+              factRefs,
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
+      },
+    },
+    {
+      name: "health_get_diet_plan",
+      description: "Read persisted diet-plan entries for a date range.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: {
+          startDate: ISO_DATE,
+          endDate: ISO_DATE,
+          runHandle: { type: "string" },
+        },
+        required: ["startDate"],
+      },
+      execute: async (inv) => {
+        const startDate = str(inv.args, "startDate");
+        const endDate = optStr(inv.args, "endDate") ?? addDays(startDate, 6);
+        const entries = await db.select().from(schema.mealPlanEntries)
+          .where(and(
+            eq(schema.mealPlanEntries.userId, inv.principalUserId),
+            gte(schema.mealPlanEntries.planDate, startDate),
+            lte(schema.mealPlanEntries.planDate, endDate),
+          )).orderBy(schema.mealPlanEntries.planDate, schema.mealPlanEntries.mealType);
+        const runHandle = optStr(inv.args, "runHandle");
+        if (runHandle) {
+          await runs.recordStep({
+            userId: inv.principalUserId,
+            runHandle,
+            stage: "tool_call",
+            mcpMethod: "tools/call",
+            mcpName: "health_get_diet_plan",
+            arguments: inv.args,
+            resultSummary: { startDate, endDate, entryCount: entries.length },
+          });
+        }
+        return complete({ startDate, endDate, entries });
+      },
+    },
+    {
+      name: "health_search_training_media",
+      description: "Search safe, usable training-video segments without exposing local file paths.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: {
+          movementPattern: { type: "string" },
+          bodyPart: { type: "string" },
+          category: { type: "string" },
+          text: { type: "string" },
+          limit: { type: "number" },
+        },
+      },
+      execute: async (inv) => {
+        const segments = await createMediaRetrieval(db).search({
+          ...(optStr(inv.args, "movementPattern") ? { movementPattern: optStr(inv.args, "movementPattern") } : {}),
+          ...(optStr(inv.args, "bodyPart") ? { bodyPart: optStr(inv.args, "bodyPart") } : {}),
+          ...(optStr(inv.args, "category") ? { category: optStr(inv.args, "category") } : {}),
+          ...(optStr(inv.args, "text") ? { text: optStr(inv.args, "text") } : {}),
+          ...(optNum(inv.args, "limit") ? { limit: Math.min(50, Math.max(1, Math.round(optNum(inv.args, "limit")!))) } : {}),
+        });
+        return complete({ segments });
+      },
+    },
+    {
+      name: "health_record_media_feedback",
+      description: "Record whether a training-video segment was helpful.",
+      risk: "revocable-write",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runHandle: { type: "string" },
+          segmentId: { type: "string" },
+          helpful: { type: "boolean" },
+          note: { type: "string" },
+          idempotencyKey: { type: "string" },
+        },
+        required: ["runHandle", "segmentId", "helpful", "idempotencyKey"],
+      },
+      execute: async (inv) => {
+        const segmentId = str(inv.args, "segmentId");
+        const helpful = inv.args["helpful"] === true;
+        const result = await writes.execute(
+          writeInput(inv, "health_record_media_feedback", segmentId),
+          async (tx) => {
+            const [segment] = await tx.select().from(schema.videoSegments)
+              .where(eq(schema.videoSegments.id, segmentId)).limit(1);
+            if (!segment) throw new RangeError("media segment not found");
+            const feedback = await createMediaRetrieval(tx as unknown as Db)
+              .recordFeedback(inv.principalUserId, segmentId, helpful, optStr(inv.args, "note"));
+            const [readBack] = await tx.select().from(schema.segmentFeedback)
+              .where(and(
+                eq(schema.segmentFeedback.id, feedback.feedbackId),
+                eq(schema.segmentFeedback.userId, inv.principalUserId),
+              )).limit(1);
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "user_decision",
+              aggregateId: feedback.feedbackId,
+              eventType: "media.feedback_recorded",
+              payloadJson: { observedOn: today(), segmentId, helpful },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!readBack || !outbox) throw new Error("media feedback read-back failed");
+            return {
+              response: { feedbackId: readBack.id, segmentId, helpful },
+              factRefs: [{ type: "media_feedback", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
+      },
+    },
+    {
+      name: "health_get_projection_diagnostics",
+      description: "Read daily-state projection, checkpoint, pending outbox, and dead-letter diagnostics.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { date: ISO_DATE },
+      },
+      execute: async (inv) => complete(await createProjectionWorker(db, repo)
+        .getDiagnostics(inv.principalUserId, optStr(inv.args, "date") ?? today())),
+    },
+    {
+      name: "health_replay_projection",
+      description: "Requeue this user's dead letters and rebuild one daily-state projection.",
+      risk: "state-change",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runHandle: { type: "string" },
+          date: ISO_DATE,
+          idempotencyKey: { type: "string" },
+        },
+        required: ["runHandle", "idempotencyKey"],
+      },
+      execute: async (inv) => {
+        const date = optStr(inv.args, "date") ?? today();
+        const result = await writes.execute(
+          writeInput(inv, "health_replay_projection", date),
+          async (tx) => {
+            const txDb = tx as unknown as Db;
+            const worker = createProjectionWorker(txDb, createRepository(txDb));
+            const revived = await worker.replayDeadLetters(inv.principalUserId);
+            await worker.rebuildUserProjection(inv.principalUserId, date);
+            const [projection] = await tx.select().from(schema.dailyHealthStateProjection)
+              .where(and(
+                eq(schema.dailyHealthStateProjection.userId, inv.principalUserId),
+                eq(schema.dailyHealthStateProjection.stateDate, date),
+              )).limit(1);
+            if (!projection) throw new Error("projection replay read-back failed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "user_decision",
+              aggregateId: `${inv.principalUserId}:${date}`,
+              eventType: "projection.replayed",
+              payloadJson: { observedOn: date, revived },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("projection replay outbox failed");
+            return {
+              response: { date, revived, revision: projection.revision, status: projection.projectionStatus },
+              factRefs: [{ type: "daily_state_projection", id: `${inv.principalUserId}:${date}` }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
+      },
+    },
+    {
+      name: "health_get_run_evidence",
+      description: "Read the redacted evidence timeline for an owned runHandle.",
+      risk: "read-only",
+      inputSchema: {
+        type: "object",
+        properties: { runHandle: { type: "string" } },
+        required: ["runHandle"],
+      },
+      execute: async (inv) => complete(await runs.getRun(
+        inv.principalUserId,
+        str(inv.args, "runHandle"),
+      )),
+    },
+    {
+      name: "health_acknowledge_rest",
+      description: "Acknowledge a REST recommendation and advance the explicit training cycle.",
+      risk: "state-change",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runHandle: { type: "string" },
+          date: ISO_DATE,
+          reason: { type: "string" },
+          idempotencyKey: { type: "string" },
+        },
+        required: ["runHandle", "idempotencyKey"],
+      },
+      execute: async (inv) => {
+        const date = optStr(inv.args, "date") ?? today();
+        const result = await writes.execute(
+          writeInput(inv, "health_acknowledge_rest", date),
+          async (tx) => {
+            const acknowledged = await createCycleEngine(tx as unknown as Db).acknowledgeRest({
+              userId: inv.principalUserId,
+              ...(optStr(inv.args, "reason") ? { reasonCode: optStr(inv.args, "reason") } : {}),
+              onDate: date,
+            });
+            const [readBack] = await tx.select().from(schema.trainingCyclePositions)
+              .where(and(
+                eq(schema.trainingCyclePositions.cycleInstanceId, acknowledged.cycleInstanceId),
+                eq(schema.trainingCyclePositions.positionIndex, acknowledged.positionIndex),
+                eq(schema.trainingCyclePositions.userId, inv.principalUserId),
+              )).limit(1);
+            const [userDecision] = await tx.insert(schema.userDecisionEvents).values({
+              userId: inv.principalUserId,
+              decisionType: "accepted",
+              subjectJson: { type: "rest_acknowledgement", date, reasonCodes: acknowledged.reasonCodes },
+            }).returning();
+            if (!readBack || !userDecision) throw new Error("rest acknowledgement read-back failed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "user_decision",
+              aggregateId: userDecision.id,
+              eventType: "training.rest_acknowledged",
+              payloadJson: { observedOn: date, cycleInstanceId: acknowledged.cycleInstanceId },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("rest acknowledgement outbox failed");
+            return {
+              response: {
+                acknowledged: true,
+                date,
+                cycleInstanceId: acknowledged.cycleInstanceId,
+                positionIndex: acknowledged.positionIndex,
+                status: readBack.status,
+                reasonCodes: acknowledged.reasonCodes,
+              },
+              factRefs: [
+                { type: "training_cycle_position", id: readBack.id },
+                { type: "user_decision", id: userDecision.id },
+              ],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
       name: "health_log_meal",
-      description: "Log a meal by description. Ambiguous items return input_required with candidate choices; retry with confirmToken + same idempotencyKey.",
+      description: "Log a meal by description. Ambiguous items return standard MCP input_required candidate choices.",
       risk: "revocable-write",
       inputSchema: {
         type: "object",
@@ -274,43 +648,75 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           description: { type: "string", description: "Free-text meal description." },
           idempotencyKey: { type: "string", description: "Stable key for retries." },
           expectedRevision: { type: "number" },
-          confirmToken: { type: "string", description: "confirmationId from a previous input_required." },
-          choice: { type: "string", description: "User's chosen candidate (when confirming)." },
         },
-        required: ["runHandle", "mealType", "description"],
+        required: ["runHandle", "mealType", "description", "idempotencyKey"],
       },
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_log_meal");
         const ctx = await buildToolContext(inv.principalUserId);
         try {
-          const idempotencyKey = optStr(inv.args, "idempotencyKey") ?? `mcp-meal-${crypto.randomUUID()}`;
-          const confirmToken = optStr(inv.args, "confirmToken");
-          const choice = optStr(inv.args, "choice");
+          const idempotencyKey = str(inv.args, "idempotencyKey");
 
           // MRTR retry path: apply the user's confirmed resolution.
-          if (confirmToken !== undefined) {
-            const pending = pendingConfirmations.get(confirmToken);
-            pendingConfirmations.delete(confirmToken);
-            if (!pending || pending.userId !== inv.principalUserId || pending.toolName !== "health_log_meal") {
-              return toolError("proposal_stale", "confirmation unknown, expired, or not yours — start again");
-            }
-            if (pending.expiresAt < new Date()) {
-              return toolError("proposal_stale", "confirmation expired — start again");
-            }
-            const payload = pending.payload as {
-              date: string; mealType: string; description: string;
-              overrideEstimate?: Record<string, unknown>;
-            };
-            const { log, replayed } = await diet.commit(ctx, {
-              userId: inv.principalUserId,
-              logDate: payload.date,
-              mealType: payload.mealType,
-              description: payload.description,
-              idempotencyKey: pending.idempotencyKey,
-              ...(payload.overrideEstimate ? { overrideEstimate: payload.overrideEstimate as never } : {}),
-            });
-            await dailyState.persistDailyProjection(inv.principalUserId, payload.date, "Asia/Shanghai");
-            return complete({ dietLogId: log.id, replayed, caloriesKcal: log.caloriesKcal, confirmed: choice ?? "user-confirmed" });
+          if (inv.requestState !== undefined) {
+            const targetId = `diet:${optStr(inv.args, "date") ?? today()}:${str(inv.args, "mealType")}`;
+            const committed = await requestStates.consume(
+              inv.requestState,
+              pendingBinding("health_log_meal", targetId, inv),
+              async (tx, pending) => {
+                const payload = pending.payloadJson as {
+                  date: string;
+                  mealType: string;
+                  description: string;
+                  estimate: NutritionEstimateResult;
+                };
+                const txDb = tx as unknown as Db;
+                const txCtx: ToolContext = { ...ctx, db: txDb };
+                const resolved = await resolveConfirmedFoodCandidate(
+                  txCtx,
+                  payload.estimate,
+                  inv.confirmationChoice,
+                );
+                return writes.executeInTransaction(
+                  tx,
+                  writeInput(inv, "health_log_meal", targetId),
+                  async (writeTx) => {
+                    const writeDb = writeTx as unknown as Db;
+                    const writeCtx: ToolContext = { ...txCtx, db: writeDb };
+                    const result = await createDietLogService(writeDb, repo).commit(writeCtx, {
+                      userId: inv.principalUserId,
+                      logDate: payload.date,
+                      mealType: payload.mealType,
+                      description: payload.description,
+                      idempotencyKey,
+                      overrideEstimate: resolved,
+                    });
+                    const [readBack] = await writeTx.select().from(schema.dietLogs)
+                      .where(and(
+                        eq(schema.dietLogs.id, result.log.id),
+                        eq(schema.dietLogs.userId, inv.principalUserId),
+                      )).limit(1);
+                    const outbox = await writeTx.select({ id: schema.outboxEvents.id })
+                      .from(schema.outboxEvents)
+                      .where(and(
+                        eq(schema.outboxEvents.userId, inv.principalUserId),
+                        eq(schema.outboxEvents.aggregateId, result.log.id),
+                      ));
+                    if (!readBack || outbox.length === 0) throw new Error("diet write read-back failed");
+                    return {
+                      response: {
+                        dietLogId: readBack.id,
+                        caloriesKcal: readBack.caloriesKcal,
+                        confirmed: inv.confirmationChoice,
+                      },
+                      factRefs: [{ type: "diet_log", id: readBack.id }],
+                      outboxEventIds: outbox.map((event) => event.id),
+                    };
+                  },
+                );
+              },
+            );
+            return complete(committed.response);
           }
 
           // First call: preview; ambiguous -> MRTR.
@@ -321,41 +727,82 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           });
           if (previewResult.status === "needs_confirmation") {
             const estimate = previewResult.estimate as {
-              needsConfirmation?: Array<{ name?: string; candidates?: string[] }>;
-              unmatched?: Array<{ name?: string }>;
+              needsConfirmation?: Array<{ segment?: string; candidates?: Array<{ slug?: string; label?: string }> }>;
+              unmatched?: Array<{ segment?: string }>;
             };
             const promptItems = [
-              ...(estimate.needsConfirmation ?? []).map((n) => n.name ?? "item"),
-              ...(estimate.unmatched ?? []).map((n) => `${n.name ?? "item"} (未匹配)`,
+              ...(estimate.needsConfirmation ?? []).map((n) => n.segment ?? "item"),
+              ...(estimate.unmatched ?? []).map((n) => `${n.segment ?? "item"} (未匹配)`,
               ),
             ];
-            return makeConfirmation(
-              "health_log_meal", inv,
+            const date = optStr(inv.args, "date") ?? today();
+            const mealType = str(inv.args, "mealType");
+            return await makeConfirmation(
+              "health_log_meal", `diet:${date}:${mealType}`, inv,
               `这些食材需要确认：${promptItems.join("、") || "份量不确定"}`,
-              (estimate.needsConfirmation ?? []).flatMap((n) => n.candidates ?? []).slice(0, 5),
+              (estimate.needsConfirmation ?? [])
+                .flatMap((n) => n.candidates ?? [])
+                .map((candidate) => candidate.slug ?? candidate.label ?? "")
+                .filter((candidate) => candidate !== "")
+                .slice(0, 5),
               {
-                date: optStr(inv.args, "date") ?? today(),
-                mealType: str(inv.args, "mealType"),
+                date,
+                mealType,
                 description: str(inv.args, "description"),
+                estimate: previewResult.estimate as unknown as Record<string, unknown>,
               },
             );
           }
 
           // Clean estimate -> commit directly.
-          const { log, replayed } = await diet.commit(ctx, {
-            userId: inv.principalUserId,
-            logDate: optStr(inv.args, "date") ?? today(),
-            mealType: str(inv.args, "mealType"),
-            description: str(inv.args, "description"),
-            idempotencyKey,
-            ...(optNum(inv.args, "expectedRevision") !== undefined
-              ? { expectedRevision: optNum(inv.args, "expectedRevision") } : {}),
-          });
-          await dailyState.persistDailyProjection(inv.principalUserId, log.logDate, "Asia/Shanghai");
-          return complete({ dietLogId: log.id, replayed, caloriesKcal: log.caloriesKcal });
+          const date = optStr(inv.args, "date") ?? today();
+          const mealType = str(inv.args, "mealType");
+          const targetId = `diet:${date}:${mealType}`;
+          const committed = await writes.execute(
+            writeInput(inv, "health_log_meal", targetId),
+            async (tx) => {
+              const txDb = tx as unknown as Db;
+              const txCtx: ToolContext = { ...ctx, db: txDb };
+              const result = await createDietLogService(txDb, repo).commit(txCtx, {
+                userId: inv.principalUserId,
+                logDate: date,
+                mealType,
+                description: str(inv.args, "description"),
+                idempotencyKey,
+                ...(optNum(inv.args, "expectedRevision") !== undefined
+                  ? { expectedRevision: optNum(inv.args, "expectedRevision") } : {}),
+              });
+              const [readBack] = await tx.select().from(schema.dietLogs)
+                .where(and(
+                  eq(schema.dietLogs.id, result.log.id),
+                  eq(schema.dietLogs.userId, inv.principalUserId),
+                )).limit(1);
+              const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+                .where(and(
+                  eq(schema.outboxEvents.userId, inv.principalUserId),
+                  eq(schema.outboxEvents.aggregateId, result.log.id),
+                ));
+              if (!readBack || outbox.length === 0) throw new Error("diet write read-back failed");
+              return {
+                response: { dietLogId: readBack.id, caloriesKcal: readBack.caloriesKcal },
+                factRefs: [{ type: "diet_log", id: readBack.id }],
+                outboxEventIds: outbox.map((event) => event.id),
+              };
+            },
+          );
+          return complete(committed.response);
         } catch (error) {
           if (error instanceof NeedsConfirmationError) {
-            return makeConfirmation("health_log_meal", inv, String(error.message), [], {});
+            const date = optStr(inv.args, "date") ?? today();
+            const mealType = str(inv.args, "mealType");
+            return await makeConfirmation(
+              "health_log_meal",
+              `diet:${date}:${mealType}`,
+              inv,
+              String(error.message),
+              [],
+              { date, mealType, description: str(inv.args, "description"), estimate: error.estimate as unknown as Record<string, unknown> },
+            );
           }
           if (error instanceof StateConflict) {
             return toolError("state_conflict", error.message);
@@ -378,21 +825,48 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           reason: { type: "string" },
           idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "dietLogId"],
+        required: ["runHandle", "dietLogId", "idempotencyKey"],
       },
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_correct_meal");
         const ctx = await buildToolContext(inv.principalUserId);
-        const result = await diet.correct(ctx, {
-            userId: inv.principalUserId,
-            originalLogId: str(inv.args, "dietLogId"),
-            ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
-            ...(optStr(inv.args, "mealType") ? { mealType: optStr(inv.args, "mealType") } : {}),
-            reason: optStr(inv.args, "reason") ?? "mcp correction",
-            idempotencyKey: optStr(inv.args, "idempotencyKey"),
-          });
-        await dailyState.persistDailyProjection(inv.principalUserId, result.revised.logDate, "Asia/Shanghai");
-        return complete({ correctedLogId: result.revised.id, supersededLogId: result.original.id, caloriesKcal: result.revised.caloriesKcal });
+        const originalLogId = str(inv.args, "dietLogId");
+        const result = await writes.execute(
+          writeInput(inv, "health_correct_meal", originalLogId),
+          async (tx) => {
+            const txDb = tx as unknown as Db;
+            const txCtx: ToolContext = { ...ctx, db: txDb };
+            const corrected = await createDietLogService(txDb, repo).correct(txCtx, {
+              userId: inv.principalUserId,
+              originalLogId,
+              ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
+              ...(optStr(inv.args, "mealType") ? { mealType: optStr(inv.args, "mealType") } : {}),
+              reason: optStr(inv.args, "reason") ?? "mcp correction",
+              idempotencyKey: str(inv.args, "idempotencyKey"),
+            });
+            const [readBack] = await tx.select().from(schema.dietLogs)
+              .where(and(
+                eq(schema.dietLogs.id, corrected.revised.id),
+                eq(schema.dietLogs.userId, inv.principalUserId),
+              )).limit(1);
+            const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+              .where(and(
+                eq(schema.outboxEvents.userId, inv.principalUserId),
+                eq(schema.outboxEvents.aggregateId, corrected.revised.id),
+              ));
+            if (!readBack || outbox.length === 0) throw new Error("diet correction read-back failed");
+            return {
+              response: {
+                correctedLogId: readBack.id,
+                supersededLogId: corrected.original.id,
+                caloriesKcal: readBack.caloriesKcal,
+              },
+              factRefs: [{ type: "diet_log", id: readBack.id }],
+              outboxEventIds: outbox.map((event) => event.id),
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -405,21 +879,44 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           runHandle: { type: "string" },
           amountMl: { type: "number" },
           date: ISO_DATE,
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "amountMl"],
+        required: ["runHandle", "amountMl", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_record_water");
         const amount = optNum(inv.args, "amountMl");
         if (amount === undefined || amount <= 0 || amount > 10000) {
           return toolError("validation_failed", "amountMl must be 1..10000");
         }
         const date = optStr(inv.args, "date") ?? today();
-        const [log] = await db.insert(schema.waterLogs).values({
-          userId: inv.principalUserId, logDate: date, amountMl: Math.round(amount),
-        }).returning();
-        await dailyState.persistDailyProjection(inv.principalUserId, date, "Asia/Shanghai");
-        return complete({ waterLogId: log!.id, amountMl: log!.amountMl });
+        const result = await writes.execute(writeInput(inv, "health_record_water", date), async (tx) => {
+          const [log] = await tx.insert(schema.waterLogs).values({
+            userId: inv.principalUserId,
+            logDate: date,
+            amountMl: Math.round(amount),
+            source: `mcp:${inv.actor}`,
+          }).returning();
+          if (!log) throw new Error("water insert returned no row");
+          const [outbox] = await tx.insert(schema.outboxEvents).values({
+            userId: inv.principalUserId,
+            aggregateType: "water_log",
+            aggregateId: log.id,
+            eventType: "health.water_recorded",
+            payloadJson: { observedOn: date },
+          }).returning({ id: schema.outboxEvents.id });
+          const [readBack] = await tx.select().from(schema.waterLogs)
+            .where(and(
+              eq(schema.waterLogs.id, log.id),
+              eq(schema.waterLogs.userId, inv.principalUserId),
+            )).limit(1);
+          if (!outbox || !readBack) throw new Error("water write read-back failed");
+          return {
+            response: { waterLogId: readBack.id, amountMl: readBack.amountMl },
+            factRefs: [{ type: "water_log", id: readBack.id }],
+            outboxEventIds: [outbox.id],
+          };
+        });
+        return complete(result.response);
       },
     },
     {
@@ -434,25 +931,48 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           durationMinutes: { type: "number" },
           caloriesBurnedKcal: { type: "number" },
           date: ISO_DATE,
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "activityType", "durationMinutes"],
+        required: ["runHandle", "activityType", "durationMinutes", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_record_activity");
         const duration = optNum(inv.args, "durationMinutes");
         if (duration === undefined || duration <= 0 || duration > 600) {
           return toolError("validation_failed", "durationMinutes must be 1..600");
         }
         const date = optStr(inv.args, "date") ?? today();
-        const [log] = await db.insert(schema.exerciseLogs).values({
-          userId: inv.principalUserId,
-          logDate: date,
-          activityType: str(inv.args, "activityType"),
-          durationMinutes: Math.round(duration),
-          caloriesBurnedKcal: optNum(inv.args, "caloriesBurnedKcal") ?? 0,
-        }).returning();
-        await dailyState.persistDailyProjection(inv.principalUserId, date, "Asia/Shanghai");
-        return complete({ activityId: log!.id });
+        const result = await writes.execute(
+          writeInput(inv, "health_record_activity", date),
+          async (tx) => {
+            const [log] = await tx.insert(schema.exerciseLogs).values({
+              userId: inv.principalUserId,
+              logDate: date,
+              activityType: str(inv.args, "activityType"),
+              durationMinutes: Math.round(duration),
+              caloriesBurnedKcal: optNum(inv.args, "caloriesBurnedKcal") ?? 0,
+            }).returning();
+            if (!log) throw new Error("activity insert returned no row");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "activity_log",
+              aggregateId: log.id,
+              eventType: "health.activity_recorded",
+              payloadJson: { observedOn: date },
+            }).returning({ id: schema.outboxEvents.id });
+            const [readBack] = await tx.select().from(schema.exerciseLogs)
+              .where(and(
+                eq(schema.exerciseLogs.id, log.id),
+                eq(schema.exerciseLogs.userId, inv.principalUserId),
+              )).limit(1);
+            if (!outbox || !readBack) throw new Error("activity write read-back failed");
+            return {
+              response: { activityId: readBack.id, durationMinutes: readBack.durationMinutes },
+              factRefs: [{ type: "activity_log", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -465,22 +985,48 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           runHandle: { type: "string" },
           hours: { type: "number" },
           date: ISO_DATE,
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "hours"],
+        required: ["runHandle", "hours", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_record_sleep");
         const hours = optNum(inv.args, "hours");
         if (hours === undefined || hours < 0 || hours > 24) {
           return toolError("validation_failed", "hours must be 0..24");
         }
         const date = optStr(inv.args, "date") ?? today();
-        const result = await dailyState.recordObservation({
-          userId: inv.principalUserId, observedOn: date, kind: "sleep",
-          valueJson: { hours }, source: "mcp",
-        }, { commandType: "mcp.record_sleep", aggregateType: "observation" });
-        await dailyState.persistDailyProjection(inv.principalUserId, date, "Asia/Shanghai");
-        return complete({ observationId: result.eventId, hours });
+        const result = await writes.execute(
+          writeInput(inv, "health_record_sleep", date),
+          async (tx) => {
+            const [observation] = await tx.insert(schema.healthObservationEvents).values({
+              userId: inv.principalUserId,
+              observedOn: date,
+              kind: "sleep",
+              valueJson: { hours },
+              source: `mcp:${inv.actor}`,
+            }).returning();
+            if (!observation) throw new Error("sleep observation insert returned no row");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "observation",
+              aggregateId: observation.id,
+              eventType: "health.sleep_recorded",
+              payloadJson: { observedOn: date },
+            }).returning({ id: schema.outboxEvents.id });
+            const [readBack] = await tx.select().from(schema.healthObservationEvents)
+              .where(and(
+                eq(schema.healthObservationEvents.id, observation.id),
+                eq(schema.healthObservationEvents.userId, inv.principalUserId),
+              )).limit(1);
+            if (!outbox || !readBack) throw new Error("sleep write read-back failed");
+            return {
+              response: { observationId: readBack.id, hours },
+              factRefs: [{ type: "observation", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -495,23 +1041,53 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           scope: { type: "string", enum: ["general", "local"] },
           feedback: { type: "string" },
           date: ISO_DATE,
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "level", "scope"],
+        required: ["runHandle", "level", "scope", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_record_fatigue");
         const level = optNum(inv.args, "level");
         if (level === undefined || level < 1 || level > 5) {
           return toolError("validation_failed", "level must be 1..5 (structured fatigue is required)");
         }
         const date = optStr(inv.args, "date") ?? today();
-        const result = await dailyState.recordObservation({
-          userId: inv.principalUserId, observedOn: date, kind: "fatigue",
-          valueJson: { level, scope: str(inv.args, "scope"), ...(optStr(inv.args, "feedback") ? { feedback: optStr(inv.args, "feedback") } : {}) },
-          source: "mcp",
-        }, { commandType: "mcp.record_fatigue", aggregateType: "observation" });
-        await dailyState.persistDailyProjection(inv.principalUserId, date, "Asia/Shanghai");
-        return complete({ observationId: result.eventId, level, scope: str(inv.args, "scope") });
+        const valueJson = {
+          level,
+          scope: str(inv.args, "scope"),
+          ...(optStr(inv.args, "feedback") ? { feedback: optStr(inv.args, "feedback") } : {}),
+        };
+        const result = await writes.execute(
+          writeInput(inv, "health_record_fatigue", date),
+          async (tx) => {
+            const [observation] = await tx.insert(schema.healthObservationEvents).values({
+              userId: inv.principalUserId,
+              observedOn: date,
+              kind: "fatigue",
+              valueJson,
+              source: `mcp:${inv.actor}`,
+            }).returning();
+            if (!observation) throw new Error("fatigue observation insert returned no row");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "observation",
+              aggregateId: observation.id,
+              eventType: "health.fatigue_recorded",
+              payloadJson: { observedOn: date },
+            }).returning({ id: schema.outboxEvents.id });
+            const [readBack] = await tx.select().from(schema.healthObservationEvents)
+              .where(and(
+                eq(schema.healthObservationEvents.id, observation.id),
+                eq(schema.healthObservationEvents.userId, inv.principalUserId),
+              )).limit(1);
+            if (!outbox || !readBack) throw new Error("fatigue write read-back failed");
+            return {
+              response: { observationId: readBack.id, level, scope: valueJson.scope },
+              factRefs: [{ type: "observation", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -526,21 +1102,51 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           severity: { type: "string", enum: ["mild", "sharp", "worsening", "unstable", "unknown"] },
           description: { type: "string" },
           date: ISO_DATE,
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "bodyPart", "severity"],
+        required: ["runHandle", "bodyPart", "severity", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_report_pain");
         const date = optStr(inv.args, "date") ?? today();
-        const result = await pain.execute({
-          userId: inv.principalUserId,
-          observedOn: date,
-          bodyPart: str(inv.args, "bodyPart"),
-          severityHint: str(inv.args, "severity") as never,
-          ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
-        });
-        await dailyState.persistDailyProjection(inv.principalUserId, date, "Asia/Shanghai");
-        return complete(result as unknown as Record<string, unknown>);
+        const result = await writes.execute(
+          writeInput(inv, "health_report_pain", date),
+          async (tx) => {
+            const command = await createPainCommand(tx as unknown as Db).execute({
+              userId: inv.principalUserId,
+              observedOn: date,
+              bodyPart: str(inv.args, "bodyPart"),
+              severityHint: str(inv.args, "severity") as never,
+              ...(optStr(inv.args, "description") ? { description: optStr(inv.args, "description") } : {}),
+            });
+            const [constraint] = await tx.select().from(schema.healthConstraints)
+              .where(and(
+                eq(schema.healthConstraints.id, command.constraintId),
+                eq(schema.healthConstraints.userId, inv.principalUserId),
+              )).limit(1);
+            const [observation] = await tx.select().from(schema.healthObservationEvents)
+              .where(and(
+                eq(schema.healthObservationEvents.id, command.observationId),
+                eq(schema.healthObservationEvents.userId, inv.principalUserId),
+              )).limit(1);
+            const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+              .where(and(
+                eq(schema.outboxEvents.userId, inv.principalUserId),
+                eq(schema.outboxEvents.aggregateId, command.constraintId),
+              ));
+            if (!constraint || !observation || outbox.length === 0) {
+              throw new Error("pain write read-back failed");
+            }
+            return {
+              response: command as unknown as Record<string, unknown>,
+              factRefs: [
+                { type: "observation", id: observation.id },
+                { type: "constraint", id: constraint.id },
+              ],
+              outboxEventIds: outbox.map((event) => event.id),
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -552,9 +1158,9 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
         properties: {
           runHandle: { type: "string" },
           constraintId: { type: "string" },
-          confirmToken: { type: "string" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "constraintId"],
+        required: ["runHandle", "constraintId", "idempotencyKey"],
       },
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_lift_constraint");
@@ -569,26 +1175,67 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           return toolError("not_found", "constraint not found or already lifted");
         }
 
-        const confirmToken = optStr(inv.args, "confirmToken");
-        if (confirmToken === undefined) {
+        if (inv.requestState === undefined) {
           const target = constraint.targetJson as { bodyPart?: string };
-          return makeConfirmation(
-            "health_lift_constraint", inv,
+          return await makeConfirmation(
+            "health_lift_constraint", constraintId, inv,
             `解除限制会允许 ${target.bodyPart ?? "相关部位"} 的训练动作重新进入计划。原始原因：${constraint.reason}。确认解除？`,
             ["确认解除", "暂不解除"],
             { constraintId },
           );
         }
-        const pending = pendingConfirmations.get(confirmToken);
-        pendingConfirmations.delete(confirmToken);
-        if (!pending || pending.userId !== inv.principalUserId
-            || pending.toolName !== "health_lift_constraint"
-            || pending.expiresAt < new Date()) {
-          return toolError("proposal_stale", "confirmation unknown, expired, or not yours");
-        }
-        await pain.lift(inv.principalUserId, constraintId, `mcp:${inv.actor}`);
-        await dailyState.persistDailyProjection(inv.principalUserId, today(), "Asia/Shanghai");
-        return complete({ constraintId, lifted: true, liftedBy: `mcp:${inv.actor}` });
+        const result = await requestStates.consume(
+          inv.requestState,
+          pendingBinding("health_lift_constraint", constraintId, inv),
+          async (tx) => {
+            return writes.executeInTransaction(
+              tx,
+              writeInput(inv, "health_lift_constraint", constraintId),
+              async (writeTx) => {
+                const confirmed = inv.confirmationChoice === "确认解除";
+                if (confirmed) {
+                  const updated = await writeTx.update(schema.healthConstraints)
+                    .set({ liftedAt: new Date(), liftedByActor: `mcp:${inv.actor}`, updatedAt: new Date() })
+                    .where(and(
+                      eq(schema.healthConstraints.id, constraintId),
+                      eq(schema.healthConstraints.userId, inv.principalUserId),
+                      isNull(schema.healthConstraints.liftedAt),
+                    )).returning({ id: schema.healthConstraints.id });
+                  if (updated.length !== 1) throw new RequestStateError("target_changed");
+                }
+                const [decision] = await writeTx.insert(schema.userDecisionEvents).values({
+                  userId: inv.principalUserId,
+                  decisionType: confirmed ? "accepted" : "rejected",
+                  subjectJson: { type: "constraint_lift", constraintId },
+                }).returning();
+                if (!decision) throw new Error("constraint decision insert returned no row");
+                const [outbox] = await writeTx.insert(schema.outboxEvents).values({
+                  userId: inv.principalUserId,
+                  aggregateType: confirmed ? "constraint" : "user_decision",
+                  aggregateId: confirmed ? constraintId : decision.id,
+                  eventType: confirmed ? "constraint.lifted" : "constraint.lift_declined",
+                  payloadJson: { observedOn: constraint.activeFrom, constraintId },
+                }).returning({ id: schema.outboxEvents.id });
+                const [readBack] = await writeTx.select().from(schema.healthConstraints)
+                  .where(and(
+                    eq(schema.healthConstraints.id, constraintId),
+                    eq(schema.healthConstraints.userId, inv.principalUserId),
+                  )).limit(1);
+                if (!outbox || !readBack) throw new Error("constraint lift read-back failed");
+                return {
+                  response: confirmed
+                    ? { constraintId, lifted: true, liftedBy: `mcp:${inv.actor}` }
+                    : { constraintId, lifted: false, declined: true },
+                  factRefs: confirmed
+                    ? [{ type: "constraint", id: readBack.id }, { type: "user_decision", id: decision.id }]
+                    : [{ type: "user_decision", id: decision.id }],
+                  outboxEventIds: [outbox.id],
+                };
+              },
+            );
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -601,32 +1248,58 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           runHandle: { type: "string" },
           date: ISO_DATE,
           day: { type: "string", enum: ["A", "B", "C"] },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle"],
+        required: ["runHandle", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_prepare_training");
         const date = optStr(inv.args, "date") ?? today();
         const day = optStr(inv.args, "day") as "A" | "B" | "C" | undefined;
-        const proposal = await training.prepareSession(inv.principalUserId, date, day);
-        const current = await dailyState.getDailyProjection(inv.principalUserId, date);
-        const { createPreparedSessionService } = await import("../../training/prepared-session.js");
-        const saved = await createPreparedSessionService(db).saveProposal({
-          userId: inv.principalUserId,
-          sessionDate: date,
-          dayRole: proposal.dayRole,
-          planVersionId: proposal.planVersionId ?? null,
-          dailyStateRevision: typeof current?.revision === "number" ? current.revision : -1,
-          proposedExercises: proposal.proposedExercises as unknown as Array<Record<string, unknown>>,
-          blockedExercises: proposal.blockedExercises as unknown as Array<Record<string, unknown>>,
-          activeConstraints: proposal.activeConstraints as unknown as Array<Record<string, unknown>>,
-        });
-        return complete({
-          trainingProposalId: saved.proposalId,
-          dayRole: proposal.dayRole,
-          proposedExercises: proposal.proposedExercises,
-          blockedExercises: proposal.blockedExercises,
-        });
+        const result = await writes.execute(
+          writeInput(inv, "health_prepare_training", `${date}:${day ?? "cycle"}`),
+          async (tx) => {
+            const txDb = tx as unknown as Db;
+            const proposal = await createTrainingService(txDb)
+              .prepareSession(inv.principalUserId, date, day);
+            const current = await createDailyStateService(txDb, repo)
+              .getDailyProjection(inv.principalUserId, date);
+            const { createPreparedSessionService } = await import("../../training/prepared-session.js");
+            const saved = await createPreparedSessionService(txDb).saveProposal({
+              userId: inv.principalUserId,
+              sessionDate: date,
+              dayRole: proposal.dayRole,
+              planVersionId: proposal.planVersionId ?? null,
+              dailyStateRevision: typeof current?.revision === "number" ? current.revision : -1,
+              proposedExercises: proposal.proposedExercises as unknown as Array<Record<string, unknown>>,
+              blockedExercises: proposal.blockedExercises as unknown as Array<Record<string, unknown>>,
+              activeConstraints: proposal.activeConstraints as unknown as Array<Record<string, unknown>>,
+            });
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "training_session",
+              aggregateId: saved.proposalId,
+              eventType: "training.prepared",
+              payloadJson: { observedOn: date, dayRole: proposal.dayRole },
+            }).returning({ id: schema.outboxEvents.id });
+            const [readBack] = await tx.select().from(schema.preparedTrainingProposals)
+              .where(and(
+                eq(schema.preparedTrainingProposals.id, saved.proposalId),
+                eq(schema.preparedTrainingProposals.userId, inv.principalUserId),
+              )).limit(1);
+            if (!outbox || !readBack) throw new Error("training proposal read-back failed");
+            return {
+              response: {
+                trainingProposalId: readBack.id,
+                dayRole: proposal.dayRole,
+                proposedExercises: proposal.proposedExercises,
+                blockedExercises: proposal.blockedExercises,
+              },
+              factRefs: [{ type: "training_proposal", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -640,20 +1313,49 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           trainingProposalId: { type: "string" },
           date: ISO_DATE,
           dayRole: { type: "string", enum: ["A", "B", "C"] },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingProposalId"],
+        required: ["runHandle", "trainingProposalId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_start_training");
         const { createPreparedSessionService, ProposalStaleError } = await import("../../training/prepared-session.js");
         try {
-          const result = await createPreparedSessionService(db).startSessionFromProposal({
-            userId: inv.principalUserId,
-            proposalId: str(inv.args, "trainingProposalId"),
-            sessionDate: optStr(inv.args, "date") ?? today(),
-            ...(optStr(inv.args, "dayRole") !== undefined ? { dayRole: optStr(inv.args, "dayRole") as "A" | "B" | "C" } : {}),
-          });
-          return complete({ trainingSessionId: result.sessionId, dayRole: result.dayRole, exerciseCount: result.exerciseCount });
+          const proposalId = str(inv.args, "trainingProposalId");
+          const result = await writes.execute(
+            writeInput(inv, "health_start_training", proposalId),
+            async (tx) => {
+              const started = await createPreparedSessionService(tx as unknown as Db)
+                .startSessionFromProposal({
+                  userId: inv.principalUserId,
+                  proposalId,
+                  sessionDate: optStr(inv.args, "date") ?? today(),
+                  ...(optStr(inv.args, "dayRole") !== undefined
+                    ? { dayRole: optStr(inv.args, "dayRole") as "A" | "B" | "C" }
+                    : {}),
+                });
+              const [readBack] = await tx.select().from(schema.trainingSessions)
+                .where(and(
+                  eq(schema.trainingSessions.id, started.sessionId),
+                  eq(schema.trainingSessions.userId, inv.principalUserId),
+                )).limit(1);
+              const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+                .where(and(
+                  eq(schema.outboxEvents.userId, inv.principalUserId),
+                  eq(schema.outboxEvents.aggregateId, started.sessionId),
+                ));
+              if (!readBack || outbox.length === 0) throw new Error("training start read-back failed");
+              return {
+                response: {
+                  trainingSessionId: readBack.id,
+                  dayRole: started.dayRole,
+                  exerciseCount: started.exerciseCount,
+                },
+                factRefs: [{ type: "training_session", id: readBack.id }],
+                outboxEventIds: outbox.map((event) => event.id),
+              };
+            },
+          );
+          return complete(result.response);
         } catch (error) {
           if (error instanceof ProposalStaleError) {
             return toolError("proposal_stale", `${error.reason}; re-run health_prepare_training`);
@@ -679,33 +1381,61 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           rir: { type: "number" },
           idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingSessionId", "sessionExerciseId", "setNumber"],
+        required: ["runHandle", "trainingSessionId", "sessionExerciseId", "setNumber", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const run = await requireRun(inv.principalUserId, inv.args, "health_record_set");
-        const result = await training.recordSet({
-          userId: inv.principalUserId,
-          sessionId: str(inv.args, "trainingSessionId"),
-          sessionExerciseId: str(inv.args, "sessionExerciseId"),
-          setNumber: optNum(inv.args, "setNumber") ?? 1,
-          loadValue: optNum(inv.args, "loadValue") ?? null,
-          loadUnit: (optStr(inv.args, "loadUnit") as "kg" | "lb" | "bodyweight" | undefined) ?? null,
-          reps: optNum(inv.args, "reps") ?? null,
-          rir: optNum(inv.args, "rir") ?? null,
-          idempotencyKey: optStr(inv.args, "idempotencyKey"),
-          source: `mcp:${inv.actor}`,
-        });
-        const session = await runs.getRun(inv.principalUserId, String(inv.args["runHandle"]));
-        void session;
-        await dailyState.persistDailyProjection(inv.principalUserId, today(), "Asia/Shanghai");
-        return complete({
-          setId: result.log.id,
-          replayed: result.replayed,
-          beforeRevision: result.beforeRevision,
-          afterRevision: result.afterRevision,
-          exerciseCompleted: result.exerciseCompleted,
-          journeyId: run.run.journeyId,
-        });
+        const sessionId = str(inv.args, "trainingSessionId");
+        const result = await writes.execute(
+          writeInput(inv, "health_record_set", sessionId),
+          async (tx) => {
+            const recorded = await createTrainingService(tx as unknown as Db).recordSet({
+              userId: inv.principalUserId,
+              sessionId,
+              sessionExerciseId: str(inv.args, "sessionExerciseId"),
+              setNumber: optNum(inv.args, "setNumber") ?? 1,
+              loadValue: optNum(inv.args, "loadValue") ?? null,
+              loadUnit: (optStr(inv.args, "loadUnit") as "kg" | "lb" | "bodyweight" | undefined) ?? null,
+              reps: optNum(inv.args, "reps") ?? null,
+              rir: optNum(inv.args, "rir") ?? null,
+              idempotencyKey: str(inv.args, "idempotencyKey"),
+              source: `mcp:${inv.actor}`,
+            });
+            const [readBack] = await tx.select({
+              id: schema.trainingSetLogs.id,
+              sessionId: schema.trainingSessions.id,
+            }).from(schema.trainingSetLogs)
+              .innerJoin(
+                schema.trainingSessionExercises,
+                eq(schema.trainingSetLogs.sessionExerciseId, schema.trainingSessionExercises.id),
+              )
+              .innerJoin(
+                schema.trainingSessions,
+                eq(schema.trainingSessionExercises.sessionId, schema.trainingSessions.id),
+              )
+              .where(and(
+                eq(schema.trainingSetLogs.id, recorded.log.id),
+                eq(schema.trainingSessions.id, sessionId),
+                eq(schema.trainingSessions.userId, inv.principalUserId),
+              )).limit(1);
+            const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+              .where(and(
+                eq(schema.outboxEvents.userId, inv.principalUserId),
+                eq(schema.outboxEvents.aggregateId, recorded.log.id),
+              ));
+            if (!readBack || outbox.length === 0) throw new Error("training set read-back failed");
+            return {
+              response: {
+                setId: readBack.id,
+                beforeRevision: recorded.beforeRevision,
+                afterRevision: recorded.afterRevision,
+                exerciseCompleted: recorded.exerciseCompleted,
+              },
+              factRefs: [{ type: "training_set", id: readBack.id }],
+              outboxEventIds: outbox.map((event) => event.id),
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -718,27 +1448,51 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           runHandle: { type: "string" },
           trainingSessionId: { type: "string" },
           finalStatus: { type: "string", enum: ["completed", "interrupted", "cancelled"] },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingSessionId"],
+        required: ["runHandle", "trainingSessionId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_finish_training");
         const status = (optStr(inv.args, "finalStatus") ?? "completed") as "completed" | "interrupted" | "cancelled";
-        const session = await training.finishSession(inv.principalUserId, str(inv.args, "trainingSessionId"), status);
-        await dailyState.persistDailyProjection(inv.principalUserId, session.sessionDate, "Asia/Shanghai");
-        let cycle: unknown = null;
-        if (status === "completed") {
-          try {
-            const { createCycleEngine } = await import("../../training/cycle-engine.js");
-            cycle = await createCycleEngine(db).recordCycleOutcome({
-              userId: inv.principalUserId,
-              sessionId: session.id,
-              outcome: "completed",
-              onDate: session.sessionDate,
-            });
-          } catch { cycle = null; }
-        }
-        return complete({ sessionId: session.id, status, cycle });
+        const sessionId = str(inv.args, "trainingSessionId");
+        const result = await writes.execute(
+          writeInput(inv, "health_finish_training", sessionId),
+          async (tx) => {
+            const txDb = tx as unknown as Db;
+            const session = await createTrainingService(txDb)
+              .finishSession(inv.principalUserId, sessionId, status);
+            let cycle: { cycleInstanceId: string; positionIndex: number } | null = null;
+            if (status === "completed") {
+              const { createCycleEngine } = await import("../../training/cycle-engine.js");
+              cycle = await createCycleEngine(txDb).recordCycleOutcome({
+                userId: inv.principalUserId,
+                sessionId: session.id,
+                outcome: "completed",
+                onDate: session.sessionDate,
+              });
+            }
+            const [readBack] = await tx.select().from(schema.trainingSessions)
+              .where(and(
+                eq(schema.trainingSessions.id, sessionId),
+                eq(schema.trainingSessions.userId, inv.principalUserId),
+              )).limit(1);
+            const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+              .where(and(
+                eq(schema.outboxEvents.userId, inv.principalUserId),
+                eq(schema.outboxEvents.aggregateId, sessionId),
+              ));
+            if (!readBack || outbox.length === 0) throw new Error("training finish read-back failed");
+            return {
+              response: { sessionId: readBack.id, status: readBack.status, cycle },
+              factRefs: [
+                { type: "training_session", id: readBack.id },
+                ...(cycle ? [{ type: "training_cycle", id: cycle.cycleInstanceId }] : []),
+              ],
+              outboxEventIds: outbox.map((event) => event.id),
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -751,20 +1505,51 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           runHandle: { type: "string" },
           trainingSessionId: { type: "string" },
           sessionExerciseId: { type: "string" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingSessionId", "sessionExerciseId"],
+        required: ["runHandle", "trainingSessionId", "sessionExerciseId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_propose_substitution");
-        const proposal = await substitution.propose(
-          inv.principalUserId, str(inv.args, "trainingSessionId"), str(inv.args, "sessionExerciseId"));
-        return complete(proposal as unknown as Record<string, unknown>);
+        const sessionId = str(inv.args, "trainingSessionId");
+        const exerciseId = str(inv.args, "sessionExerciseId");
+        const result = await writes.execute(
+          writeInput(inv, "health_propose_substitution", `${sessionId}:${exerciseId}`),
+          async (tx) => {
+            const proposal = await createSubstitutionEngine(tx as unknown as Db)
+              .propose(inv.principalUserId, sessionId, exerciseId);
+            const [session] = await tx.select().from(schema.trainingSessions)
+              .where(and(
+                eq(schema.trainingSessions.id, sessionId),
+                eq(schema.trainingSessions.userId, inv.principalUserId),
+              )).limit(1);
+            const [saved] = await tx.select().from(schema.substitutionProposals)
+              .where(and(
+                eq(schema.substitutionProposals.id, proposal.substitutionProposalId),
+                eq(schema.substitutionProposals.userId, inv.principalUserId),
+              )).limit(1);
+            if (!session || !saved) throw new Error("substitution proposal read-back failed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "training_substitution",
+              aggregateId: saved.id,
+              eventType: "training.substitution_proposed",
+              payloadJson: { observedOn: session.sessionDate, sessionId, exerciseId },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("substitution proposal outbox failed");
+            return {
+              response: proposal as unknown as Record<string, unknown>,
+              factRefs: [{ type: "substitution_proposal", id: saved.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
       name: "health_apply_substitution",
       description: "Apply a substitution by proposal id + chosen slug. Candidates with trade-offs are chosen by the user (MRTR when ambiguous).",
-      risk: "confirmation",
+      risk: "state-change",
       inputSchema: {
         type: "object",
         properties: {
@@ -772,20 +1557,48 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           substitutionProposalId: { type: "string" },
           chosenSlug: { type: "string" },
           reason: { type: "string" },
-          confirmToken: { type: "string" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "substitutionProposalId", "chosenSlug"],
+        required: ["runHandle", "substitutionProposalId", "chosenSlug", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_apply_substitution");
         try {
-          const result = await substitution.apply({
-            userId: inv.principalUserId,
-            substitutionProposalId: str(inv.args, "substitutionProposalId"),
-            chosenSlug: str(inv.args, "chosenSlug"),
-            reason: optStr(inv.args, "reason") ?? "mcp substitution",
-          });
-          return complete({ replacementId: result.replacementId });
+          const proposalId = str(inv.args, "substitutionProposalId");
+          const result = await writes.execute(
+            writeInput(inv, "health_apply_substitution", proposalId),
+            async (tx) => {
+              const applied = await createSubstitutionEngine(tx as unknown as Db).apply({
+                userId: inv.principalUserId,
+                substitutionProposalId: proposalId,
+                chosenSlug: str(inv.args, "chosenSlug"),
+                reason: optStr(inv.args, "reason") ?? "mcp substitution",
+              });
+              const [replacement] = await tx.select({
+                id: schema.trainingSessionExercises.id,
+                sessionId: schema.trainingSessions.id,
+              }).from(schema.trainingSessionExercises)
+                .innerJoin(
+                  schema.trainingSessions,
+                  eq(schema.trainingSessionExercises.sessionId, schema.trainingSessions.id),
+                )
+                .where(and(
+                  eq(schema.trainingSessionExercises.id, applied.replacementId),
+                  eq(schema.trainingSessions.userId, inv.principalUserId),
+                )).limit(1);
+              const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
+                .where(and(
+                  eq(schema.outboxEvents.userId, inv.principalUserId),
+                  eq(schema.outboxEvents.aggregateId, applied.replacementId),
+                ));
+              if (!replacement || outbox.length === 0) throw new Error("substitution apply read-back failed");
+              return {
+                response: { replacementId: replacement.id, trainingSessionId: replacement.sessionId },
+                factRefs: [{ type: "training_substitution", id: replacement.id }],
+                outboxEventIds: outbox.map((event) => event.id),
+              };
+            },
+          );
+          return complete(result.response);
         } catch (error) {
           if (error instanceof SubstitutionProposalError) {
             return toolError("proposal_stale", error.reason);
@@ -808,21 +1621,51 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           painSummary: { type: "array", items: { type: "object" } },
           proposedAdjustments: { type: "array", items: { type: "object" } },
           nextValidationQuestions: { type: "array", items: { type: "string" } },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingSessionId"],
+        required: ["runHandle", "trainingSessionId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_record_reflection");
-        const result = await reflection.record({
-          userId: inv.principalUserId,
-          sessionId: str(inv.args, "trainingSessionId"),
-          bestCueRefs: (inv.args["bestCueRefs"] as string[] | undefined) ?? [],
-          unresolvedIssues: (inv.args["unresolvedIssues"] as Array<Record<string, unknown>> | undefined) ?? [],
-          painSummary: (inv.args["painSummary"] as Array<Record<string, unknown>> | undefined) ?? [],
-          proposedAdjustments: (inv.args["proposedAdjustments"] as never) ?? [],
-          nextValidationQuestions: (inv.args["nextValidationQuestions"] as string[] | undefined) ?? [],
-        });
-        return complete(result);
+        const sessionId = str(inv.args, "trainingSessionId");
+        const result = await writes.execute(
+          writeInput(inv, "health_record_reflection", sessionId),
+          async (tx) => {
+            const recorded = await createReflectionEngine(tx as unknown as Db).record({
+              userId: inv.principalUserId,
+              sessionId,
+              bestCueRefs: (inv.args["bestCueRefs"] as string[] | undefined) ?? [],
+              unresolvedIssues: (inv.args["unresolvedIssues"] as Array<Record<string, unknown>> | undefined) ?? [],
+              painSummary: (inv.args["painSummary"] as Array<Record<string, unknown>> | undefined) ?? [],
+              proposedAdjustments: (inv.args["proposedAdjustments"] as never) ?? [],
+              nextValidationQuestions: (inv.args["nextValidationQuestions"] as string[] | undefined) ?? [],
+            });
+            const [session] = await tx.select().from(schema.trainingSessions)
+              .where(and(
+                eq(schema.trainingSessions.id, sessionId),
+                eq(schema.trainingSessions.userId, inv.principalUserId),
+              )).limit(1);
+            const [readBack] = await tx.select().from(schema.trainingReflections)
+              .where(and(
+                eq(schema.trainingReflections.id, recorded.reflectionId),
+                eq(schema.trainingReflections.userId, inv.principalUserId),
+              )).limit(1);
+            if (!session || !readBack) throw new Error("reflection read-back failed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "training_reflection",
+              aggregateId: readBack.id,
+              eventType: "training.reflection_recorded",
+              payloadJson: { observedOn: session.sessionDate, sessionId },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("reflection outbox failed");
+            return {
+              response: { reflectionId: readBack.id },
+              factRefs: [{ type: "training_reflection", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -836,18 +1679,43 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           reflectionId: { type: "string" },
           changes: { type: "array", items: { type: "object" } },
           reason: { type: "string" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "reflectionId", "reason"],
+        required: ["runHandle", "reflectionId", "reason", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_propose_plan_change");
-        const result = await reflection.proposeChildVersion({
-          userId: inv.principalUserId,
-          reflectionId: str(inv.args, "reflectionId"),
-          changes: (inv.args["changes"] as Array<Record<string, unknown>> | undefined) ?? [],
-          reason: str(inv.args, "reason"),
-        });
-        return complete(result);
+        const reflectionId = str(inv.args, "reflectionId");
+        const result = await writes.execute(
+          writeInput(inv, "health_propose_plan_change", reflectionId),
+          async (tx) => {
+            const proposed = await createReflectionEngine(tx as unknown as Db).proposeChildVersion({
+              userId: inv.principalUserId,
+              reflectionId,
+              changes: (inv.args["changes"] as Array<Record<string, unknown>> | undefined) ?? [],
+              reason: str(inv.args, "reason"),
+            });
+            const [readBack] = await tx.select().from(schema.planVersions)
+              .where(and(
+                eq(schema.planVersions.id, proposed.childVersionId),
+                eq(schema.planVersions.userId, inv.principalUserId),
+              )).limit(1);
+            if (!readBack) throw new Error("plan proposal read-back failed");
+            const [outbox] = await tx.insert(schema.outboxEvents).values({
+              userId: inv.principalUserId,
+              aggregateType: "plan_version",
+              aggregateId: readBack.id,
+              eventType: "plan.version_proposed",
+              payloadJson: { observedOn: today(), reflectionId },
+            }).returning({ id: schema.outboxEvents.id });
+            if (!outbox) throw new Error("plan proposal outbox failed");
+            return {
+              response: proposed,
+              factRefs: [{ type: "plan_version", id: readBack.id }],
+              outboxEventIds: [outbox.id],
+            };
+          },
+        );
+        return complete(result.response);
       },
     },
     {
@@ -859,9 +1727,9 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
         properties: {
           runHandle: { type: "string" },
           planVersionId: { type: "string" },
-          confirmToken: { type: "string" },
+          idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "planVersionId"],
+        required: ["runHandle", "planVersionId", "idempotencyKey"],
       },
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_activate_plan_version");
@@ -874,28 +1742,64 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
           return toolError("invalid_session_state", `version is ${version.status}, only drafts activate`);
         }
 
-        const confirmToken = optStr(inv.args, "confirmToken");
-        if (confirmToken === undefined) {
+        if (inv.requestState === undefined) {
           const parent = version.parentVersionId
             ? (await db.select().from(schema.planVersions)
                 .where(eq(schema.planVersions.id, version.parentVersionId)).limit(1))[0]
             : undefined;
-          return makeConfirmation(
-            "health_activate_plan_version", inv,
+          return await makeConfirmation(
+            "health_activate_plan_version", planVersionId, inv,
             `激活将把当前训练计划切换到 v${version.versionNumber}（原因：${version.adjustmentReason ?? "n/a"}），父版本 ${parent?.versionNumber ?? "?"} 转为 superseded，可回滚。确认激活？`,
             ["确认激活", "暂不激活"],
             { planVersionId },
           );
         }
-        const pending = pendingConfirmations.get(confirmToken);
-        pendingConfirmations.delete(confirmToken);
-        if (!pending || pending.userId !== inv.principalUserId
-            || pending.toolName !== "health_activate_plan_version"
-            || pending.expiresAt < new Date()) {
-          return toolError("proposal_stale", "confirmation unknown, expired, or not yours");
-        }
-        await reflection.activateChildVersion(inv.principalUserId, planVersionId);
-        return complete({ planVersionId, activated: true });
+        const result = await requestStates.consume(
+          inv.requestState,
+          pendingBinding("health_activate_plan_version", planVersionId, inv),
+          async (tx) => {
+            return writes.executeInTransaction(
+              tx,
+              writeInput(inv, "health_activate_plan_version", planVersionId),
+              async (writeTx) => {
+                const confirmed = inv.confirmationChoice === "确认激活";
+                if (confirmed) {
+                  await createReflectionEngine(writeTx as unknown as Db)
+                    .activateChildVersion(inv.principalUserId, planVersionId);
+                }
+                const [decision] = await writeTx.insert(schema.userDecisionEvents).values({
+                  userId: inv.principalUserId,
+                  decisionType: confirmed ? "accepted" : "rejected",
+                  subjectJson: { type: "plan_activation", planVersionId },
+                }).returning();
+                if (!decision) throw new Error("plan activation decision insert failed");
+                const [outbox] = await writeTx.insert(schema.outboxEvents).values({
+                  userId: inv.principalUserId,
+                  aggregateType: confirmed ? "plan_version" : "user_decision",
+                  aggregateId: confirmed ? planVersionId : decision.id,
+                  eventType: confirmed ? "plan.version_activated" : "plan.activation_declined",
+                  payloadJson: { observedOn: today(), planVersionId },
+                }).returning({ id: schema.outboxEvents.id });
+                const [readBack] = await writeTx.select().from(schema.planVersions)
+                  .where(and(
+                    eq(schema.planVersions.id, planVersionId),
+                    eq(schema.planVersions.userId, inv.principalUserId),
+                  )).limit(1);
+                if (!outbox || !readBack) throw new Error("plan activation read-back failed");
+                return {
+                  response: confirmed
+                    ? { planVersionId, activated: true, status: readBack.status }
+                    : { planVersionId, activated: false, declined: true },
+                  factRefs: confirmed
+                    ? [{ type: "plan_version", id: readBack.id }, { type: "user_decision", id: decision.id }]
+                    : [{ type: "user_decision", id: decision.id }],
+                  outboxEventIds: [outbox.id],
+                };
+              },
+            );
+          },
+        );
+        return complete(result.response);
       },
     },
   ];
@@ -930,6 +1834,15 @@ export function createHealthToolCatalog(db: Db, repo: Repository) {
         }
         if (error instanceof RangeError) {
           return toolError("validation_failed", error.message);
+        }
+        if (error instanceof RequestStateError) {
+          return toolError("proposal_stale", error.message);
+        }
+        if (error instanceof CandidateSelectionError) {
+          return toolError("proposal_stale", error.message);
+        }
+        if (error instanceof WriteCommandError) {
+          return toolError(error.code, error.message);
         }
         return toolError("internal", "internal error");
       }

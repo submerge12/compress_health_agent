@@ -11,6 +11,8 @@ import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import type { Repository } from "../../db/repository.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
+import { createProjectionWorker } from "../../domain/projection-worker.js";
+import { createTrainingService } from "../../training/training-service.js";
 import { CACHE_TTL_MS } from "../server-info.js";
 import { McpProtocolError } from "../errors.js";
 import type { Principal } from "../auth/principal-resolver.js";
@@ -36,6 +38,9 @@ export const RESOURCE_URIS = [
 ] as const;
 
 export function createResourceCatalog(db: Db, repo: Repository) {
+  const dailyState = createDailyStateService(db, repo);
+  const projectionWorker = createProjectionWorker(db, repo);
+  const training = createTrainingService(db);
   async function listResources(principal: Principal): Promise<Array<Record<string, unknown>>> {
     void principal; // listing is identity-independent; reads are scoped
     return [
@@ -124,16 +129,32 @@ export function createResourceCatalog(db: Db, repo: Repository) {
     }
     if (uri.startsWith("health://daily-state/")) {
       const date = normalizeDate(uri.slice("health://daily-state/".length), today);
-      const state = await createDailyStateService(db, repo)
-        .buildDailyState(principal.userId, date, "Asia/Shanghai");
-      return state;
+      const [state, diagnostics] = await Promise.all([
+        dailyState.getDailyProjection(principal.userId, date),
+        projectionWorker.getDiagnostics(principal.userId, date),
+      ]);
+      if (!state) {
+        return {
+          schemaVersion: "daily-health-state.v1",
+          userId: principal.userId,
+          localDate: date,
+          state: null,
+          projection: diagnostics,
+        };
+      }
+      return {
+        ...state,
+        projection: {
+          ...state.projection,
+          status: diagnostics.status,
+          checkpoint: diagnostics.checkpoint,
+          outbox: diagnostics.outbox,
+        },
+      };
     }
     if (uri.startsWith("health://constraints/active/")) {
       const date = normalizeDate(uri.slice("health://constraints/active/".length), today);
-      return db.select().from(schema.healthConstraints).where(and(
-        eq(schema.healthConstraints.userId, principal.userId),
-        isNull(schema.healthConstraints.liftedAt),
-      ));
+      return dailyState.listActiveConstraints(principal.userId, date);
     }
     if (uri === "health://plans/training/active") {
       const [assignment] = await db.select().from(schema.activePlanAssignments)
@@ -154,9 +175,7 @@ export function createResourceCatalog(db: Db, repo: Repository) {
           eq(schema.trainingSessions.userId, principal.userId), // ownership: 404, never leak
         )).limit(1);
       if (!session) throw new McpProtocolError("not_found", "session not found for this user");
-      const exercises = await db.select().from(schema.trainingSessionExercises)
-        .where(eq(schema.trainingSessionExercises.sessionId, sessionId));
-      return { session, exercises };
+      return training.readBackSession(principal.userId, sessionId);
     }
     if (uri === "health://training/cycles/current") {
       const { createCycleEngine } = await import("../../training/cycle-engine.js");

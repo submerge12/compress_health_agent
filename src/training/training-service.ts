@@ -430,7 +430,16 @@ export function createTrainingService(db: Db) {
 
       if (input.idempotencyKey) {
         const [existing] = await tx.select().from(schema.trainingSetLogs)
-          .where(eq(schema.trainingSetLogs.idempotencyKey, input.idempotencyKey))
+          .where(and(
+            eq(schema.trainingSetLogs.idempotencyKey, input.idempotencyKey),
+            sql`${schema.trainingSetLogs.sessionExerciseId} IN (
+              SELECT exercise.id
+              FROM ${schema.trainingSessionExercises} exercise
+              JOIN ${schema.trainingSessions} session ON session.id = exercise.session_id
+              WHERE session.id = ${input.sessionId}::uuid
+                AND session.user_id = ${input.userId}::uuid
+            )`,
+          ))
           .limit(1);
         if (existing) {
           return {

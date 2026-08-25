@@ -11,11 +11,10 @@ export const MCP_SERVER_NAME = "compass-health";
 export const MCP_SERVER_VERSION = "0.1.0";
 
 /**
- * Protocol versions this server can speak. The SDK negotiates the newest
- * mutually supported one during initialize; requests carrying any other
- * version are refused with `protocol_version_mismatch`.
+ * Protocol revisions this server serves. The modern stdio entry selects this
+ * revision through `server/discover`; no initialize exchange is used.
  */
-export const SUPPORTED_PROTOCOL_VERSIONS = ["2025-11-25", "2025-06-18"] as const;
+export const SUPPORTED_PROTOCOL_VERSIONS = ["2026-07-28"] as const;
 
 /**
  * Cache policies for list/read results (2026-07-28 requires ttlMs +

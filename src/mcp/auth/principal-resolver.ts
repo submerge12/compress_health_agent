@@ -40,7 +40,7 @@ export interface ActorBindingOptions {
 }
 
 export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
-  async function resolvePrincipal(meta: Record<string, unknown> | undefined): Promise<Principal> {
+  async function resolvePrincipal(_meta: Record<string, unknown> | undefined): Promise<Principal> {
     const binding = options.externalUserId;
     if (!binding) {
       throw new McpProtocolError(
@@ -61,16 +61,16 @@ export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
       const row = created ?? (await db.select().from(schema.users)
         .where(eq(schema.users.externalId, binding)).limit(1))[0];
       if (!row) throw new McpProtocolError("internal", "user provisioning failed");
-      return { userId: row.id, externalUserId: binding, actor: declaredActor(meta) };
+      return { userId: row.id, externalUserId: binding, actor: verifiedActor(options) };
     }
-    return { userId: user.id, externalUserId: binding, actor: declaredActor(meta) };
+    return { userId: user.id, externalUserId: binding, actor: verifiedActor(options) };
   }
 
   return { resolvePrincipal };
 }
 
-/** The declared actor is metadata for evidence, never authorization. */
-function declaredActor(meta: Record<string, unknown> | undefined): string {
-  const actor = (meta as { "compass.health/actor"?: unknown } | undefined)?.["compass.health/actor"];
-  return typeof actor === "string" && actor.trim() !== "" ? actor.trim() : "codex-primary";
+/** Actor identity comes from server startup configuration, never request metadata. */
+function verifiedActor(options: ActorBindingOptions): string {
+  const actor = options.actor?.trim();
+  return actor ? actor : "codex-primary";
 }

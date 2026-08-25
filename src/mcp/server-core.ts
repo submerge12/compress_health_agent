@@ -1,47 +1,53 @@
 /**
  * P1: MCP server core.
  *
- * Assembles the official-SDK Server with:
- * - initialize negotiation restricted to SUPPORTED_PROTOCOL_VERSIONS;
- * - a custom `server/discover` handler (2026-07-28 self-description: the
- *   SDK does not ship it yet, so it is registered as a raw protocol handler);
+ * Assembles the official v2 SDK Server with:
+ * - protocol support pinned to 2026-07-28;
+ * - SDK-owned `server/discover` and result wire codecs;
  * - tools/list + resources/list + resources/read backed by the catalogs;
  * - every handler resolving the principal from the transport-verified
  *   binding — tool arguments can never change identity.
  *
  * Write tools arrive in P2 (WO-MCP-3); P1 ships read-only surface only.
  */
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { z } from "zod/v4";
 import {
-  ListResourcesRequestSchema,
-  ReadResourceRequestSchema,
-  ListToolsRequestSchema,
-} from "@modelcontextprotocol/sdk/types.js";
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
+  acceptedContent,
+  inputRequired,
+  Server,
+  type InputRequests,
+  type Resource,
+  type Tool,
+} from "@modelcontextprotocol/server";
 
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { sql } from "drizzle-orm";
 import * as schema from "../db/schema.js";
 import type { Repository } from "../db/repository.js";
+import type { ToolContext } from "../tools/context.js";
 
-import { MCP_SERVER_NAME, MCP_SERVER_VERSION, serverCapabilitiesDocument } from "./server-info.js";
-import { McpProtocolError, JSON_RPC } from "./errors.js";
+import { CACHE_TTL_MS, MCP_SERVER_NAME, MCP_SERVER_VERSION } from "./server-info.js";
+import { McpProtocolError } from "./errors.js";
 import { createPrincipalResolver, type ActorBindingOptions, type Principal } from "./auth/principal-resolver.js";
 import { createResourceCatalog } from "./resources/catalog.js";
 import { createHealthToolCatalog } from "./tools/catalog.js";
+import { createRunHandleService } from "./evidence/run-handles.js";
+import { createRequestStateService } from "./input/request-state.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
 export interface CreateHealthMcpServerOptions extends ActorBindingOptions {
   db: Db;
   repo: Repository;
+  toolContext: ToolContext;
 }
 
 export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Server {
   const { db, repo } = options;
   const principalResolver = createPrincipalResolver(db, options);
   const resources = createResourceCatalog(db, repo);
+  const runs = createRunHandleService(db);
+  const requestStates = createRequestStateService(db);
+  const verifiedActor = options.actor?.trim() || "codex-primary";
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
@@ -54,52 +60,84 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         "Compass Health domain server. Read daily-state and active constraints BEFORE any training advice. " +
         "All state crosses calls via explicit handles (runHandle, trainingProposalId, …) — there are no sessions.",
       enforceStrictCapabilities: false,
-    },
-  );
-
-  // ── 2026-07-28: server/discover (self-description; SDK lacks it yet) ──
-  server.setRequestHandler(
-    z.object({
-      method: z.literal("server/discover"),
-      params: z.object({
-        protocolVersion: z.string().optional(),
-        _meta: z.looseObject({}).optional(),
-      }).optional(),
-    }),
-    (request) => {
-      const requested = request.params?.protocolVersion;
-      if (requested !== undefined && !(serverCapabilitiesDocument().server.protocolVersions as readonly string[]).includes(requested)) {
-        throw new McpProtocolError(
-          "protocol_version_mismatch",
-          `protocol version ${requested} not supported; supported: ${SUPPORTED_LIST}`,
-          JSON_RPC.INVALID_REQUEST,
-        );
-      }
-      return {
-        protocolVersion: requested ?? SUPPORTED_LIST[0],
-        ...serverCapabilitiesDocument(),
-      };
+      supportedProtocolVersions: [...SUPPORTED_LIST],
+      cacheHints: {
+        "server/discover": { ttlMs: CACHE_TTL_MS.systemCapabilities, cacheScope: "public" },
+        "tools/list": { ttlMs: CACHE_TTL_MS.toolCatalog, cacheScope: "public" },
+        "resources/list": { ttlMs: CACHE_TTL_MS.resourceCatalog, cacheScope: "public" },
+        "resources/read": { ttlMs: 0, cacheScope: "private" },
+      },
+      requestState: {
+        verify: (state) => requestStates.verify(state, {
+          userId: options.toolContext.userId,
+          verifiedActor,
+        }),
+      },
     },
   );
 
   // ── resources/list ──
-  server.setRequestHandler(ListResourcesRequestSchema, async (request) => {
+  server.setRequestHandler("resources/list", async (request) => {
     const principal = await resolveFromRequest(principalResolver, request);
     const list = await resources.listResources(principal);
-    return { resources: list };
+    return { resources: list as Resource[] };
   });
 
   // ── resources/read ──
-  server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+  server.setRequestHandler("resources/read", async (request) => {
     const principal = await resolveFromRequest(principalResolver, request);
     const uri = String((request.params as { uri?: unknown }).uri ?? "");
-    const result = await resources.readResource(principal, uri);
-    return { contents: result.contents, _meta: result._meta };
+    const meta = request.params?._meta as Record<string, unknown> | undefined;
+    const suppliedRun = meta?.["compass.health/runHandle"];
+    let runHandle = typeof suppliedRun === "string" && suppliedRun !== "" ? suppliedRun : undefined;
+    let implicitRun = false;
+    if (!runHandle) {
+      const begun = await runs.beginRun({
+        userId: principal.userId,
+        objective: `resource read ${uri}`,
+        inputChannel: "mcp-resource",
+        actor: principal.actor,
+      });
+      runHandle = begun.runHandle;
+      implicitRun = true;
+    }
+    try {
+      const result = await resources.readResource(principal, uri);
+      await runs.recordStep({
+        userId: principal.userId,
+        runHandle,
+        stage: "resource_read",
+        mcpMethod: "resources/read",
+        resourceUri: uri,
+        resultSummary: { contentCount: result.contents.length },
+      });
+      if (implicitRun) {
+        await runs.endRun({ userId: principal.userId, runHandle, outcome: "completed" });
+      }
+      return {
+        contents: result.contents,
+        _meta: { ...result._meta, "compass.health/runHandle": runHandle },
+      };
+    } catch (error) {
+      await runs.recordStep({
+        userId: principal.userId,
+        runHandle,
+        stage: "resource_read",
+        mcpMethod: "resources/read",
+        resourceUri: uri,
+        status: "failed",
+        errorCode: error instanceof McpProtocolError ? error.code : "internal",
+      });
+      if (implicitRun) {
+        await runs.endRun({ userId: principal.userId, runHandle, outcome: "failed" });
+      }
+      throw error;
+    }
   });
 
   // ── tools/list: P1 read tool + P2 canonical write tools ──
-  const tools = createHealthToolCatalog(db, repo);
-  server.setRequestHandler(ListToolsRequestSchema, async () => {
+  const tools = createHealthToolCatalog(db, repo, { toolContext: options.toolContext });
+  server.setRequestHandler("tools/list", async () => {
     return {
       tools: [
         {
@@ -109,22 +147,15 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
           _meta: { "compass.health/risk": "read-only" },
         },
         ...tools.listTools(),
-      ],
+      ] as Tool[],
     };
   });
 
   // tools/call: dispatch to the catalog; MRTR results pass through with
   // resultType input_required.
   server.setRequestHandler(
-    z.object({
-      method: z.literal("tools/call"),
-      params: z.object({
-        name: z.string(),
-        arguments: z.looseObject({}).optional(),
-        _meta: z.looseObject({}).optional(),
-      }),
-    }),
-    async (request) => {
+    "tools/call",
+    async (request, ctx) => {
       const params = request.params;
       const principal = await resolveFromRequest(principalResolver, request);
       if (params.name === "health_get_system_status") {
@@ -137,16 +168,35 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
           }],
         };
       }
+      const requestState = ctx.mcpReq.requestState<string>();
+      const confirmation = acceptedContent<{ choice?: string }>(
+        ctx.mcpReq.inputResponses,
+        "confirmation",
+      );
       const outcome = await tools.call(params.name, {
         principalUserId: principal.userId,
         actor: principal.actor,
         args: params.arguments ?? {},
+        ...(typeof requestState === "string" ? { requestState } : {}),
+        ...(confirmation?.choice ? { confirmationChoice: confirmation.choice } : {}),
       });
+      if (outcome.resultType === "input_required") {
+        const pending = outcome.structured as {
+          requestState?: string;
+          inputRequests?: Record<string, unknown>;
+        } | undefined;
+        if (!pending?.requestState || !pending.inputRequests) {
+          throw new McpProtocolError("internal", "input_required outcome has no request state");
+        }
+        return inputRequired({
+          inputRequests: pending.inputRequests as InputRequests,
+          requestState: pending.requestState,
+        });
+      }
       return {
-        ...(outcome.resultType === "input_required"
-          ? { _meta: { "compass.health/resultType": "input_required" } } : {}),
         isError: outcome.isError === true ? true : undefined,
         content: outcome.content,
+        structuredContent: outcome.structured,
       };
     },
   );
@@ -154,7 +204,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
   return server;
 }
 
-const SUPPORTED_LIST = ["2025-11-25", "2025-06-18"];
+const SUPPORTED_LIST = ["2026-07-28"];
 
 async function resolveFromRequest(
   resolver: { resolvePrincipal: (meta: Record<string, unknown> | undefined) => Promise<Principal> },
@@ -162,8 +212,4 @@ async function resolveFromRequest(
 ): Promise<Principal> {
   const meta = (request as { params?: { _meta?: Record<string, unknown> } }).params?._meta;
   return resolver.resolvePrincipal(meta);
-}
-
-export async function connectHealthMcpServer(server: Server, transport: Transport): Promise<void> {
-  await server.connect(transport);
 }

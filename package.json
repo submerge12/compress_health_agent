@@ -39,13 +39,14 @@
     "db:migrate": "tsx src/db/migrate.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/server": "^2.0.0",
     "dotenv": "^17.4.2",
     "drizzle-orm": "^0.45.2",
     "postgres": "^3.4.9",
     "zod": "^4.4.3"
   },
   "devDependencies": {
+    "@modelcontextprotocol/client": "^2.0.0",
     "@types/node": "^22.19.21",
     "drizzle-kit": "^0.31.10",
     "tsx": "^4.22.4",

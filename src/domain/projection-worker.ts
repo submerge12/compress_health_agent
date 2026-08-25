@@ -11,7 +11,7 @@
  *   MAX_ATTEMPTS exhausted -> dead_letter (visible, replayable);
  * - a projection failure NEVER rolls back committed facts.
  */
-import { and, asc, eq, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, lte, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -200,7 +200,70 @@ export function createProjectionWorker(db: Db, repo: Repository) {
     }
   }
 
-  return { runOnce, replayDeadLetters, rebuildUserProjection };
+  async function getDiagnostics(userId: string, localDate: string) {
+    const [projection] = await db.select().from(schema.dailyHealthStateProjection)
+      .where(and(
+        eq(schema.dailyHealthStateProjection.userId, userId),
+        eq(schema.dailyHealthStateProjection.stateDate, localDate),
+      )).limit(1);
+    const [checkpoint] = await db.select().from(schema.projectionCheckpoints)
+      .where(and(
+        eq(schema.projectionCheckpoints.projectionName, "daily-health-state"),
+        eq(schema.projectionCheckpoints.checkpointKey, `${userId}:${localDate}`),
+      )).limit(1);
+    const [counts] = await db.select({
+      pending: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'pending')::int`,
+      deadLetter: sql<number>`count(*) filter (where ${schema.outboxEvents.status} = 'dead_letter')::int`,
+      oldestPendingAt: sql<Date | null>`min(${schema.outboxEvents.createdAt}) filter (where ${schema.outboxEvents.status} = 'pending')`,
+    }).from(schema.outboxEvents)
+      .where(eq(schema.outboxEvents.userId, userId));
+    const failures = await db.select({
+      id: schema.outboxEvents.id,
+      aggregateType: schema.outboxEvents.aggregateType,
+      eventType: schema.outboxEvents.eventType,
+      attempts: schema.outboxEvents.attempts,
+      lastError: schema.outboxEvents.lastError,
+      createdAt: schema.outboxEvents.createdAt,
+    }).from(schema.outboxEvents)
+      .where(and(
+        eq(schema.outboxEvents.userId, userId),
+        eq(schema.outboxEvents.status, "dead_letter"),
+      ))
+      .orderBy(desc(schema.outboxEvents.createdAt))
+      .limit(20);
+
+    const pending = counts?.pending ?? 0;
+    const deadLetter = counts?.deadLetter ?? 0;
+    const status = checkpoint?.status === "failed" || deadLetter > 0
+      ? "failed"
+      : pending > 0 || projection?.projectionStatus === "lagging"
+        ? "lagging"
+        : projection?.projectionStatus ?? checkpoint?.status ?? "missing";
+    return {
+      userId,
+      localDate,
+      status,
+      projection: projection ? {
+        revision: projection.revision,
+        status: projection.projectionStatus,
+        builtAt: projection.builtAt,
+        updatedAt: projection.updatedAt,
+      } : null,
+      checkpoint: checkpoint ? {
+        status: checkpoint.status,
+        lastEventAt: checkpoint.lastEventAt,
+        updatedAt: checkpoint.updatedAt,
+      } : null,
+      outbox: {
+        pending,
+        deadLetter,
+        oldestPendingAt: counts?.oldestPendingAt ?? null,
+        failures,
+      },
+    };
+  }
+
+  return { runOnce, replayDeadLetters, rebuildUserProjection, getDiagnostics };
 }
 
 export type ProjectionWorker = ReturnType<typeof createProjectionWorker>;

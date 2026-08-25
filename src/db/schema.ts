@@ -785,6 +785,51 @@ export const agentRunSteps = compass.table("agent_run_steps", {
   index("agent_run_steps_run_idx").on(t.runId, t.sequence),
 ]);
 
+/** Durable MCP 2026 multi-round input state. The raw requestState is never stored. */
+export const mcpPendingInputRequests = compass.table("mcp_pending_input_requests", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  requestStateHash: text("request_state_hash").notNull(),
+  userId: userId(),
+  verifiedActor: text("verified_actor").notNull(),
+  runId: uuid("run_id").notNull()
+    .references(() => agentRuns.id, { onDelete: "cascade" }),
+  toolName: text("tool_name").notNull(),
+  targetId: text("target_id").notNull(),
+  argumentHash: text("argument_hash").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  inputRequestsJson: jsonb("input_requests_json").$type<Record<string, unknown>>().notNull(),
+  payloadJson: jsonb("payload_json").$type<Record<string, unknown>>().notNull(),
+  status: text("status").notNull().default("pending"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  ...timestamps(),
+}, (t) => [
+  uniqueIndex("mcp_pending_input_requests_state_hash_uidx").on(t.requestStateHash),
+  index("mcp_pending_input_requests_user_status_idx").on(t.userId, t.status, t.expiresAt),
+]);
+
+/** One durable, replayable receipt per user/tool/scope/idempotency key. */
+export const mcpWriteReceipts = compass.table("mcp_write_receipts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  runId: uuid("run_id").notNull()
+    .references(() => agentRuns.id, { onDelete: "cascade" }),
+  verifiedActor: text("verified_actor").notNull(),
+  toolName: text("tool_name").notNull(),
+  scopeKey: text("scope_key").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  argumentHash: text("argument_hash").notNull(),
+  factRefsJson: jsonb("fact_refs_json").$type<Array<Record<string, unknown>>>().notNull().default(emptyArrayJson),
+  outboxEventIdsJson: jsonb("outbox_event_ids_json").$type<string[]>().notNull().default(emptyArrayJson),
+  responseJson: jsonb("response_json").$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("mcp_write_receipts_idempotency_uidx").on(
+    t.userId, t.toolName, t.scopeKey, t.idempotencyKey,
+  ),
+  index("mcp_write_receipts_run_idx").on(t.runId, t.createdAt),
+]);
+
 export const reviewFindings = compass.table("review_findings", {
   id: uuid("id").primaryKey().defaultRandom(),
   reviewerActorId: uuid("reviewer_actor_id"),
