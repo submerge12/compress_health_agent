@@ -1129,17 +1129,16 @@ export function createHealthToolCatalog(
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_lift_constraint");
         const constraintId = str(inv.args, "constraintId");
-        const [constraint] = await db.select().from(schema.healthConstraints)
-          .where(and(
-            eq(schema.healthConstraints.id, constraintId),
-            eq(schema.healthConstraints.userId, inv.principalUserId),
-            isNull(schema.healthConstraints.liftedAt),
-          )).limit(1);
-        if (!constraint) {
-          return toolError("not_found", "constraint not found or already lifted");
-        }
-
         if (inv.requestState === undefined) {
+          const [constraint] = await db.select().from(schema.healthConstraints)
+            .where(and(
+              eq(schema.healthConstraints.id, constraintId),
+              eq(schema.healthConstraints.userId, inv.principalUserId),
+              isNull(schema.healthConstraints.liftedAt),
+            )).limit(1);
+          if (!constraint) {
+            return toolError("not_found", "constraint not found or already lifted");
+          }
           const target = constraint.targetJson as { bodyPart?: string };
           return await makeConfirmation(
             "health_lift_constraint", constraintId, inv,
@@ -1675,15 +1674,14 @@ export function createHealthToolCatalog(
       execute: async (inv) => {
         await requireRun(inv.principalUserId, inv.args, "health_activate_plan_version");
         const planVersionId = str(inv.args, "planVersionId");
-        const [version] = await db.select().from(schema.planVersions)
-          .where(and(eq(schema.planVersions.id, planVersionId), eq(schema.planVersions.userId, inv.principalUserId)))
-          .limit(1);
-        if (!version) return toolError("not_found", "plan version not found");
-        if (version.status !== "draft") {
-          return toolError("invalid_session_state", `version is ${version.status}, only drafts activate`);
-        }
-
         if (inv.requestState === undefined) {
+          const [version] = await db.select().from(schema.planVersions)
+            .where(and(eq(schema.planVersions.id, planVersionId), eq(schema.planVersions.userId, inv.principalUserId)))
+            .limit(1);
+          if (!version) return toolError("not_found", "plan version not found");
+          if (version.status !== "draft") {
+            return toolError("invalid_session_state", `version is ${version.status}, only drafts activate`);
+          }
           const parent = version.parentVersionId
             ? (await db.select().from(schema.planVersions)
                 .where(eq(schema.planVersions.id, version.parentVersionId)).limit(1))[0]

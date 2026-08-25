@@ -452,8 +452,115 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }));
 
     expect(completed.result?.resultType).toBe("complete");
-    expect(completed.result?.structuredContent).toMatchObject({ constraintId, lifted: true });
+    const completedBody = completed.result?.structuredContent as {
+      constraintId: string; lifted: boolean; receiptId: string; replayed: boolean;
+    };
+    expect(completedBody).toMatchObject({ constraintId, lifted: true, replayed: false });
+
+    const replayed = await client.request(toolCall(5, "health_lift_constraint", {
+      runHandle,
+      constraintId,
+      idempotencyKey: "wire-lift-standard",
+    }, {
+      requestState,
+      inputResponses: {
+        confirmation: { action: "accept", content: { choice: "确认解除" } },
+      },
+    }));
+    expect(replayed.result?.structuredContent).toMatchObject({
+      constraintId,
+      lifted: true,
+      receiptId: completedBody.receiptId,
+      replayed: true,
+    });
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [counts] = await sql`
+        SELECT
+          (SELECT count(*)::int FROM compass_health.user_decision_events
+           WHERE subject_json->>'type' = 'constraint_lift'
+             AND subject_json->>'constraintId' = ${constraintId}) AS decisions,
+          (SELECT count(*)::int FROM compass_health.outbox_events
+           WHERE aggregate_id = ${constraintId} AND type = 'constraint.lifted') AS outbox,
+          (SELECT count(*)::int FROM compass_health.mcp_write_receipts
+           WHERE id = ${completedBody.receiptId}::uuid) AS receipts`;
+      expect(counts).toMatchObject({ decisions: 1, outbox: 1, receipts: 1 });
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
   }, 25_000);
+
+  it("replays a successful plan activation from the original receipt", async () => {
+    const binding = `mcp-wire-activate-replay-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire activation success replay",
+      idempotencyKey: "wire-activation-replay-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let childId = "";
+    try {
+      const [user] = await sql`SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      const scope = `activation-replay-${Date.now()}`;
+      const [parent] = await sql`
+        INSERT INTO compass_health.plan_versions
+          (user_id, scope, status, content_json, version_number)
+        VALUES (${user!.id}::uuid, ${scope}, 'active', '{"days":{}}'::jsonb, 1)
+        RETURNING id`;
+      const [child] = await sql`
+        INSERT INTO compass_health.plan_versions
+          (user_id, scope, status, parent_version_id, content_json, version_number)
+        VALUES (${user!.id}::uuid, ${scope}, 'draft', ${parent!.id}::uuid, '{"days":{}}'::jsonb, 2)
+        RETURNING id`;
+      childId = String(child!.id);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+
+    const args = {
+      runHandle,
+      planVersionId: childId,
+      idempotencyKey: "wire-activation-replay",
+    };
+    const pending = await client.request(toolCall(2, "health_activate_plan_version", args));
+    expect(pending.result?.resultType).toBe("input_required");
+    const retry = {
+      requestState: pending.result?.requestState as string,
+      inputResponses: {
+        confirmation: { action: "accept", content: { choice: "确认激活" } },
+      },
+    };
+    const completed = await client.request(toolCall(3, "health_activate_plan_version", args, retry));
+    const body = completed.result?.structuredContent as { receiptId: string };
+    expect(completed.result?.structuredContent).toMatchObject({
+      planVersionId: childId, activated: true, replayed: false,
+    });
+
+    const replayed = await client.request(toolCall(4, "health_activate_plan_version", args, retry));
+    expect(replayed.result?.structuredContent).toMatchObject({
+      planVersionId: childId,
+      activated: true,
+      receiptId: body.receiptId,
+      replayed: true,
+    });
+
+    const verify = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [counts] = await verify`
+        SELECT
+          (SELECT count(*)::int FROM compass_health.user_decision_events
+           WHERE subject_json->>'type' = 'plan_activation'
+             AND subject_json->>'planVersionId' = ${childId}) AS decisions,
+          (SELECT count(*)::int FROM compass_health.outbox_events
+           WHERE aggregate_id = ${childId} AND type = 'plan.version_activated') AS outbox`;
+      expect(counts).toMatchObject({ decisions: 1, outbox: 1 });
+    } finally {
+      await verify.end({ timeout: 3 });
+    }
+  }, 30_000);
 
   it("recovers requestState after the server process restarts", async () => {
     const firstProcess = new WireClient();
