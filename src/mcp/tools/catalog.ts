@@ -33,7 +33,11 @@ import { createMediaRetrieval } from "../../media/retrieval.js";
 import { createPainCommand } from "../../training/prepared-session.js";
 import { createTrainingService } from "../../training/training-service.js";
 import type { TrainingSetPainInput } from "../../training/training-service.js";
-import { createSubstitutionEngine, SubstitutionProposalError } from "../../training/substitution-engine.js";
+import {
+  createSubstitutionEngine,
+  SubstitutionProposalError,
+  type SubstitutionReasonCode,
+} from "../../training/substitution-engine.js";
 import { createReflectionEngine } from "../../training/reflection-engine.js";
 import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
@@ -243,6 +247,19 @@ export function createHealthToolCatalog(
         ...(description ? { description } : {}),
       };
     });
+  }
+
+  function stringList(args: Record<string, unknown>, key: string): string[] {
+    const raw = args[key];
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) throw new RangeError(`${key} must be an array`);
+    const values = raw.map((value, index) => {
+      if (typeof value !== "string" || value.trim() === "") {
+        throw new RangeError(`${key}[${index}] must be a non-empty string`);
+      }
+      return value.trim();
+    });
+    return [...new Set(values)];
   }
 
   function acceptedSelections(responses: Record<string, unknown> | undefined): Record<string, string> {
@@ -1493,7 +1510,7 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_propose_substitution",
-      description: "Propose substitutes for an unfinished exercise. Returns substitutionProposalId + candidates.",
+      description: "Propose equipment-aware substitutes for an unfinished exercise. Unavailable equipment is excluded before candidates are ranked.",
       risk: "proposal",
       inputSchema: {
         type: "object",
@@ -1501,9 +1518,31 @@ export function createHealthToolCatalog(
           runHandle: { type: "string" },
           trainingSessionId: { type: "string" },
           sessionExerciseId: { type: "string" },
+          reasonCode: {
+            type: "string",
+            enum: ["equipment_occupied", "equipment_unavailable", "comfort", "preference"],
+          },
+          unavailableEquipment: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            uniqueItems: true,
+          },
+          availableEquipment: {
+            type: "array",
+            items: { type: "string", minLength: 1 },
+            uniqueItems: true,
+          },
+          occupiedExerciseSlug: { type: "string" },
           idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "trainingSessionId", "sessionExerciseId", "idempotencyKey"],
+        required: [
+          "runHandle",
+          "trainingSessionId",
+          "sessionExerciseId",
+          "reasonCode",
+          "unavailableEquipment",
+          "idempotencyKey",
+        ],
       },
       execute: async (inv) => {
         const sessionId = str(inv.args, "trainingSessionId");
@@ -1512,7 +1551,16 @@ export function createHealthToolCatalog(
           writeInput(inv, "health_propose_substitution", `${sessionId}:${exerciseId}`),
           async (tx) => {
             const proposal = await createSubstitutionEngine(tx as unknown as Db)
-              .propose(inv.principalUserId, sessionId, exerciseId);
+              .propose(inv.principalUserId, sessionId, exerciseId, {
+                reasonCode: str(inv.args, "reasonCode") as SubstitutionReasonCode,
+                unavailableEquipment: stringList(inv.args, "unavailableEquipment"),
+                ...(stringList(inv.args, "availableEquipment").length > 0
+                  ? { availableEquipment: stringList(inv.args, "availableEquipment") }
+                  : {}),
+                ...(optStr(inv.args, "occupiedExerciseSlug")
+                  ? { occupiedExerciseSlug: optStr(inv.args, "occupiedExerciseSlug") }
+                  : {}),
+              });
             const [session] = await tx.select().from(schema.trainingSessions)
               .where(and(
                 eq(schema.trainingSessions.id, sessionId),
@@ -1544,54 +1592,110 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_apply_substitution",
-      description: "Apply a substitution by proposal id + chosen slug. Candidates with trade-offs are chosen by the user (MRTR when ambiguous).",
-      risk: "state-change",
+      description: "Apply a persisted substitution proposal. The user chooses one offered candidate through a standard MRTR input response.",
+      risk: "confirmation",
       inputSchema: {
         type: "object",
         properties: {
           runHandle: { type: "string" },
           substitutionProposalId: { type: "string" },
-          chosenSlug: { type: "string" },
           reason: { type: "string" },
           idempotencyKey: { type: "string" },
         },
-        required: ["runHandle", "substitutionProposalId", "chosenSlug", "idempotencyKey"],
+        required: ["runHandle", "substitutionProposalId", "idempotencyKey"],
       },
       execute: async (inv) => {
         try {
+          await requireRun(inv.principalUserId, inv.args, "health_apply_substitution");
           const proposalId = str(inv.args, "substitutionProposalId");
-          const result = await writes.execute(
-            writeInput(inv, "health_apply_substitution", proposalId),
-            async (tx) => {
-              const applied = await createSubstitutionEngine(tx as unknown as Db).apply({
-                userId: inv.principalUserId,
+          if (inv.requestState === undefined) {
+            const pending = await createSubstitutionEngine(db)
+              .readPendingProposal(inv.principalUserId, proposalId);
+            const choices = pending.candidates.map((candidate) => candidate.slug);
+            return await makeConfirmation(
+              "health_apply_substitution",
+              proposalId,
+              inv,
+              "请选择要应用的替代动作；系统只会转移原动作尚未完成的组数。",
+              [],
+              {
                 substitutionProposalId: proposalId,
-                chosenSlug: str(inv.args, "chosenSlug"),
+                candidateSlugs: choices,
                 reason: optStr(inv.args, "reason") ?? "mcp substitution",
-              });
-              const [replacement] = await tx.select({
-                id: schema.trainingSessionExercises.id,
-                sessionId: schema.trainingSessions.id,
-              }).from(schema.trainingSessionExercises)
-                .innerJoin(
-                  schema.trainingSessions,
-                  eq(schema.trainingSessionExercises.sessionId, schema.trainingSessions.id),
-                )
-                .where(and(
-                  eq(schema.trainingSessionExercises.id, applied.replacementId),
-                  eq(schema.trainingSessions.userId, inv.principalUserId),
-                )).limit(1);
-              const outbox = await tx.select({ id: schema.outboxEvents.id }).from(schema.outboxEvents)
-                .where(and(
-                  eq(schema.outboxEvents.userId, inv.principalUserId),
-                  eq(schema.outboxEvents.aggregateId, applied.replacementId),
-                ));
-              if (!replacement || outbox.length === 0) throw new Error("substitution apply read-back failed");
-              return {
-                response: { replacementId: replacement.id, trainingSessionId: replacement.sessionId },
-                factRefs: [{ type: "training_substitution", id: replacement.id }],
-                outboxEventIds: outbox.map((event) => event.id),
+              },
+              {
+                substitution_choice: {
+                  method: "elicitation/create",
+                  params: {
+                    mode: "form",
+                    message: "请选择一个替代动作",
+                    requestedSchema: {
+                      type: "object",
+                      properties: { choice: { type: "string", enum: choices } },
+                      required: ["choice"],
+                    },
+                  },
+                },
+              },
+            );
+          }
+          const result = await requestStates.consume(
+            inv.requestState,
+            pendingBinding("health_apply_substitution", proposalId, inv),
+            async (tx, pending) => {
+              const payload = pending.payloadJson as {
+                candidateSlugs?: unknown;
+                reason?: unknown;
               };
+              const candidateSlugs = Array.isArray(payload.candidateSlugs)
+                ? payload.candidateSlugs.filter((value): value is string => typeof value === "string")
+                : [];
+              const chosenSlug = acceptedSelections(inv.inputResponses)["substitution_choice"];
+              if (!chosenSlug || !candidateSlugs.includes(chosenSlug)) {
+                throw new RangeError("substitution_choice must accept one offered candidate");
+              }
+              return writes.executeInTransaction(
+                tx,
+                writeInput(inv, "health_apply_substitution", proposalId),
+                async (writeTx) => {
+                  const applied = await createSubstitutionEngine(writeTx as unknown as Db).apply({
+                    userId: inv.principalUserId,
+                    substitutionProposalId: proposalId,
+                    chosenSlug,
+                    reason: typeof payload.reason === "string" ? payload.reason : "mcp substitution",
+                  });
+                  const [replacement] = await writeTx.select({
+                    id: schema.trainingSessionExercises.id,
+                    sessionId: schema.trainingSessions.id,
+                  }).from(schema.trainingSessionExercises)
+                    .innerJoin(
+                      schema.trainingSessions,
+                      eq(schema.trainingSessionExercises.sessionId, schema.trainingSessions.id),
+                    )
+                    .where(and(
+                      eq(schema.trainingSessionExercises.id, applied.replacementId),
+                      eq(schema.trainingSessions.userId, inv.principalUserId),
+                    )).limit(1);
+                  const outbox = await writeTx.select({ id: schema.outboxEvents.id })
+                    .from(schema.outboxEvents)
+                    .where(and(
+                      eq(schema.outboxEvents.userId, inv.principalUserId),
+                      eq(schema.outboxEvents.aggregateId, applied.replacementId),
+                    ));
+                  if (!replacement || outbox.length === 0) {
+                    throw new Error("substitution apply read-back failed");
+                  }
+                  return {
+                    response: {
+                      replacementId: replacement.id,
+                      trainingSessionId: replacement.sessionId,
+                      chosenSlug,
+                    },
+                    factRefs: [{ type: "training_substitution", id: replacement.id }],
+                    outboxEventIds: outbox.map((event) => event.id),
+                  };
+                },
+              );
             },
           );
           return complete(result.response);
@@ -1900,6 +2004,9 @@ export function createHealthToolCatalog(
         }
         if (error instanceof CandidateSelectionError) {
           return toolError("proposal_stale", error.message);
+        }
+        if (error instanceof SubstitutionProposalError) {
+          return toolError("proposal_stale", error.reason);
         }
         if (error instanceof WriteCommandError) {
           return toolError(error.code, error.message);

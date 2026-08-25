@@ -36,12 +36,26 @@ export interface SubstitutionCandidate {
   lost: string[];
 }
 
+export type SubstitutionReasonCode =
+  | "equipment_occupied"
+  | "equipment_unavailable"
+  | "comfort"
+  | "preference";
+
+export interface SubstitutionAvailability {
+  reasonCode: SubstitutionReasonCode;
+  unavailableEquipment: string[];
+  availableEquipment?: string[];
+  occupiedExerciseSlug?: string;
+}
+
 export interface SubstitutionProposalView {
   substitutionProposalId: string;
   originalSessionExerciseId: string;
   originalSlug: string;
   remainingSets: number; // the ONLY budget a replacement may inherit
   candidates: SubstitutionCandidate[];
+  equipmentAvailability: SubstitutionAvailability;
   volumeNote: string;
   expiresAt: string;
 }
@@ -62,7 +76,15 @@ export function createSubstitutionEngine(db: Db) {
    * Candidates are filtered by: active block constraints (pattern + body-part
    * family), contraindication tags, repeated user rejections, self.
    */
-  async function propose(userId: string, sessionId: string, sessionExerciseId: string): Promise<SubstitutionProposalView> {
+  async function propose(
+    userId: string,
+    sessionId: string,
+    sessionExerciseId: string,
+    availability: SubstitutionAvailability = {
+      reasonCode: "preference",
+      unavailableEquipment: [],
+    },
+  ): Promise<SubstitutionProposalView> {
     // WO-HS-02: verify user -> session -> exercise before touching anything.
     const [session] = await db.select().from(schema.trainingSessions)
       .where(and(eq(schema.trainingSessions.id, sessionId), eq(schema.trainingSessions.userId, userId)))
@@ -80,6 +102,12 @@ export function createSubstitutionEngine(db: Db) {
       .where(eq(schema.exerciseDefinitions.slug, original.exerciseSlug))
       .limit(1);
     if (!definition) throw new RangeError(`no definition for ${original.exerciseSlug}`);
+    if (
+      availability.occupiedExerciseSlug !== undefined
+      && availability.occupiedExerciseSlug !== original.exerciseSlug
+    ) {
+      throw new RangeError("occupiedExerciseSlug does not match the session exercise");
+    }
 
     const doneSets = await db.select({ setNumber: schema.trainingSetLogs.setNumber })
       .from(schema.trainingSetLogs)
@@ -139,9 +167,26 @@ export function createSubstitutionEngine(db: Db) {
     // then same-muscle fallbacks — all filtered through definitions.
     const all = await db.select().from(schema.exerciseDefinitions);
     const userAlternateSlugs = new Set(userSubs.map((s) => s.toExerciseSlug));
+    const unavailable = new Set(
+      availability.unavailableEquipment.map((value) => value.trim().toLowerCase()).filter(Boolean),
+    );
+    const available = new Set(
+      (availability.availableEquipment ?? []).map((value) => value.trim().toLowerCase()).filter(Boolean),
+    );
+    const equipmentIsUnavailable = (slug: string, equipment: string | null) => (
+      unavailable.has(slug.toLowerCase())
+      || (equipment !== null && unavailable.has(equipment.toLowerCase()))
+    );
+    const equipmentIsAvailable = (equipment: string | null) => (
+      available.size === 0
+      || (equipment !== null && available.has(equipment.toLowerCase()))
+    );
 
     const scored = all
       .filter((e) => e.slug !== original.exerciseSlug)
+      .filter((e) => e.trainingPurpose === definition.trainingPurpose)
+      .filter((e) => !equipmentIsUnavailable(e.slug, e.equipment))
+      .filter((e) => equipmentIsAvailable(e.equipment))
       .filter((e) => !blockedPatterns.has(e.movementPattern)) // active constraints win
       .filter((e) => !e.contraindicationTags.some((tag) => contraindicated.has(tag)))
       .filter((e) => !rejectedSlugs.has(e.slug)) // repeatedly rejected by this user
@@ -177,6 +222,9 @@ export function createSubstitutionEngine(db: Db) {
           .map((m) => `新增主肌群：${m}`),
       ],
     }));
+    if (candidates.length === 0) {
+      throw new SubstitutionProposalError("no_candidate_matches_constraints_and_equipment");
+    }
 
     // Persist: apply() will only accept the id + chosen slug.
     return db.transaction(async (tx) => {
@@ -202,6 +250,10 @@ export function createSubstitutionEngine(db: Db) {
         equipmentSnapshotJson: {
           originalEquipment: definition.equipment,
           originalStabilityDemand: definition.stabilityDemand,
+          reasonCode: availability.reasonCode,
+          unavailableEquipment: [...unavailable],
+          availableEquipment: [...available],
+          occupiedExerciseSlug: availability.occupiedExerciseSlug ?? null,
         },
       }).returning();
       if (!saved) throw new Error("substitution proposal insert returned no row");
@@ -212,6 +264,14 @@ export function createSubstitutionEngine(db: Db) {
         originalSlug: original.exerciseSlug,
         remainingSets,
         candidates,
+        equipmentAvailability: {
+          reasonCode: availability.reasonCode,
+          unavailableEquipment: [...unavailable],
+          ...(available.size > 0 ? { availableEquipment: [...available] } : {}),
+          ...(availability.occupiedExerciseSlug
+            ? { occupiedExerciseSlug: availability.occupiedExerciseSlug }
+            : {}),
+        },
         volumeNote: `仅转移未完成的 ${remainingSets} 组；已完成 ${doneSets.length} 组保留为 actual，不叠加`,
         expiresAt: saved.expiresAt.toISOString(),
       };
@@ -319,5 +379,27 @@ export function createSubstitutionEngine(db: Db) {
     });
   }
 
-  return { propose, apply };
+  async function readPendingProposal(userId: string, proposalId: string): Promise<{
+    substitutionProposalId: string;
+    candidates: SubstitutionCandidate[];
+    expiresAt: string;
+  }> {
+    const [proposal] = await db.select().from(schema.substitutionProposals)
+      .where(and(
+        eq(schema.substitutionProposals.id, proposalId),
+        eq(schema.substitutionProposals.userId, userId),
+        eq(schema.substitutionProposals.status, "pending"),
+      ))
+      .limit(1);
+    if (!proposal || proposal.expiresAt <= new Date()) {
+      throw new SubstitutionProposalError("proposal_missing_or_expired");
+    }
+    return {
+      substitutionProposalId: proposal.id,
+      candidates: proposal.candidateJson as unknown as SubstitutionCandidate[],
+      expiresAt: proposal.expiresAt.toISOString(),
+    };
+  }
+
+  return { propose, apply, readPendingProposal };
 }

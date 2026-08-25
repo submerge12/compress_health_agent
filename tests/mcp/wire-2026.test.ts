@@ -1299,7 +1299,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const prepared = await client.request(toolCall(2, "health_prepare_training", {
       runHandle,
       date: "2026-08-18",
-      day: "B",
+      day: "A",
       idempotencyKey: "wire-j05-prepare",
     }));
     const proposalId = (prepared.result?.structuredContent as { trainingProposalId: string }).trainingProposalId;
@@ -1307,7 +1307,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
       runHandle,
       trainingProposalId: proposalId,
       date: "2026-08-18",
-      dayRole: "B",
+      dayRole: "A",
       idempotencyKey: "wire-j05-start",
     }));
     const sessionId = (started.result?.structuredContent as { trainingSessionId: string }).trainingSessionId;
@@ -1328,24 +1328,47 @@ describe("MCP 2026-07-28 stdio wire", () => {
       runHandle,
       trainingSessionId: sessionId,
       sessionExerciseId: original.id,
+      reasonCode: "equipment_unavailable",
+      unavailableEquipment: ["barbell"],
+      availableEquipment: ["dumbbell", "machine", "cable"],
       idempotencyKey: "wire-j05-propose-substitution",
     }));
     const proposal = proposed.result?.structuredContent as {
       substitutionProposalId: string;
       remainingSets: number;
-      candidates: Array<{ slug: string }>;
+      candidates: Array<{ slug: string; equipment: string | null }>;
     };
     expect(proposal.remainingSets).toBe(original.targetSets - 1);
     expect(proposal.candidates.length).toBeGreaterThan(0);
-    const applied = await client.request(toolCall(7, "health_apply_substitution", {
+    expect(proposal.candidates.every((candidate) => candidate.equipment !== "barbell")).toBe(true);
+    expect(proposal.candidates.every((candidate) => (
+      candidate.equipment !== null && ["dumbbell", "machine", "cable"].includes(candidate.equipment)
+    ))).toBe(true);
+
+    const applyArgs = {
       runHandle,
       substitutionProposalId: proposal.substitutionProposalId,
-      chosenSlug: proposal.candidates[0]!.slug,
       reason: "equipment occupied",
       idempotencyKey: "wire-j05-apply-substitution",
+    };
+    const pending = await client.request(toolCall(7, "health_apply_substitution", applyArgs));
+    expect(pending.result?.resultType).toBe("input_required");
+    const inputRequests = pending.result?.inputRequests as Record<string, {
+      params: { requestedSchema: { properties: { choice: { enum?: string[] } } } };
+    }>;
+    const offered = inputRequests.substitution_choice!.params
+      .requestedSchema.properties.choice.enum!;
+    expect(offered).toEqual(proposal.candidates.map((candidate) => candidate.slug));
+    const chosenSlug = offered[0]!;
+    const applied = await client.request(toolCall(8, "health_apply_substitution", applyArgs, {
+      requestState: pending.result?.requestState as string,
+      inputResponses: {
+        substitution_choice: { action: "accept", content: { choice: chosenSlug } },
+      },
     }));
+    expect(applied.result?.resultType).toBe("complete");
     const replacementId = (applied.result?.structuredContent as { replacementId: string }).replacementId;
-    const readBack = await client.request(resourceRead(8, `health://training/sessions/${sessionId}`, runHandle));
+    const readBack = await client.request(resourceRead(9, `health://training/sessions/${sessionId}`, runHandle));
     const readBackBody = JSON.parse(
       (readBack.result?.contents as Array<{ text: string }>)[0]!.text,
     ) as {
