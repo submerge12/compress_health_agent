@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { once } from "node:events";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -40,7 +41,12 @@ class WireClient {
   readonly waiters: Array<(message: JsonRpcResponse) => void> = [];
   readonly stderr: string[] = [];
 
-  constructor(options: { externalUserId?: string; actor?: string } = {}) {
+  constructor(options: {
+    externalUserId?: string;
+    actor?: string;
+    allowUserProvisioning?: boolean;
+    testNow?: string;
+  } = {}) {
     const binding = options.externalUserId ?? externalUserId;
     testExternalUserIds.add(binding);
     const tsxCli = resolve("node_modules", "tsx", "dist", "cli.mjs");
@@ -51,6 +57,9 @@ class WireClient {
         DATABASE_URL,
         COMPASS_HEALTH_USER_BINDING: binding,
         COMPASS_HEALTH_ACTOR: options.actor ?? "codex-primary",
+        COMPASS_HEALTH_ALLOW_USER_PROVISIONING:
+          options.allowUserProvisioning === false ? "false" : "true",
+        ...(options.testNow ? { COMPASS_HEALTH_TEST_NOW: options.testNow } : {}),
         NODE_ENV: "test",
       },
       stdio: "pipe",
@@ -202,6 +211,100 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const tools = response.result?.tools as Array<{ name: string }>;
     expect(tools.map((tool) => tool.name)).toContain("health_begin_run");
   }, 20_000);
+
+  it("rejects an unknown production user binding without provisioning a blank user", async () => {
+    const binding = `mcp-wire-unknown-binding-${process.pid}-${Date.now()}`;
+    const tsxCli = resolve("node_modules", "tsx", "dist", "cli.mjs");
+    const child = spawn(process.execPath, [tsxCli, "src/mcp/stdio.ts"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_URL,
+        COMPASS_HEALTH_USER_BINDING: binding,
+        COMPASS_HEALTH_ALLOW_USER_PROVISIONING: "false",
+        NODE_ENV: "production",
+      },
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    const stderr: string[] = [];
+    createInterface({ input: child.stderr }).on("line", (line) => stderr.push(line));
+    const exitCode = await Promise.race([
+      once(child, "exit").then(([code]) => code as number | null),
+      new Promise<null>((resolveTimeout) => setTimeout(() => resolveTimeout(null), 4_000)),
+    ]);
+    if (exitCode === null && !child.killed) {
+      child.kill();
+      await once(child, "exit");
+    }
+    expect(exitCode, stderr.join(" | ")).toBe(1);
+    expect(stderr.join(" | ")).toContain("unknown user binding");
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const rows = await sql`
+        SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      expect(rows).toHaveLength(0);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 12_000);
+
+  it("uses the bound user's timezone for tool and resource default dates", async () => {
+    const binding = `mcp-wire-local-date-${process.pid}-${Date.now()}`;
+    testExternalUserIds.add(binding);
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      await sql`
+        INSERT INTO compass_health.users (external_id, locale, timezone)
+        VALUES (${binding}, 'en', 'America/Los_Angeles')`;
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+
+    const client = new WireClient({
+      externalUserId: binding,
+      allowUserProvisioning: false,
+      testNow: "2035-04-01T00:30:00.000Z",
+    });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire local date boundary",
+      idempotencyKey: "wire-local-date-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const recorded = await client.request(toolCall(2, "health_record_water", {
+      runHandle,
+      amountMl: 275,
+      idempotencyKey: "wire-local-date-water",
+    }));
+    expect(recorded.result?.resultType).toBe("complete");
+
+    const resource = await client.request(resourceRead(
+      3,
+      "health://daily-state/today",
+      runHandle,
+    ));
+    const body = JSON.parse(
+      (resource.result?.contents as Array<{ text: string }>)[0]!.text,
+    ) as { localDate: string };
+    expect(body.localDate).toBe("2035-03-31");
+
+    const verify = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [row] = await verify`
+        SELECT water.log_date::text AS log_date, outbox.payload_json
+        FROM compass_health.water_logs water
+        JOIN compass_health.users usr ON usr.id = water.user_id
+        JOIN compass_health.outbox_events outbox ON outbox.aggregate_id = water.id::text
+        WHERE usr.external_id = ${binding}
+          AND water.amount_ml = 275`;
+      expect(row?.log_date).toBe("2035-03-31");
+      expect(row?.payload_json).toMatchObject({ observedOn: "2035-03-31" });
+    } finally {
+      await verify.end({ timeout: 3 });
+    }
+  }, 25_000);
 
   it("covers every J01-J09 journey with discoverable tools", async () => {
     const client = new WireClient();

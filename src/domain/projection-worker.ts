@@ -18,7 +18,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
 import { createDailyStateService, type DailyStateService } from "./daily-state.js";
-import { createTimezoneResolver } from "./timezone.js";
+import { createTimezoneResolver, createUserLocalDateResolver } from "./timezone.js";
 import type { Repository } from "../db/repository.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
@@ -76,16 +76,17 @@ export function createProjectionWorker(
   options: ProjectionWorkerOptions = {},
 ) {
   const dailyState: DailyStateService = createDailyStateService(db, repo);
+  const now = options.now ?? (() => new Date());
   const resolveTimezone = createTimezoneResolver(db);
+  const getUserLocalDate = createUserLocalDateResolver(db, now);
   const workerId = options.workerId ?? `projection-${process.pid}-${randomUUID()}`;
   const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
   const batchSize = options.batchSize ?? BATCH_SIZE;
-  const now = options.now ?? (() => new Date());
 
-  function extractEventDay(event: typeof schema.outboxEvents.$inferSelect): string {
+  async function extractEventDay(event: typeof schema.outboxEvents.$inferSelect): Promise<string> {
     const payloadDay = (event.payloadJson as { observedOn?: string; logDate?: string } | null)?.observedOn
       ?? (event.payloadJson as { logDate?: string } | null)?.logDate;
-    return payloadDay ?? new Date().toISOString().slice(0, 10);
+    return payloadDay ?? getUserLocalDate(event.userId);
   }
 
   /** Persist ownership before the row lock is released. Expired leases are reclaimable. */
@@ -157,7 +158,7 @@ export function createProjectionWorker(
       }
       // Every known aggregate feeds the user/day projection of its event day.
       const tz = await resolveTimezone(event.userId);
-      await dailyState.persistDailyProjection(event.userId, extractEventDay(event), tz);
+      await dailyState.persistDailyProjection(event.userId, await extractEventDay(event), tz);
       return true;
     } catch (error) {
       if (String(error instanceof Error ? error.message : error).startsWith("unsupported_event_type")) {

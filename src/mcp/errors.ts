@@ -8,6 +8,7 @@ export type McpErrorCode =
   | "protocol_version_mismatch"
   | "unauthorized_actor"
   | "missing_external_user_id"
+  | "unknown_user_binding"
   | "not_found"
   | "state_conflict"
   | "proposal_stale"
@@ -50,6 +51,7 @@ export function toToolError(error: unknown): { code: McpErrorCode; message: stri
     case "state_conflict":
     case "invalid_session_state":
     case "missing_external_user_id":
+    case "unknown_user_binding":
       return { code: raw.code as McpErrorCode, message: raw.message ?? raw.code };
     case "not_owned":
       return { code: "not_found", message: "resource not found for this user" };

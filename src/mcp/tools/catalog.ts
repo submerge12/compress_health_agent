@@ -28,6 +28,7 @@ import {
 } from "../../domain/diet-log-service.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
 import { createProjectionWorker } from "../../domain/projection-worker.js";
+import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createHealthRecordingService } from "../../domain/health-recording-service.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
 import { createPainCommand } from "../../training/prepared-session.js";
@@ -103,12 +104,17 @@ function toolError(code: string, message: string): ToolOutcome {
 export function createHealthToolCatalog(
   db: Db,
   repo: Repository,
-  options: { toolContext?: ToolContext; conformanceProfile?: boolean } = {},
+  options: {
+    toolContext?: ToolContext;
+    conformanceProfile?: boolean;
+    now?: () => Date;
+  } = {},
 ) {
   const runs = createRunHandleService(db);
   const diet = createDietLogService(db, repo);
   const requestStates = createRequestStateService(db);
   const writes = createWriteCommandService(db);
+  const getUserLocalDate = createUserLocalDateResolver(db, options.now);
 
   const CONFIRMATION_TTL_MS = 10 * 60_000;
 
@@ -273,8 +279,8 @@ export function createHealthToolCatalog(
     return selections;
   }
 
-  function today(): string {
-    return new Date().toISOString().slice(0, 10);
+  async function today(userId: string): Promise<string> {
+    return getUserLocalDate(userId);
   }
 
   function addDays(date: string, days: number): string {
@@ -396,7 +402,8 @@ export function createHealthToolCatalog(
       },
       execute: async (inv) => {
         const ctx = await buildToolContext(inv.principalUserId);
-        const startDate = optStr(inv.args, "startDate") ?? addDays(today(), 1);
+        const startDate = optStr(inv.args, "startDate")
+          ?? addDays(await today(inv.principalUserId), 1);
         const endDate = addDays(startDate, 6);
         const result = await writes.execute(
           writeInput(inv, "health_generate_diet_plan", startDate),
@@ -545,7 +552,11 @@ export function createHealthToolCatalog(
               aggregateType: "user_decision",
               aggregateId: feedback.feedbackId,
               eventType: "media.feedback_recorded",
-              payloadJson: { observedOn: today(), segmentId, helpful },
+              payloadJson: {
+                observedOn: await today(inv.principalUserId),
+                segmentId,
+                helpful,
+              },
             }).returning({ id: schema.outboxEvents.id });
             if (!readBack || !outbox) throw new Error("media feedback read-back failed");
             return {
@@ -567,7 +578,10 @@ export function createHealthToolCatalog(
         properties: { date: ISO_DATE },
       },
       execute: async (inv) => complete(await createProjectionWorker(db, repo)
-        .getDiagnostics(inv.principalUserId, optStr(inv.args, "date") ?? today())),
+        .getDiagnostics(
+          inv.principalUserId,
+          optStr(inv.args, "date") ?? await today(inv.principalUserId),
+        )),
     },
     {
       name: "health_replay_projection",
@@ -583,7 +597,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_replay_projection", date),
           async (tx) => {
@@ -644,7 +658,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_acknowledge_rest", date),
           async (tx) => {
@@ -717,7 +731,7 @@ export function createHealthToolCatalog(
 
           // MRTR retry path: apply the user's confirmed resolution.
           if (inv.requestState !== undefined) {
-            const targetId = `diet:${optStr(inv.args, "date") ?? today()}:${str(inv.args, "mealType")}`;
+            const targetId = `diet:${optStr(inv.args, "date") ?? await today(inv.principalUserId)}:${str(inv.args, "mealType")}`;
             const committed = await requestStates.consume(
               inv.requestState,
               pendingBinding("health_log_meal", targetId, inv),
@@ -780,7 +794,7 @@ export function createHealthToolCatalog(
           // First call: preview; ambiguous -> MRTR.
           const previewResult = await diet.preview(ctx, {
             description: str(inv.args, "description"),
-            date: optStr(inv.args, "date") ?? today(),
+            date: optStr(inv.args, "date") ?? await today(inv.principalUserId),
             mealType: str(inv.args, "mealType"),
           });
           if (previewResult.status === "needs_confirmation") {
@@ -793,7 +807,7 @@ export function createHealthToolCatalog(
               ...(estimate.unmatched ?? []).map((n) => `${n.segment ?? "item"} (未匹配)`,
               ),
             ];
-            const date = optStr(inv.args, "date") ?? today();
+            const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
             const mealType = str(inv.args, "mealType");
             const inputRequests: Record<string, unknown> = {};
             (estimate.needsConfirmation ?? []).forEach((diagnostic, index) => {
@@ -846,7 +860,7 @@ export function createHealthToolCatalog(
           }
 
           // Clean estimate -> commit directly.
-          const date = optStr(inv.args, "date") ?? today();
+          const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
           const mealType = str(inv.args, "mealType");
           const targetId = `diet:${date}:${mealType}`;
           const committed = await writes.execute(
@@ -966,7 +980,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "amountMl", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(writeInput(inv, "health_record_water", date), async (tx) => {
           const recorded = await createHealthRecordingService(tx as unknown as Db).recordWater({
             userId: inv.principalUserId,
@@ -1000,7 +1014,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "activityType", "durationMinutes", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_record_activity", date),
           async (tx) => {
@@ -1036,7 +1050,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "hours", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_record_sleep", date),
           async (tx) => {
@@ -1074,7 +1088,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "level", "scope", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_record_fatigue", date),
           async (tx) => {
@@ -1114,7 +1128,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "bodyPart", "severity", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_report_pain", date),
           async (tx) => {
@@ -1236,7 +1250,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "idempotencyKey"],
       },
       execute: async (inv) => {
-        const date = optStr(inv.args, "date") ?? today();
+        const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);
         const day = optStr(inv.args, "day") as "A" | "B" | "C" | undefined;
         const result = await writes.execute(
           writeInput(inv, "health_prepare_training", `${date}:${day ?? "cycle"}`),
@@ -1311,7 +1325,7 @@ export function createHealthToolCatalog(
                 .startSessionFromProposal({
                   userId: inv.principalUserId,
                   proposalId,
-                  sessionDate: optStr(inv.args, "date") ?? today(),
+                  sessionDate: optStr(inv.args, "date") ?? await today(inv.principalUserId),
                   ...(optStr(inv.args, "dayRole") !== undefined
                     ? { dayRole: optStr(inv.args, "dayRole") as "A" | "B" | "C" }
                     : {}),
@@ -1805,7 +1819,10 @@ export function createHealthToolCatalog(
               aggregateType: "plan_version",
               aggregateId: readBack.id,
               eventType: "plan.version_proposed",
-              payloadJson: { observedOn: today(), reflectionId },
+              payloadJson: {
+                observedOn: await today(inv.principalUserId),
+                reflectionId,
+              },
             }).returning({ id: schema.outboxEvents.id });
             if (!outbox) throw new Error("plan proposal outbox failed");
             return {
@@ -1877,7 +1894,10 @@ export function createHealthToolCatalog(
                   aggregateType: confirmed ? "plan_version" : "user_decision",
                   aggregateId: confirmed ? planVersionId : decision.id,
                   eventType: confirmed ? "plan.version_activated" : "plan.activation_declined",
-                  payloadJson: { observedOn: today(), planVersionId },
+                  payloadJson: {
+                    observedOn: await today(inv.principalUserId),
+                    planVersionId,
+                  },
                 }).returning({ id: schema.outboxEvents.id });
                 const [readBack] = await writeTx.select().from(schema.planVersions)
                   .where(and(

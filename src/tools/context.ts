@@ -32,6 +32,8 @@ export interface InitContextOptions {
   externalUserId: string;
   locale?: "zh" | "en";
   timezone?: string;
+  /** Explicit opt-in for creating a missing user binding. */
+  allowUserProvisioning?: boolean;
 }
 
 export async function initToolContext(options: InitContextOptions): Promise<ToolContext> {
@@ -45,7 +47,16 @@ export async function initToolContext(options: InitContextOptions): Promise<Tool
     embeddingModel: process.env.EMBEDDING_MODEL,
   });
 
-  const user = await repo.findOrCreateUser(options.externalUserId, {
+  const allowUserProvisioning = options.allowUserProvisioning
+    ?? process.env.NODE_ENV === "test";
+  let user = await repo.findUserByExternalId(options.externalUserId);
+  if (!user && !allowUserProvisioning) {
+    await pool.end({ timeout: 5 });
+    throw new Error(
+      `unknown user binding: ${options.externalUserId}; run pnpm user:bootstrap --external-id ${options.externalUserId}`,
+    );
+  }
+  user ??= await repo.findOrCreateUser(options.externalUserId, {
     locale: options.locale ?? "zh",
     timezone: options.timezone ?? "Asia/Shanghai",
   });

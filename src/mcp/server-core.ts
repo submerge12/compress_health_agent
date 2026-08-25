@@ -41,6 +41,8 @@ export interface CreateHealthMcpServerOptions extends ActorBindingOptions {
   db: Db;
   repo: Repository;
   toolContext: ToolContext;
+  /** Injectable clock for deterministic boundary tests. */
+  now?: () => Date;
   /** Test-only official conformance diagnostics; never enabled by stdio. */
   conformanceProfile?: boolean;
 }
@@ -51,7 +53,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     ...options,
     expectedUserId: options.toolContext.userId,
   });
-  const resources = createResourceCatalog(db, repo);
+  const resources = createResourceCatalog(db, repo, { now: options.now });
   const runs = createRunHandleService(db);
   const requestStates = createRequestStateService(db);
   const verifiedActor = options.actor?.trim() || "codex-primary";
@@ -160,6 +162,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
   const tools = createHealthToolCatalog(db, repo, {
     toolContext: options.toolContext,
     conformanceProfile: options.conformanceProfile,
+    now: options.now,
   });
   server.setRequestHandler("tools/list", async () => {
     return {

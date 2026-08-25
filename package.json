@@ -38,7 +38,8 @@
     "db:seed": "tsx src/db/run-seed.ts",
     "db:embed-catalog": "tsx src/db/embed-catalog.ts",
     "db:embed-memories": "tsx src/db/embed-memories.ts",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "user:bootstrap": "tsx src/db/bootstrap-user.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.0.0",

@@ -30,6 +30,13 @@ export interface CycleDecision {
 
 const DEFAULT_CYCLE = ["A", "B", "REST", "C", "REST"];
 
+function addCalendarDays(localDate: string, days: number): string {
+  const value = new Date(`${localDate}T00:00:00.000Z`);
+  if (Number.isNaN(value.getTime())) throw new RangeError(`invalid local date: ${localDate}`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
 /** Movement patterns each A/B/C reference day trains (from the seed program). */
 function patternsForRole(role: string): string[] {
   const day = THREE_SPLIT_DAYS.find((d) => d.dayRole === role);
@@ -110,7 +117,7 @@ export function createCycleEngine(db: Db) {
     }
 
     const candidatePatterns = patternsForRole(role);
-    const obsSince = new Date(Date.now() - 2 * 86400_000).toISOString().slice(0, 10);
+    const obsSince = addCalendarDays(onDate, -2);
     const observations = await db.select().from(schema.healthObservationEvents)
       .where(and(
         eq(schema.healthObservationEvents.userId, userId),

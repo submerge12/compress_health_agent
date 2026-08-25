@@ -54,17 +54,10 @@ export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
       .where(eq(schema.users.externalId, binding))
       .limit(1);
     if (!user) {
-      // Auto-provision the bound local user on first use — STDIO mode is a
-      // single-user deployment by definition.
-      const [created] = await db.insert(schema.users)
-        .values({ externalId: binding, locale: "zh", timezone: "Asia/Shanghai" })
-        .onConflictDoNothing()
-        .returning();
-      const row = created ?? (await db.select().from(schema.users)
-        .where(eq(schema.users.externalId, binding)).limit(1))[0];
-      if (!row) throw new McpProtocolError("internal", "user provisioning failed");
-      assertExpectedUser(row.id, options.expectedUserId);
-      return { userId: row.id, externalUserId: binding, actor: verifiedActor(options) };
+      throw new McpProtocolError(
+        "unknown_user_binding",
+        `unknown user binding: ${binding}; provision it explicitly before starting MCP`,
+      );
     }
     assertExpectedUser(user.id, options.expectedUserId);
     return { userId: user.id, externalUserId: binding, actor: verifiedActor(options) };

@@ -13,6 +13,7 @@
  * - COMPASS_HEALTH_USER_BINDING      (required) external id of the single
  *                                     local user; no binding, no tools
  * - COMPASS_HEALTH_ACTOR             (optional) actor label, default codex-primary
+ * - COMPASS_HEALTH_ALLOW_USER_PROVISIONING (optional) explicit opt-in; default false
  *
  * STDIO mode never listens on a port and never reads bearer tokens: the OS
  * user that launched the process IS the principal.
@@ -28,6 +29,8 @@ async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL
     ?? "postgres://compass:compass@localhost:5433/compass_health";
   const externalUserId = process.env.COMPASS_HEALTH_USER_BINDING;
+  const allowUserProvisioning = process.env.COMPASS_HEALTH_ALLOW_USER_PROVISIONING
+    ?.trim().toLowerCase() === "true";
 
   if (!externalUserId) {
     // Fail loudly on stderr (stdout is the MCP channel) and exit — a server
@@ -43,6 +46,7 @@ async function main(): Promise<void> {
     locale: "zh",
     databaseUrl,
     timezone: process.env.COMPASS_HEALTH_TIMEZONE ?? "Asia/Shanghai",
+    allowUserProvisioning,
   });
   if (!ctx.db) {
     process.stderr.write("compass-health MCP: database-backed context is required\n");
@@ -61,6 +65,7 @@ async function main(): Promise<void> {
         ),
       })
     : undefined;
+  const now = testClock();
 
   let handle: StdioServerHandle | undefined;
   handle = serveStdio(() => createHealthMcpServer({
@@ -69,6 +74,7 @@ async function main(): Promise<void> {
       toolContext: ctx,
       externalUserId,
       actor: process.env.COMPASS_HEALTH_ACTOR,
+      ...(now ? { now } : {}),
     }), {
       legacy: "reject",
       onerror: (error) => {
@@ -91,6 +97,18 @@ async function main(): Promise<void> {
   process.stdin.once("end", () => void shutdown());
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function testClock(): (() => Date) | undefined {
+  const value = process.env.NODE_ENV === "test"
+    ? process.env.COMPASS_HEALTH_TEST_NOW?.trim()
+    : undefined;
+  if (!value) return undefined;
+  const instant = new Date(value);
+  if (Number.isNaN(instant.getTime())) {
+    throw new RangeError("COMPASS_HEALTH_TEST_NOW must be an ISO timestamp");
+  }
+  return () => new Date(instant.getTime());
 }
 
 main().catch((error: unknown) => {

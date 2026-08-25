@@ -12,6 +12,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import type { Repository } from "../../db/repository.js";
 import { createDailyStateService } from "../../domain/daily-state.js";
 import { createProjectionWorker } from "../../domain/projection-worker.js";
+import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createTrainingService } from "../../training/training-service.js";
 import { CACHE_TTL_MS } from "../server-info.js";
 import { McpProtocolError } from "../errors.js";
@@ -37,10 +38,15 @@ export const RESOURCE_URIS = [
   "health://system/capabilities",
 ] as const;
 
-export function createResourceCatalog(db: Db, repo: Repository) {
+export function createResourceCatalog(
+  db: Db,
+  repo: Repository,
+  options: { now?: () => Date } = {},
+) {
   const dailyState = createDailyStateService(db, repo);
   const projectionWorker = createProjectionWorker(db, repo);
   const training = createTrainingService(db);
+  const getUserLocalDate = createUserLocalDateResolver(db, options.now);
   async function listResources(principal: Principal): Promise<Array<Record<string, unknown>>> {
     void principal; // listing is identity-independent; reads are scoped
     return [
@@ -114,7 +120,7 @@ export function createResourceCatalog(db: Db, repo: Repository) {
   }
 
   async function readBody(principal: Principal, uri: string): Promise<unknown> {
-    const today = new Date().toISOString().slice(0, 10);
+    const today = await getUserLocalDate(principal.userId);
     if (uri === "health://profile") {
       const [user] = await db.select().from(schema.users)
         .where(eq(schema.users.id, principal.userId)).limit(1);
