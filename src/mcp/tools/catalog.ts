@@ -34,6 +34,7 @@ import {
 import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createHealthRecordingService } from "../../domain/health-recording-service.js";
 import { createProjectionInvalidationService } from "../../domain/projection-invalidation.js";
+import { createBodyProfileService } from "../../domain/body-profile.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
 import type { MediaStreamUrlIssuer } from "../../media/signed-stream-url.js";
 import { createPainCommand } from "../../training/prepared-session.js";
@@ -382,6 +383,12 @@ export function createHealthToolCatalog(
     return Number.isFinite(n) ? n : undefined;
   }
 
+  function num(args: Record<string, unknown>, key: string): number {
+    const value = optNum(args, key);
+    if (value === undefined) throw new RangeError(`${key} must be a finite number`);
+    return value;
+  }
+
   function setPainEntries(args: Record<string, unknown>): TrainingSetPainInput[] {
     const raw = args["pain"];
     if (raw === undefined || raw === null) return [];
@@ -669,6 +676,96 @@ export function createHealthToolCatalog(
               factRefs,
               outboxEventIds,
               auditEventIds: [audit.id],
+            };
+          },
+        );
+        return complete(result.response);
+      },
+    },
+    {
+      name: "health_update_body_profile",
+      description: "Record an effective-dated body profile version and recompute calorie and macro targets.",
+      risk: "state-change",
+      inputSchema: {
+        type: "object",
+        properties: {
+          runHandle: { type: "string" },
+          effectiveDate: ISO_DATE,
+          sex: { type: "string", enum: ["male", "female"] },
+          ageYears: { type: "integer", minimum: 18, maximum: 120 },
+          heightCm: { type: "number", exclusiveMinimum: 0, maximum: 300 },
+          weightKg: { type: "number", exclusiveMinimum: 0, maximum: 500 },
+          goalWeightKg: { type: "number", exclusiveMinimum: 0, maximum: 500 },
+          activityLevel: {
+            type: "string",
+            enum: ["sedentary", "lightly_active", "moderately_active", "strength_training"],
+          },
+          goal: {
+            type: "string",
+            enum: [
+              "improve_health",
+              "body_recomp",
+              "fat_loss_slow",
+              "fat_loss_moderate",
+              "fat_loss_fast",
+              "muscle_gain_slow",
+              "muscle_gain_moderate",
+              "muscle_gain_fast",
+            ],
+          },
+          trainingCadence: { type: "string", minLength: 1, maxLength: 100 },
+          trainingSplit: { type: "string", minLength: 1, maxLength: 100 },
+          idempotencyKey: { type: "string" },
+        },
+        required: [
+          "runHandle",
+          "effectiveDate",
+          "sex",
+          "ageYears",
+          "heightCm",
+          "weightKg",
+          "goalWeightKg",
+          "activityLevel",
+          "goal",
+          "trainingCadence",
+          "trainingSplit",
+          "idempotencyKey",
+        ],
+      },
+      execute: async (inv) => {
+        const effectiveDate = str(inv.args, "effectiveDate");
+        const result = await writes.execute(
+          writeInput(inv, "health_update_body_profile", effectiveDate),
+          async (tx) => {
+            const recorded = await createBodyProfileService(tx as unknown as Db)
+              .recordEffectiveProfile(inv.principalUserId, {
+                effectiveDate,
+                sex: str(inv.args, "sex") as "male" | "female",
+                ageYears: num(inv.args, "ageYears"),
+                heightCm: num(inv.args, "heightCm"),
+                weightKg: num(inv.args, "weightKg"),
+                goalWeightKg: num(inv.args, "goalWeightKg"),
+                activityLevel: str(inv.args, "activityLevel") as
+                  | "sedentary"
+                  | "lightly_active"
+                  | "moderately_active"
+                  | "strength_training",
+                goal: str(inv.args, "goal") as
+                  | "improve_health"
+                  | "body_recomp"
+                  | "fat_loss_slow"
+                  | "fat_loss_moderate"
+                  | "fat_loss_fast"
+                  | "muscle_gain_slow"
+                  | "muscle_gain_moderate"
+                  | "muscle_gain_fast",
+                trainingCadence: str(inv.args, "trainingCadence"),
+                trainingSplit: str(inv.args, "trainingSplit"),
+              });
+            return {
+              response: { profile: recorded.profile, plan: recorded.plan },
+              factRefs: [{ type: "body_profile", id: recorded.profile.id }],
+              outboxEventIds: [recorded.outboxEventId],
             };
           },
         );

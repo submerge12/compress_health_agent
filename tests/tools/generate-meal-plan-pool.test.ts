@@ -335,6 +335,7 @@ function smartContext(options: {
     seasoningRecords: [],
     repo: {
       getLatestBmrProfile: async () => options.bmrProfile,
+      getEffectiveBmrProfile: async () => options.bmrProfile,
       listUserDishes: async () => [],
       listActiveMemories: async () => [],
       listRejectedSeasoningSlugs: async () => [],

@@ -6,7 +6,7 @@ This gate is evidence from the real Codex MCP path, not a synonym for green unit
 
 1. Put the populated `compass_health` entry in `%USERPROFILE%\.codex\config.toml`; use [.codex/config.toml.example](../.codex/config.toml.example) as the shape. Keep the database URL and external user id out of Git.
 2. Enable Codex feature `mcp_2026_07_28` and retain the per-server `CODEX_MCP_PROTOCOL_VERSION=2026-07-28` opt-in from the example.
-3. Review and back up the target before `pnpm db:migrate`, then run `pnpm build` and `pnpm codex:verify-binding` in the configured `cwd`. Migrations 0021, 0023, and 0024 intentionally update legacy evidence/projection rows; do not apply them to a formal database as part of a wire smoke or without explicit data-migration authorization. Codex must launch `node dist/mcp/stdio.js` directly; a package-manager wrapper corrupts STDIO with banner text.
+3. Review and back up the target before `pnpm db:migrate`, then run `pnpm build` and `pnpm codex:verify-binding` in the configured `cwd`. Migrations 0021, 0023, and 0024 intentionally update legacy evidence/projection rows; do not apply them to a formal database as part of a wire smoke or without explicit data-migration authorization. Migration 0026 is schema-only and adds effective body-profile fields and lookup indexing. Codex must launch `node dist/mcp/stdio.js` directly; a package-manager wrapper corrupts STDIO with banner text.
 4. Restart Codex so it reloads MCP configuration and the project skill.
 5. Confirm `server/discover` reports only protocol `2026-07-28`, the formal tool `resultType` schemas, and no session-id requirement.
 6. Start a separate run for each journey. Never use synthetic health facts in the bound real user.
@@ -19,7 +19,7 @@ If the formal database is behind `MIN_SCHEMA_VERSION`, stop at the startup gate.
 
 | Journey | Real-use condition | Required read-back |
 | --- | --- | --- |
-| J01 | Generate/read diet plan, record an actual meal, resolve a genuinely ambiguous food candidate | Receipt, one fact, Daily State plan/actual/deviation, state revision |
+| J01 | Read the Profile Resource; when the user supplied changed body data, record its effective-dated version; generate/read diet plan, record an actual meal, resolve a genuinely ambiguous food candidate | Profile and plan receipts, Profile Resource read-back, one meal fact, Daily State plan/actual/deviation, state revision |
 | J02 | Prepare and complete a real training session with per-set weight, reps, RIR, muscle feeling, and pain | Session resource with sets, receipt IDs, Daily State |
 | J03 | Only when low sleep actually occurs | Updated Daily State and cycle decision; active plan unchanged |
 | J04 | Only when knee discomfort actually occurs | Pain observation, active constraint, prepared session without blocked movement |

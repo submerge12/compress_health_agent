@@ -161,8 +161,11 @@ export function createResourceCatalog(
 
   async function readBody(principal: Principal, uri: string, today: string): Promise<unknown> {
     if (uri === "health://profile") {
-      const [user] = await db.select().from(schema.users)
-        .where(eq(schema.users.id, principal.userId)).limit(1);
+      const [[user], bodyProfile] = await Promise.all([
+        db.select().from(schema.users)
+          .where(eq(schema.users.id, principal.userId)).limit(1),
+        repo.getEffectiveBmrProfile(principal.userId, today),
+      ]);
       if (!user) throw new McpProtocolError("not_found", "user vanished");
       return {
         userId: user.id,
@@ -170,6 +173,7 @@ export function createResourceCatalog(
         locale: user.locale,
         timezone: user.timezone,
         actor: principal.actor,
+        bodyProfile: bodyProfile ?? null,
       };
     }
     if (uri.startsWith("health://daily-state/")) {

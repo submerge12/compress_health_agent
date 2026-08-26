@@ -789,24 +789,38 @@ export interface SmartGenerateMealPlanInput {
   startDate?: string;
 }
 
+export interface MealPlanProfileBasis {
+  profileId: string | null;
+  effectiveDate: string | null;
+  targetKcal: number;
+  proteinTargetGrams: number | null;
+  fatTargetGrams: number | null;
+  carbsTargetGrams: number | null;
+  usedDefault: boolean;
+}
+
+export type SmartGenerateMealPlanResult = GenerateMealPlanResult & {
+  profileBasis: MealPlanProfileBasis;
+};
+
 export async function handleSmartGenerateMealPlan(
   ctx: ToolContext,
   input: SmartGenerateMealPlanInput,
   dependencies: GenerateMealPlanDependencies | undefined = undefined,
-): Promise<GenerateMealPlanResult> {
+): Promise<SmartGenerateMealPlanResult> {
   const startDate = input.startDate
     ? requireIsoDate(input.startDate)
     : tomorrow();
 
   const [bmrProfile, candidates, preferences] = await Promise.all([
-    ctx.repo.getLatestBmrProfile(ctx.userId),
+    ctx.repo.getEffectiveBmrProfile(ctx.userId, startDate),
     loadCandidateDishes(ctx),
     loadUserPreferences(ctx, { asOfDate: startDate }),
   ]);
 
   const dailyKcalTarget = bmrProfile?.targetKcal ?? 2000;
 
-  return handleGenerateMealPlan(ctx, {
+  const generated = await handleGenerateMealPlan(ctx, {
     startDate,
     dailyKcalTarget,
     dailyProteinTarget: bmrProfile?.proteinTargetGrams,
@@ -815,6 +829,18 @@ export async function handleSmartGenerateMealPlan(
     presetDishes: candidates,
     preferences,
   }, dependencies);
+  return {
+    ...generated,
+    profileBasis: {
+      profileId: bmrProfile?.id ?? null,
+      effectiveDate: bmrProfile?.effectiveDate ?? null,
+      targetKcal: dailyKcalTarget,
+      proteinTargetGrams: bmrProfile?.proteinTargetGrams ?? null,
+      fatTargetGrams: bmrProfile?.fatTargetGrams ?? null,
+      carbsTargetGrams: bmrProfile?.carbsTargetGrams ?? null,
+      usedDefault: bmrProfile === undefined,
+    },
+  };
 }
 
 // ── 12b. Swap Meal (V2-P5: "换一个") ──

@@ -45,6 +45,7 @@ export const SUPPORTED_AGGREGATE_TYPES: ReadonlySet<string> = new Set([
   "training_reflection",
   "plan_version",
   "user_decision",
+  "body_profile",
 ]);
 
 /** Backoff for attempt n (1-based): immediate, 5s, 20s, 60s, 120s. */

@@ -74,6 +74,9 @@ export const bmrProfiles = compass.table("bmr_profiles", {
   weightKg: doublePrecision("weight_kg").notNull(),
   activityLevel: text("activity_level").notNull(),
   goal: text("goal").notNull().default("maintain"),
+  goalWeightKg: doublePrecision("goal_weight_kg"),
+  trainingCadence: text("training_cadence"),
+  trainingSplit: text("training_split"),
   bmrKcal: doublePrecision("bmr_kcal").notNull(),
   tdeeKcal: doublePrecision("tdee_kcal").notNull(),
   targetKcal: doublePrecision("target_kcal").notNull(),
@@ -82,7 +85,10 @@ export const bmrProfiles = compass.table("bmr_profiles", {
   fatTargetGrams: doublePrecision("fat_target_grams").notNull().default(0),
   effectiveDate: date("effective_date").notNull(),
   ...timestamps()
-});
+}, (t) => [
+  index("bmr_profiles_user_effective_date_idx")
+    .on(t.userId, t.effectiveDate.desc(), t.createdAt.desc()),
+]);
 
 export const dailyActivityPlans = compass.table("daily_activity_plans", {
   id: uuid("id").primaryKey().defaultRandom(),

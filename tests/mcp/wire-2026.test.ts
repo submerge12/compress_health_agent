@@ -200,6 +200,28 @@ function resourceRead(id: number, uri: string, runHandle: string): Record<string
   };
 }
 
+function bodyProfileArgs(
+  runHandle: string,
+  idempotencyKey: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    runHandle,
+    effectiveDate: "2026-08-27",
+    sex: "female",
+    ageYears: 34,
+    heightCm: 166,
+    weightKg: 72,
+    goalWeightKg: 64,
+    activityLevel: "strength_training",
+    goal: "fat_loss_moderate",
+    trainingCadence: "four_days_per_week",
+    trainingSplit: "upper_lower",
+    idempotencyKey,
+    ...overrides,
+  };
+}
+
 const clients: WireClient[] = [];
 
 afterEach(() => {
@@ -274,6 +296,173 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(response.result?.resultType).toBe("complete");
     const tools = response.result?.tools as Array<{ name: string }>;
     expect(tools.map((tool) => tool.name)).toContain("health_begin_run");
+  }, 20_000);
+
+  it("updates an effective-dated body profile and reads it back over the MCP wire", async () => {
+    const binding = `mcp-wire-profile-${process.pid}-${Date.now()}`;
+    const client = new WireClient({
+      externalUserId: binding,
+      testNow: "2026-08-27T08:00:00+08:00",
+    });
+    clients.push(client);
+
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "update body profile",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+
+    const args = bodyProfileArgs(runHandle, "wire-profile-update");
+    const updated = await client.request(toolCall(2, "health_update_body_profile", args));
+
+    expect(updated.error).toBeUndefined();
+    expect(updated.result).toMatchObject({
+      resultType: "complete",
+      structuredContent: {
+        profile: {
+          effectiveDate: "2026-08-27",
+          weightKg: 72,
+          goalWeightKg: 64,
+          trainingCadence: "four_days_per_week",
+          trainingSplit: "upper_lower",
+          targetKcal: expect.any(Number),
+          proteinTargetGrams: expect.any(Number),
+        },
+        receiptId: expect.any(String),
+        replayed: false,
+      },
+    });
+
+    const profile = await client.request(resourceRead(3, "health://profile", runHandle));
+    const contents = profile.result?.contents as Array<{ text: string }>;
+    expect(JSON.parse(contents[0]!.text)).toMatchObject({
+      bodyProfile: {
+        effectiveDate: "2026-08-27",
+        weightKg: 72,
+        goalWeightKg: 64,
+        trainingCadence: "four_days_per_week",
+        trainingSplit: "upper_lower",
+      },
+    });
+
+    const first = updated.result?.structuredContent as {
+      profile: { id: string };
+      receiptId: string;
+    };
+    const replay = await client.request(toolCall(4, "health_update_body_profile", args));
+    expect(replay.result?.structuredContent).toMatchObject({
+      profile: { id: first.profile.id },
+      receiptId: first.receiptId,
+      replayed: true,
+    });
+  }, 20_000);
+
+  it("rejects a body-profile idempotency key reused from a different run", async () => {
+    const binding = `mcp-wire-profile-run-binding-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+
+    const firstRun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "first profile run",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-first-run",
+    }));
+    const firstRunHandle = (firstRun.result?.structuredContent as { runHandle: string }).runHandle;
+    const first = await client.request(toolCall(
+      2,
+      "health_update_body_profile",
+      bodyProfileArgs(firstRunHandle, "wire-profile-shared-key"),
+    ));
+    expect(first.result?.isError).not.toBe(true);
+
+    const secondRun = await client.request(toolCall(3, "health_begin_run", {
+      objective: "second profile run",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-second-run",
+    }));
+    const secondRunHandle = (secondRun.result?.structuredContent as { runHandle: string }).runHandle;
+    const refused = await client.request(toolCall(
+      4,
+      "health_update_body_profile",
+      bodyProfileArgs(secondRunHandle, "wire-profile-shared-key"),
+    ));
+
+    expect(refused.result).toMatchObject({
+      resultType: "complete",
+      isError: true,
+      structuredContent: { error: "idempotency_conflict" },
+    });
+  }, 25_000);
+
+  it("isolates the same body-profile idempotency key between users", async () => {
+    const suffix = `${process.pid}-${Date.now()}`;
+    const firstClient = new WireClient({ externalUserId: `mcp-wire-profile-user-a-${suffix}` });
+    const secondClient = new WireClient({ externalUserId: `mcp-wire-profile-user-b-${suffix}` });
+    clients.push(firstClient, secondClient);
+
+    const firstRun = await firstClient.request(toolCall(1, "health_begin_run", {
+      objective: "profile for user A",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-user-run",
+    }));
+    const secondRun = await secondClient.request(toolCall(1, "health_begin_run", {
+      objective: "profile for user B",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-user-run",
+    }));
+    const firstRunHandle = (firstRun.result?.structuredContent as { runHandle: string }).runHandle;
+    const secondRunHandle = (secondRun.result?.structuredContent as { runHandle: string }).runHandle;
+
+    const first = await firstClient.request(toolCall(
+      2,
+      "health_update_body_profile",
+      bodyProfileArgs(firstRunHandle, "wire-profile-user-shared-key"),
+    ));
+    const second = await secondClient.request(toolCall(
+      2,
+      "health_update_body_profile",
+      bodyProfileArgs(secondRunHandle, "wire-profile-user-shared-key", {
+        weightKg: 84,
+        goalWeightKg: 76,
+      }),
+    ));
+    const firstBody = first.result?.structuredContent as { profile: { id: string }; replayed: boolean };
+    const secondBody = second.result?.structuredContent as { profile: { id: string }; replayed: boolean };
+
+    expect(firstBody.replayed).toBe(false);
+    expect(secondBody.replayed).toBe(false);
+    expect(firstBody.profile.id).not.toBe(secondBody.profile.id);
+  }, 25_000);
+
+  it("rejects a non-real body-profile effective date without creating a fact", async () => {
+    const binding = `mcp-wire-profile-invalid-date-${process.pid}-${Date.now()}`;
+    const client = new WireClient({
+      externalUserId: binding,
+      testNow: "2026-08-27T08:00:00+08:00",
+    });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "invalid profile date",
+      inputChannel: "mcp",
+      idempotencyKey: "wire-profile-invalid-date-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+
+    const refused = await client.request(toolCall(
+      2,
+      "health_update_body_profile",
+      bodyProfileArgs(runHandle, "wire-profile-invalid-date", { effectiveDate: "2026-02-30" }),
+    ));
+    expect(refused.result).toMatchObject({
+      resultType: "complete",
+      isError: true,
+      structuredContent: { error: "validation_failed" },
+    });
+
+    const profile = await client.request(resourceRead(3, "health://profile", runHandle));
+    const contents = profile.result?.contents as Array<{ text: string }>;
+    expect(JSON.parse(contents[0]!.text)).toMatchObject({ bodyProfile: null });
   }, 20_000);
 
   it("advertises dynamic resources through resources/templates/list on the raw 2026 wire", async () => {
@@ -449,7 +638,12 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }>;
     const names = new Set(discoveredTools.map((tool) => tool.name));
     const coverage: Record<string, string[]> = {
-      J01: ["health_generate_diet_plan", "health_get_diet_plan", "health_log_meal"],
+      J01: [
+        "health_update_body_profile",
+        "health_generate_diet_plan",
+        "health_get_diet_plan",
+        "health_log_meal",
+      ],
       J02: ["health_prepare_training", "health_start_training", "health_record_set", "health_finish_training"],
       J03: ["health_record_sleep", "health_record_fatigue", "health_acknowledge_rest"],
       J04: ["health_report_pain", "health_lift_constraint"],
@@ -1554,6 +1748,51 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(ids).not.toContain(expiredId);
     expect(ids).not.toContain(futureId);
   }, 20_000);
+
+  it("uses the body profile effective on the diet-plan start date", async () => {
+    const binding = `mcp-wire-diet-profile-basis-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire effective profile diet plan",
+      idempotencyKey: "wire-run-effective-profile-plan",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const current = await client.request(toolCall(2, "health_update_body_profile", bodyProfileArgs(
+      runHandle,
+      "wire-effective-profile-current",
+      { effectiveDate: "2026-08-20" },
+    )));
+    const future = await client.request(toolCall(3, "health_update_body_profile", bodyProfileArgs(
+      runHandle,
+      "wire-effective-profile-future",
+      { effectiveDate: "2026-09-20", weightKg: 84, goalWeightKg: 76 },
+    )));
+    const currentProfile = (current.result?.structuredContent as {
+      profile: { id: string; targetKcal: number };
+    }).profile;
+    const futureProfile = (future.result?.structuredContent as {
+      profile: { id: string; targetKcal: number };
+    }).profile;
+    expect(currentProfile.id).not.toBe(futureProfile.id);
+
+    const generated = await client.request(toolCall(4, "health_generate_diet_plan", {
+      runHandle,
+      startDate: "2026-08-26",
+      idempotencyKey: "wire-generate-effective-profile-plan",
+    }));
+
+    expect(generated.result?.structuredContent).toMatchObject({
+      generation: {
+        profileBasis: {
+          profileId: currentProfile.id,
+          effectiveDate: "2026-08-20",
+          targetKcal: currentProfile.targetKcal,
+          usedDefault: false,
+        },
+      },
+    });
+  }, 30_000);
 
   it("generates and reads back a persisted diet plan", async () => {
     const binding = `mcp-wire-diet-plan-${process.pid}-${Date.now()}`;

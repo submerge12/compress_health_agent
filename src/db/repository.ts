@@ -26,12 +26,16 @@ export interface BmrProfileRow {
   weightKg: number;
   activityLevel: string;
   goal: string;
+  goalWeightKg?: number | null;
+  trainingCadence?: string | null;
+  trainingSplit?: string | null;
   bmrKcal: number;
   tdeeKcal: number;
   targetKcal: number;
   proteinTargetGrams: number;
   carbsTargetGrams: number;
   fatTargetGrams: number;
+  effectiveDate?: string;
 }
 
 export interface DietLogRow {
@@ -249,7 +253,18 @@ export function createRepository(db: Db, repositoryOptions: RepositoryOptions = 
     async getLatestBmrProfile(userId: string): Promise<BmrProfileRow | undefined> {
       const rows = await db.select().from(schema.bmrProfiles)
         .where(eq(schema.bmrProfiles.userId, userId))
-        .orderBy(desc(schema.bmrProfiles.createdAt))
+        .orderBy(desc(schema.bmrProfiles.effectiveDate), desc(schema.bmrProfiles.createdAt))
+        .limit(1);
+      return rows[0] as unknown as BmrProfileRow | undefined;
+    },
+
+    async getEffectiveBmrProfile(userId: string, asOfDate: string): Promise<BmrProfileRow | undefined> {
+      const rows = await db.select().from(schema.bmrProfiles)
+        .where(and(
+          eq(schema.bmrProfiles.userId, userId),
+          lte(schema.bmrProfiles.effectiveDate, asOfDate),
+        ))
+        .orderBy(desc(schema.bmrProfiles.effectiveDate), desc(schema.bmrProfiles.createdAt))
         .limit(1);
       return rows[0] as unknown as BmrProfileRow | undefined;
     },

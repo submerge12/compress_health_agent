@@ -18,6 +18,7 @@ Never invent a health fact to complete a journey. J03 runs only after real low s
 
 ## Reads and writes
 
+- For J01, read `health://profile` first. When the user has supplied changed body data and authorized recording, call `health_update_body_profile` with the user-stated effective date before generating a plan. Read the Profile Resource back and use `health_generate_diet_plan`; do not calculate or present a replacement diet plan in prose.
 - Before preparing or changing training, read the Daily State and active Constraints for the relevant date. Read the active plan or current cycle when the operation depends on it.
 - Treat a proposal as unexecuted until the corresponding apply or activation call returns `resultType=complete`. Say "proposed" and "applied" separately.
 - A write is successful only when the result is `complete` and includes its receipt and affected identifiers. Read back the relevant projection or resource, and record its state revision. Do not infer success from a conversational response.

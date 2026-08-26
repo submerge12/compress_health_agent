@@ -69,6 +69,12 @@ Every omitted health date is resolved from the stored
 `compass_health.users.timezone`. Tools, `today` resources and outbox payloads
 therefore use the same local calendar day.
 
+Body-profile changes use `health_update_body_profile` and append a version with
+an explicit effective date. `health://profile` resolves the version effective on
+the user's current local date, while `health_generate_diet_plan` resolves the
+version effective on the requested plan start date. A future version therefore
+cannot change an earlier plan.
+
 `mcp:stdio` starts an embedded projection worker by default outside tests, so
 the local Codex configuration is self-contained. Set
 `COMPASS_HEALTH_PROJECTION_WORKER_MODE=external` when a separately supervised
