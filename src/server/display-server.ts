@@ -162,22 +162,23 @@ const ROUTES: Readonly<Record<string, RouteHandler>> = {
   "POST /api/log/exercise": (ctx, _query, body) => handleLogExercise(ctx, cast(body)),
   "POST /api/log/weight": (ctx, _query, body) => handleLogWeight(ctx, cast(body)),
 
-  // ── M03 daily state (v1): read model + observation/constraint commands ──
+  // ── M03 daily state (V2): read model + observation/constraint commands ──
   "GET /api/v1/daily-state": async (ctx, query) => {
     const date = requireQueryDate(query, "date");
     const db = requireDailyStateDb(ctx);
-    const state = await createDailyStateService(db, ctx.repo)
-      .getDailyProjection(ctx.userId, date);
-    if (state === undefined) {
-      return {
-        schemaVersion: "daily-health-state.v1",
-        userId: ctx.userId,
-        localDate: date,
-        projection: { status: "rebuilding", pendingOutboxEvents: 0 },
-        missing: true,
-      };
-    }
-    return state;
+    const dailyState = createDailyStateService(db, ctx.repo);
+    const state = await dailyState.getDailyProjection(ctx.userId, date);
+    if (state !== undefined) return state;
+
+    const [user] = await db.select({ timezone: schemaRef.users.timezone })
+      .from(schemaRef.users)
+      .where(eq(schemaRef.users.id, ctx.userId))
+      .limit(1);
+    if (!user) throw Errors.notFound("user");
+
+    // A projection row is a cache, not an existence gate. Return the complete
+    // V2 state from facts while the worker materializes the same state later.
+    return dailyState.buildDailyState(ctx.userId, date, user.timezone);
   },
 
   "POST /api/v1/observations": async (ctx, _query, body) => {

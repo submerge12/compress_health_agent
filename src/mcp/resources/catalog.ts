@@ -47,7 +47,7 @@ export const RESOURCE_TEMPLATES = [
   {
     uriTemplate: "health://daily-state/{date}",
     name: "Daily health state by date",
-    description: "Rebuildable projection for one day: training, body, diet, constraints. date=YYYY-MM-DD or 'today'.",
+    description: "DailyHealthState V2 for one day: plans, actuals, deviations, training, body, decisions, and projection diagnostics.",
     mimeType: "application/json",
     _meta: cacheHints(CACHE_TTL_MS.dailyState),
   },
@@ -178,20 +178,29 @@ export function createResourceCatalog(
         dailyState.getDailyProjection(principal.userId, date),
         projectionWorker.getDiagnostics(principal.userId, date),
       ]);
-      if (!state) {
-        return {
-          schemaVersion: "daily-health-state.v1",
-          userId: principal.userId,
-          localDate: date,
-          state: null,
-          projection: diagnostics,
-        };
-      }
+      const materialized = state !== undefined;
+      const effectiveState = state ?? await (async () => {
+        const [user] = await db.select({ timezone: schema.users.timezone })
+          .from(schema.users)
+          .where(eq(schema.users.id, principal.userId))
+          .limit(1);
+        if (!user) throw new McpProtocolError("not_found", "user vanished");
+        return dailyState.buildDailyState(principal.userId, date, user.timezone);
+      })();
+      const diagnosticStatus = diagnostics.status === "failed"
+        || diagnostics.status === "lagging"
+        || diagnostics.status === "rebuilding"
+        || diagnostics.status === "fresh"
+        ? diagnostics.status
+        : effectiveState.projection.status;
       return {
-        ...state,
+        ...effectiveState,
         projection: {
-          ...state.projection,
-          status: diagnostics.status,
+          ...effectiveState.projection,
+          status: diagnosticStatus,
+          pendingEvents: diagnostics.outbox.pending + diagnostics.outbox.processing,
+          deadLetterEvents: diagnostics.outbox.deadLetter,
+          materialized,
           checkpoint: diagnostics.checkpoint,
           outbox: diagnostics.outbox,
         },

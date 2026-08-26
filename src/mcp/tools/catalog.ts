@@ -33,6 +33,7 @@ import {
 } from "../../domain/projection-worker.js";
 import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createHealthRecordingService } from "../../domain/health-recording-service.js";
+import { createProjectionInvalidationService } from "../../domain/projection-invalidation.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
 import type { MediaStreamUrlIssuer } from "../../media/signed-stream-url.js";
 import { createPainCommand } from "../../training/prepared-session.js";
@@ -697,14 +698,18 @@ export function createHealthToolCatalog(
               if (!decision) throw new Error("diet plan attempt fact insert failed");
               factRefs.push({ type: "user_decision", id: decision.id });
             }
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
-              userId: inv.principalUserId,
-              aggregateType: "user_decision",
-              aggregateId: startDate,
-              eventType: "diet.plan_generated",
-              payloadJson: { observedOn: startDate, endDate, status: generated.status, entries: rows.length },
-            }).returning({ id: schema.outboxEvents.id });
-            if (!outbox) throw new Error("diet plan outbox insert failed");
+            const entryCountByDate = new Map<string, number>();
+            for (const row of rows) {
+              entryCountByDate.set(row.planDate, (entryCountByDate.get(row.planDate) ?? 0) + 1);
+            }
+            const invalidation = await createProjectionInvalidationService(txDb)
+              .invalidateDietPlanRange({
+                userId: inv.principalUserId,
+                startDate,
+                dayCount: 7,
+                status: generated.status,
+                entryCountByDate,
+              });
             return {
               response: {
                 startDate,
@@ -713,7 +718,7 @@ export function createHealthToolCatalog(
                 generation: generated,
               } as unknown as Record<string, unknown>,
               factRefs,
-              outboxEventIds: [outbox.id],
+              outboxEventIds: invalidation.outboxEventIds,
             };
           },
         );
@@ -2314,9 +2319,10 @@ export function createHealthToolCatalog(
               async (writeTx) => {
                 const confirmed = inv.confirmationChoice === "确认激活";
                 let activation: PlanActivationResult | undefined;
+                const effectiveFrom = await today(inv.principalUserId);
                 if (confirmed) {
                   activation = await createReflectionEngine(writeTx as unknown as Db)
-                    .activateVersion(inv.principalUserId, planVersionId);
+                    .activateVersion(inv.principalUserId, planVersionId, effectiveFrom);
                 }
                 const [decision] = await writeTx.insert(schema.userDecisionEvents).values({
                   userId: inv.principalUserId,
@@ -2329,24 +2335,26 @@ export function createHealthToolCatalog(
                   },
                 }).returning();
                 if (!decision) throw new Error("plan activation decision insert failed");
-                const [outbox] = await writeTx.insert(schema.outboxEvents).values({
-                  userId: inv.principalUserId,
-                  aggregateType: confirmed ? "plan_version" : "user_decision",
-                  aggregateId: confirmed ? planVersionId : decision.id,
-                  eventType: confirmed ? "plan.version_activated" : "plan.activation_declined",
-                  payloadJson: {
-                    observedOn: await today(inv.principalUserId),
-                    planVersionId,
-                    direction: activation?.direction ?? "declined",
-                    previousVersionId: activation?.previousVersionId ?? null,
-                  },
-                }).returning({ id: schema.outboxEvents.id });
+                const outboxEventIds = confirmed
+                  ? activation!.outboxEventIds
+                  : (await writeTx.insert(schema.outboxEvents).values({
+                      userId: inv.principalUserId,
+                      aggregateType: "user_decision",
+                      aggregateId: decision.id,
+                      eventType: "plan.activation_declined",
+                      payloadJson: {
+                        observedOn: effectiveFrom,
+                        planVersionId,
+                        direction: "declined",
+                        previousVersionId: null,
+                      },
+                    }).returning({ id: schema.outboxEvents.id })).map((event) => event.id);
                 const [readBack] = await writeTx.select().from(schema.planVersions)
                   .where(and(
                     eq(schema.planVersions.id, planVersionId),
                     eq(schema.planVersions.userId, inv.principalUserId),
                   )).limit(1);
-                if (!outbox || !readBack) throw new Error("plan activation read-back failed");
+                if (outboxEventIds.length === 0 || !readBack) throw new Error("plan activation read-back failed");
                 return {
                   response: confirmed
                     ? {
@@ -2360,7 +2368,7 @@ export function createHealthToolCatalog(
                   factRefs: confirmed
                     ? [{ type: "plan_version", id: readBack.id }, { type: "user_decision", id: decision.id }]
                     : [{ type: "user_decision", id: decision.id }],
-                  outboxEventIds: [outbox.id],
+                  outboxEventIds,
                 };
               },
             );

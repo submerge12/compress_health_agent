@@ -6,7 +6,7 @@
  * - unknown aggregate types dead-letter IMMEDIATELY with an operational
  *   interaction event (never silently done)
  * - completing a training session produces a training_session event whose
- *   consumption lands completedSets in DailyState.training
+ *   consumption lands completedSetBudget in DailyState.training
  * - two workers can run concurrently without double-processing (SKIP LOCKED)
  * - heartbeat failure or lease takeover can never produce a false success or
  *   let the stale worker overwrite the new owner
@@ -127,7 +127,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     expect(after?.status).toBe("done");
   });
 
-  it("completed training session projects completedSets into DailyState.training", async () => {
+  it("completed training session projects set budgets into DailyState.training", async () => {
     await training.ensureUserProgram(ctx.userId);
     const plan = await training.prepareSession(ctx.userId, today, "B");
     const session = await training.startSession({
@@ -160,10 +160,10 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
       .createDailyStateService(ctx.db!, ctx.repo)
       .getDailyProjection(ctx.userId, today);
     expect(read).toBeDefined();
-    expect(read?.training.sessionId).toBe(session.id);
-    expect(read?.training.status).toBe("completed");
-    expect(read?.training.completedSets).toBe(1);
-    expect(read?.training.plannedSets).toBeGreaterThan(0);
+    expect(read?.training.activeSessionId).toBe(session.id);
+    expect(read?.training.sessions.find((entry) => entry.id === session.id)?.status).toBe("completed");
+    expect(read?.training.completedSetBudget).toBe(1);
+    expect(read?.training.plannedSetBudget).toBeGreaterThan(0);
   });
 
   it("two concurrent workers never double-process the same event", async () => {
@@ -285,7 +285,8 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     expect(newerResult).toMatchObject({ succeeded: 1, leaseLost: 0 });
 
     const projected = await state.getDailyProjection(ctx.userId, raceDate);
-    expect(projected?.observations.map((entry) => entry.kind)).toEqual(["sleep", "fatigue"]);
+    expect(projected?.body.observationHistory.map((entry) => entry.kind).sort())
+      .toEqual(["fatigue", "sleep"]);
     const rows = await Promise.all([firstEvent.id, secondEvent.id].map(async (id) => {
       const [row] = await db.select({
         id: schema.outboxEvents.id,

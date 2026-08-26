@@ -107,6 +107,10 @@ describe("database schema", () => {
     expect(schema.memoryRecords).toHaveProperty("embedding");
   });
 
+  test("test_daily_state_projection_persists_its_public_schema_version", () => {
+    expect(schema.dailyHealthStateProjection).toHaveProperty("schemaVersion");
+  });
+
   test("test_connection_module_imports_without_requiring_a_live_query", async () => {
     const connection = await import("../../src/db/connection.js");
 

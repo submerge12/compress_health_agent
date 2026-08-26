@@ -367,6 +367,10 @@ export function createSubstitutionEngine(db: Db) {
         decisionType: "accepted",
         subjectJson: {
           type: "exercise_substitution",
+          observedOn: ownedSession.sessionDate,
+          sessionId: ownedSession.id,
+          originalExerciseId: original.id,
+          replacementExerciseId: replacement.id,
           from: original?.exerciseSlug ?? null,
           to: input.chosenSlug,
           transferredSets: remaining,

@@ -384,7 +384,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
     ));
     const body = JSON.parse(
       (resource.result?.contents as Array<{ text: string }>)[0]!.text,
-    ) as { localDate: string };
+    ) as { schemaVersion: string; localDate: string };
+    expect(body.schemaVersion).toBe("daily-health-state.v2");
     expect(body.localDate).toBe("2035-03-31");
 
     const verify = postgres(DATABASE_URL, { max: 1, prepare: false });
@@ -868,6 +869,13 @@ describe("MCP 2026-07-28 stdio wire", () => {
       await sql`
         INSERT INTO compass_health.active_plan_assignments (user_id, scope, plan_version_id)
         VALUES (${user!.id}::uuid, ${scope}, ${parent!.id}::uuid)`;
+      await sql`
+        INSERT INTO compass_health.daily_health_state_projection
+          (user_id, state_date, timezone, state_json, projection_status)
+        VALUES
+          (${user!.id}::uuid, '2026-08-26', 'Asia/Shanghai', '{}'::jsonb, 'fresh'),
+          (${user!.id}::uuid, '2026-08-27', 'Asia/Shanghai', '{}'::jsonb, 'fresh'),
+          (${user!.id}::uuid, '2026-09-01', 'Asia/Shanghai', '{}'::jsonb, 'fresh')`;
       childId = String(child!.id);
     } finally {
       await sql.end({ timeout: 3 });
@@ -909,7 +917,21 @@ describe("MCP 2026-07-28 stdio wire", () => {
              AND subject_json->>'planVersionId' = ${childId}) AS decisions,
           (SELECT count(*)::int FROM compass_health.outbox_events
            WHERE aggregate_id = ${childId} AND type = 'plan.version_activated') AS outbox`;
-      expect(counts).toMatchObject({ decisions: 1, outbox: 1 });
+      expect(counts).toMatchObject({ decisions: 1, outbox: 3 });
+      const affected = await verify<Array<{ observed_on: string; projection_status: string }>>`
+        SELECT event.payload_json ->> 'observedOn' AS observed_on, projection.projection_status
+        FROM compass_health.outbox_events event
+        JOIN compass_health.daily_health_state_projection projection
+          ON projection.user_id = event.user_id
+         AND projection.state_date::text = event.payload_json ->> 'observedOn'
+        WHERE event.aggregate_id = ${childId}
+          AND event.type = 'plan.version_activated'
+        ORDER BY event.payload_json ->> 'observedOn'`;
+      expect(affected).toEqual([
+        { observed_on: "2026-08-26", projection_status: "lagging" },
+        { observed_on: "2026-08-27", projection_status: "lagging" },
+        { observed_on: "2026-09-01", projection_status: "lagging" },
+      ]);
     } finally {
       await verify.end({ timeout: 3 });
     }
@@ -1341,8 +1363,9 @@ describe("MCP 2026-07-28 stdio wire", () => {
     ));
     const unaffectedBody = JSON.parse(
       (unaffected.result?.contents as Array<{ text: string }>)[0]!.text,
-    ) as { projection: { status: string } };
-    expect(unaffectedBody.projection.status).toBe("missing");
+    ) as { schemaVersion: string; projection: { status: string; materialized: boolean } };
+    expect(unaffectedBody.schemaVersion).toBe("daily-health-state.v2");
+    expect(unaffectedBody.projection).toMatchObject({ status: "fresh", materialized: false });
 
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     try {
@@ -1415,6 +1438,15 @@ describe("MCP 2026-07-28 stdio wire", () => {
 
   it("generates and reads back a persisted diet plan", async () => {
     const binding = `mcp-wire-diet-plan-${process.pid}-${Date.now()}`;
+    const affectedDates = [
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28",
+      "2026-08-29",
+      "2026-08-30",
+      "2026-08-31",
+      "2026-09-01",
+    ];
     const client = new WireClient({ externalUserId: binding });
     clients.push(client);
     const begun = await client.request(toolCall(1, "health_begin_run", {
@@ -1449,7 +1481,59 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }));
     const readBody = readBack.result?.structuredContent as { entries: Array<{ id: string }> };
     expect(readBody.entries).toHaveLength(generatedBody.entryCount);
-  }, 30_000);
+    const actual = await client.request(toolCall(30, "health_log_meal", {
+      runHandle,
+      date: generatedBody.startDate,
+      mealType: "lunch",
+      description: "牛肉150克",
+      idempotencyKey: "wire-diet-plan-actual",
+    }));
+    expect(actual.result?.resultType).toBe("complete");
+
+    const inspection = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const events = await inspection<Array<{ observed_on: string }>>`
+        SELECT event.payload_json ->> 'observedOn' AS observed_on
+        FROM compass_health.outbox_events event
+        JOIN compass_health.users app_user ON app_user.id = event.user_id
+        WHERE app_user.external_id = ${binding}
+          AND event.type = 'diet_plan.changed'
+        ORDER BY event.payload_json ->> 'observedOn'`;
+      expect(events.map((event) => event.observed_on)).toEqual(affectedDates);
+    } finally {
+      await inspection.end({ timeout: 3 });
+    }
+
+    for (const [index, date] of affectedDates.entries()) {
+      const replay = await client.request(toolCall(4 + index * 2, "health_replay_projection", {
+        runHandle,
+        date,
+        idempotencyKey: `wire-diet-plan-replay-${date}`,
+      }));
+      expect(replay.result?.resultType).toBe("complete");
+      const stateResponse = await client.request(toolCall(5 + index * 2, "health_get_daily_state", {
+        runHandle,
+        date,
+      }));
+      const state = stateResponse.result?.structuredContent as {
+        schemaVersion: string;
+        localDate: string;
+        diet: {
+          plannedMeals: Array<{ planDate: string }>;
+          actualLogs: Array<{ id: string }>;
+          deviation: { caloriesKcal: number };
+        };
+      };
+      expect(state.schemaVersion).toBe("daily-health-state.v2");
+      expect(state.localDate).toBe(date);
+      expect(state.diet.plannedMeals.length).toBeGreaterThan(0);
+      expect(state.diet.plannedMeals.every((meal) => meal.planDate === date)).toBe(true);
+      if (date === generatedBody.startDate) {
+        expect(state.diet.actualLogs).toHaveLength(1);
+        expect(typeof state.diet.deviation.caloriesKcal).toBe("number");
+      }
+    }
+  }, 60_000);
 
   it("applies the chosen ambiguous food candidate exactly once", async () => {
     const client = new WireClient();
@@ -1993,6 +2077,42 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(replacement.exercise.replacementForId).toBe(original.id);
     expect(replacement.exercise.targetSets).toBe(proposal.remainingSets);
     expect(originalReadBack.sets).toHaveLength(1);
+
+    const replay = await client.request(toolCall(10, "health_replay_projection", {
+      runHandle,
+      date: "2026-08-18",
+      idempotencyKey: "wire-j05-replay",
+    }));
+    expect(replay.result?.resultType).toBe("complete");
+    const daily = await client.request(toolCall(11, "health_get_daily_state", {
+      runHandle,
+      date: "2026-08-18",
+    }));
+    const dailyState = daily.result?.structuredContent as {
+      training: {
+        activeSessionId: string;
+        plannedSetBudget: number;
+        completedSetBudget: number;
+        substitutions: Array<{
+          originalExerciseId: string;
+          replacementExerciseId: string;
+          inheritedSetBudget: number;
+        }>;
+      };
+      userDecisions: Array<{ decisionType: string; subject: { type?: string; to?: string } }>;
+    };
+    expect(dailyState.training.activeSessionId).toBe(sessionId);
+    expect(dailyState.training.completedSetBudget)
+      .toBeLessThanOrEqual(dailyState.training.plannedSetBudget);
+    expect(dailyState.training.substitutions).toContainEqual(expect.objectContaining({
+      originalExerciseId: original.id,
+      replacementExerciseId: replacementId,
+      inheritedSetBudget: proposal.remainingSets,
+    }));
+    expect(dailyState.userDecisions).toContainEqual(expect.objectContaining({
+      decisionType: "accepted",
+      subject: expect.objectContaining({ type: "exercise_substitution", to: chosenSlug }),
+    }));
   }, 35_000);
 
   it("executes J03 low sleep -> REST -> acknowledgement without changing the active plan", async () => {
@@ -2031,6 +2151,23 @@ describe("MCP 2026-07-28 stdio wire", () => {
       idempotencyKey: "wire-j03-low-sleep",
     }));
     expect(sleep.result?.structuredContent).toMatchObject({ hours: 4.5 });
+
+    const replay = await client.request(toolCall(40, "health_replay_projection", {
+      runHandle,
+      date,
+      idempotencyKey: "wire-j03-replay",
+    }));
+    expect(replay.result?.resultType).toBe("complete");
+    const daily = await client.request(toolCall(41, "health_get_daily_state", { runHandle, date }));
+    const dailyState = daily.result?.structuredContent as {
+      body: { effectiveSleep: { valueJson: { hours: number } } };
+      training: { recommendation: { decision: string; reasonCodes: string[] } };
+      plans: { trainingPlanVersionId: string | null };
+    };
+    expect(dailyState.body.effectiveSleep.valueJson.hours).toBe(4.5);
+    expect(dailyState.training.recommendation.decision).toBe("REST");
+    expect(dailyState.training.recommendation.reasonCodes).toContain("sleep_low");
+    expect(dailyState.plans.trainingPlanVersionId).toBe(planBefore.version.id);
 
     const cycleBefore = await client.request(toolCall(5, "health_get_training_cycle", { runHandle }));
     const cycleDecision = (cycleBefore.result?.structuredContent as {

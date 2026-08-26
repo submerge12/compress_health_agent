@@ -83,7 +83,7 @@ describe.skipIf(!isDbAvailable)("J01: diet plan -> actual -> stats", () => {
 
     // Projection layer.
     const projected = await state.persistDailyProjection(ctx.userId, today, "Asia/Shanghai");
-    expect(projected.dietActualCount).toBeGreaterThanOrEqual(1);
+    expect(projected.diet.actualLogs.length).toBeGreaterThanOrEqual(1);
 
     // Retry: same key returns the same row, no duplicate fact.
     const retry = await diet.commit(ctx, {

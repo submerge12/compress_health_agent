@@ -87,15 +87,15 @@ describe.skipIf(!isDbAvailable)("daily-state invariants", () => {
 
     const state = await service.persistDailyProjection(ctx.userId, today, "Asia/Shanghai");
     expect(state.revision).toBeGreaterThanOrEqual(0);
-    expect(state.observations.map((o) => o.kind)).toEqual(["sleep"]);
+    expect(state.body.observationHistory.map((o) => o.kind)).toEqual(["sleep"]);
   });
 
   it("projection rebuild is idempotent in content and monotonic in revision", async () => {
     const first = await service.persistDailyProjection(ctx.userId, today, "Asia/Shanghai");
     const second = await service.persistDailyProjection(ctx.userId, today, "Asia/Shanghai");
     expect(second.revision).toBe(first.revision + 1);
-    expect(second.observations).toEqual(first.observations);
-    expect(second.dietActualCount).toBe(first.dietActualCount);
+    expect(second.body.observationHistory).toEqual(first.body.observationHistory);
+    expect(second.diet.actualLogs).toEqual(first.diet.actualLogs);
   });
 
   it("J09: worker failure keeps facts committed and dead-letters after max attempts; replay converges", async () => {
@@ -142,7 +142,7 @@ describe.skipIf(!isDbAvailable)("daily-state invariants", () => {
     const read = await service.getDailyProjection(ctx.userId, today);
     expect(read).toBeDefined();
     expect(read?.projection.status).toBeDefined();
-    expect(typeof read?.projection.pendingOutboxEvents).toBe("number");
+    expect(typeof read?.projection.pendingEvents).toBe("number");
   });
 
   it("constraint lifecycle: add → active → lift leaves audit trail, not deletion", async () => {

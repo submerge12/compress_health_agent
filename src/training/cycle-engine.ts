@@ -14,6 +14,7 @@ import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
+import { latestEffectiveSingletonObservation } from "../domain/observation-policy.js";
 import { THREE_SPLIT_DAYS } from "./three-split.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
@@ -124,17 +125,14 @@ export function createCycleEngine(db: Db) {
         gte(schema.healthObservationEvents.observedOn, obsSince),
         isNull(schema.healthObservationEvents.revokedAt),
       ))
-      .orderBy(desc(schema.healthObservationEvents.createdAt));
+      .orderBy(
+        desc(schema.healthObservationEvents.observedOn),
+        desc(schema.healthObservationEvents.createdAt),
+      );
 
-    const sleepHours = (() => {
-      for (const o of observations) {
-        if (o.kind === "sleep") {
-          const hours = (o.valueJson as { hours?: number }).hours;
-          if (typeof hours === "number") return hours;
-        }
-      }
-      return undefined;
-    })();
+    const sleepObservation = latestEffectiveSingletonObservation(observations, "sleep");
+    const sleepHours = (sleepObservation?.valueJson as { hours?: number } | undefined)?.hours;
+    const fatigueObservation = latestEffectiveSingletonObservation(observations, "fatigue");
 
     const adjustments: string[] = [];
     let rest = false;
@@ -144,18 +142,18 @@ export function createCycleEngine(db: Db) {
       rest = true;
     }
 
-    for (const o of observations) {
-      if (o.kind !== "fatigue") continue;
-      const { high, level } = fatigueIsHigh(o.valueJson);
-      if (!high) continue;
-      const scope = (o.valueJson as Partial<StructuredFatigue>).scope ?? "general";
-      if (scope === "general") {
-        reasonCodes.push(`fatigue_high_general_${level}`);
-        rest = true;
-      } else {
-        // Local fatigue only adjusts; it never forces a full rest day.
-        reasonCodes.push(`fatigue_high_local_${level}`);
-        adjustments.push("reduce_intensity_for_fatigued_area");
+    if (fatigueObservation) {
+      const { high, level } = fatigueIsHigh(fatigueObservation.valueJson);
+      const scope = (fatigueObservation.valueJson as Partial<StructuredFatigue>).scope ?? "general";
+      if (high) {
+        if (scope === "general") {
+          reasonCodes.push(`fatigue_high_general_${level}`);
+          rest = true;
+        } else {
+          // Local fatigue only adjusts; it never forces a full rest day.
+          reasonCodes.push(`fatigue_high_local_${level}`);
+          adjustments.push("reduce_intensity_for_fatigued_area");
+        }
       }
     }
 

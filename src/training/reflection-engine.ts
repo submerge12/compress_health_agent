@@ -9,6 +9,8 @@ import { NotOwnedError } from "./ownership.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
+import { createProjectionInvalidationService } from "../domain/projection-invalidation.js";
+import { createUserLocalDateResolver } from "../domain/timezone.js";
 import {
   compilePlanChanges,
   diffPlanContents,
@@ -24,6 +26,9 @@ export interface PlanActivationResult {
   activatedVersionId: string;
   previousVersionId: string;
   direction: "forward" | "rollback";
+  effectiveFrom: string;
+  affectedDates: string[];
+  outboxEventIds: string[];
 }
 
 export interface ReflectionInput {
@@ -210,7 +215,11 @@ export function createReflectionEngine(db: Db) {
   }
 
   /** Activate a direct child or roll back to its direct parent atomically. */
-  async function activateVersion(userId: string, targetVersionId: string): Promise<PlanActivationResult> {
+  async function activateVersion(
+    userId: string,
+    targetVersionId: string,
+    effectiveFrom?: string,
+  ): Promise<PlanActivationResult> {
     return db.transaction(async (tx) => {
       const [targetIdentity] = await tx.select({ scope: schema.planVersions.scope })
         .from(schema.planVersions)
@@ -271,10 +280,22 @@ export function createReflectionEngine(db: Db) {
             eq(schema.trainingReflections.userId, userId),
           ));
       }
+      const activationDate = effectiveFrom ?? await createUserLocalDateResolver(tx as unknown as Db)(userId);
+      const invalidation = await createProjectionInvalidationService(tx as unknown as Db)
+        .invalidateTrainingPlanFuture({
+          userId,
+          effectiveFrom: activationDate,
+          planVersionId: target.id,
+          previousVersionId: current.id,
+          direction,
+        });
       return {
         activatedVersionId: target.id,
         previousVersionId: current.id,
         direction,
+        effectiveFrom: activationDate,
+        affectedDates: invalidation.affectedDates,
+        outboxEventIds: invalidation.outboxEventIds,
       };
     });
   }

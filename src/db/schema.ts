@@ -328,7 +328,7 @@ export const memoryRecords = compass.table("memory_records", {
 ]);
 
 // ── M03 / P2: plan versions, facts, constraints, outbox, projection ─────────
-// Design: docs/display-interface-plan.md §6 (DailyHealthStateV1). Facts are
+// Design: DailyHealthStateV2. Facts are
 // append-only; the daily projection is rebuildable and never a write target.
 
 export const planVersions = compass.table("plan_versions", {
@@ -451,6 +451,7 @@ export const projectionCheckpoints = compass.table("projection_checkpoints", {
 export const dailyHealthStateProjection = compass.table("daily_health_state_projection", {
   userId: uuid("user_id").notNull(),
   stateDate: date("state_date").notNull(),
+  schemaVersion: text("schema_version").notNull().default("daily-health-state.v2"),
   revision: integer("revision").notNull().default(0),
   timezone: text("timezone").notNull().default("UTC"),
   stateJson: jsonb("state_json").$type<Record<string, unknown>>().notNull(),

@@ -34,6 +34,7 @@ const DEFAULT_LEASE_MS = 30_000;
 /** Event types this worker knows how to project. */
 export const SUPPORTED_AGGREGATE_TYPES: ReadonlySet<string> = new Set([
   "diet_log",
+  "diet_plan",
   "observation",
   "water_log",
   "activity_log",
