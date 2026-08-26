@@ -1,0 +1,36 @@
+{
+  "evidenceType": "actual_codex_mcp_client_smoke",
+  "status": "passed",
+  "recordedAt": "2026-08-26",
+  "environment": "isolated_test_database",
+  "client": {
+    "name": "Codex",
+    "version": "0.150.0-alpha.8",
+    "protocolVersion": "2026-07-28",
+    "userConfigInherited": false
+  },
+  "launch": {
+    "command": "node",
+    "entrypoint": "dist/mcp/stdio.js",
+    "packageManagerWrapper": false
+  },
+  "runHandle": "c3cf87ba-73b8-49c5-afeb-4e79fb87b534",
+  "toolCalls": [
+    { "tool": "health_begin_run", "resultType": "complete" },
+    { "tool": "health_get_projection_diagnostics", "resultType": "complete" },
+    { "tool": "health_end_run", "resultType": "complete" }
+  ],
+  "receiptIds": [
+    "cdb44d6b-82d0-4ba6-a4d9-9719eb76c596",
+    "d789f031-7796-4fca-b9d6-8f78860c11dc"
+  ],
+  "terminalEvidenceSteps": 8,
+  "healthFactCountsAfter": {
+    "observations": 0,
+    "dietLogs": 0,
+    "trainingSessions": 0,
+    "planVersions": 0,
+    "mediaFeedback": 0
+  },
+  "conclusion": "Actual Codex completed discovery and three MCP calls without creating health facts."
+}

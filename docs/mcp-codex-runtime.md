@@ -7,7 +7,51 @@ The production startup order is:
 3. The bound user already exists.
 4. A projection worker starts.
 5. A media runtime is selected.
-6. Codex starts `pnpm mcp:stdio`.
+6. Codex starts `node dist/mcp/stdio.js`.
+
+## Codex configuration and binding gate
+
+Codex desktop, CLI, and IDE clients share the user-level
+`%USERPROFILE%\.codex\config.toml`. Copy the `compass_health` block from
+`.codex/config.toml.example` into that file and populate it locally. The
+repository ignores `.codex/config.toml` so database credentials and the exact
+external user binding cannot be committed accidentally.
+
+The STDIO entry uses `command`, `args`, `cwd`, an environment map, and explicit
+startup/tool timeouts. `CODEX_MCP_PROTOCOL_VERSION=2026-07-28` is the Codex
+per-server opt-in required by its modern STDIO conformance adapter; the global
+`mcp_2026_07_28` feature must also be enabled. The server is marked `required`,
+so a failed server cannot be silently omitted from a health journey. Restart
+Codex after changing this configuration.
+
+Do not configure Codex to launch the package script as `pnpm mcp:stdio`.
+Package-manager lifecycle banners are written to stdout before the server and
+corrupt the JSON-RPC STDIO channel. Build first and launch the compiled Node
+entry directly. Server diagnostics use stderr only and never print the bound
+external user id.
+
+Before real use, review the target migration set and take a restorable backup.
+Then run:
+
+```powershell
+pnpm db:migrate
+pnpm build
+pnpm codex:verify-binding
+```
+
+Migrations 0021, 0023, and 0024 intentionally update legacy actor, projection,
+and evidence rows. Do not apply them to a formal database merely to make a wire
+smoke pass, and do not bypass the startup gate. A database below
+`MIN_SCHEMA_VERSION` remains blocked until its data migration is explicitly
+authorized; Codex compatibility and J09 must use a separately migrated isolated
+database meanwhile.
+
+The binding verifier first runs the read-only schema startup gate, then opens
+PostgreSQL with read-only transactions and never prints the configured external
+id. It rejects an unknown user and reports
+`readyForRealJourneys=false` for an empty user without both a profile and
+existing health history. This prevents a plausible-looking test/bootstrap user
+from becoming the Codex health principal.
 
 MCP user provisioning is disabled by default. Create a binding explicitly:
 
@@ -95,3 +139,6 @@ COMPASS_HEALTH_MODEL_NAME
 Receipt replay is allowed only for the same user, run, tool, argument hash,
 idempotency key, and verified actor. `health_get_run_evidence` returns the
 formal actor profile and terminal `tool_attempt` / `tool_result` evidence.
+
+Real Codex journeys follow [.codex/skills/compass-health/SKILL.md](../.codex/skills/compass-health/SKILL.md)
+and are recorded using [the real-use baseline](codex-real-use-baseline.md).

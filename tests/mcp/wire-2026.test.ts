@@ -354,6 +354,28 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }
   }, 12_000);
 
+  it("refuses to start without an explicit database binding", async () => {
+    const tsxCli = resolve("node_modules", "tsx", "dist", "cli.mjs");
+    const child = spawn(process.execPath, [tsxCli, "src/mcp/stdio.ts"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        DATABASE_URL: "",
+        COMPASS_HEALTH_USER_BINDING: "must-not-use-default-database",
+        COMPASS_HEALTH_MEDIA_RUNTIME: "off",
+        NODE_ENV: "production",
+      },
+      stdio: "pipe",
+      windowsHide: true,
+    });
+    const stderr: string[] = [];
+    createInterface({ input: child.stderr }).on("line", (line) => stderr.push(line));
+    const [exitCode] = await once(child, "exit") as [number | null];
+
+    expect(exitCode, stderr.join(" | ")).toBe(2);
+    expect(stderr.join(" | ")).toContain("DATABASE_URL is required");
+  }, 12_000);
+
   it("uses the bound user's timezone for tool and resource default dates", async () => {
     const binding = `mcp-wire-local-date-${process.pid}-${Date.now()}`;
     testExternalUserIds.add(binding);

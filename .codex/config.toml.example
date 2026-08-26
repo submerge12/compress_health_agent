@@ -1,0 +1,23 @@
+# Copy this block into %USERPROFILE%\.codex\config.toml after replacing the
+# two binding placeholders. Never commit the populated values.
+
+[mcp_servers.compass_health]
+command = "node"
+args = ["G:\\compass-health-agent\\dist\\mcp\\stdio.js"]
+cwd = "G:\\compass-health-agent"
+enabled = true
+required = true
+startup_timeout_sec = 30
+tool_timeout_sec = 120
+default_tools_approval_mode = "writes"
+
+[mcp_servers.compass_health.env]
+CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
+DATABASE_URL = "REPLACE_WITH_LOCAL_POSTGRES_URL"
+COMPASS_HEALTH_USER_BINDING = "REPLACE_WITH_EXISTING_EXTERNAL_ID"
+COMPASS_HEALTH_ACTOR = "codex-primary"
+COMPASS_HEALTH_ACTOR_TYPE = "agent"
+COMPASS_HEALTH_RUNTIME_NAME = "codex"
+COMPASS_HEALTH_MEDIA_RUNTIME = "embedded"
+COMPASS_HEALTH_PROJECTION_WORKER_MODE = "embedded"
+COMPASS_HEALTH_ALLOW_USER_PROVISIONING = "false"

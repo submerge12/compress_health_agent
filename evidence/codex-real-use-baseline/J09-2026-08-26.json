@@ -1,0 +1,53 @@
+{
+  "journeyId": "J09",
+  "status": "passed",
+  "environment": "isolated_test_database",
+  "client": {
+    "name": "Codex",
+    "version": "0.150.0-alpha.8",
+    "protocolVersion": "2026-07-28"
+  },
+  "runHandle": "153abf15-3fac-4e81-8b3c-2c91496f685d",
+  "inputSummary": "Synthetic isolated projection event followed by a controlled single-event dead letter.",
+  "resourceReads": [],
+  "toolCalls": [
+    { "tool": "health_begin_run", "resultType": "complete" },
+    { "tool": "health_record_water", "resultType": "complete" },
+    { "tool": "health_get_projection_diagnostics", "resultType": "complete", "observedStatus": "failed" },
+    { "tool": "health_replay_projection", "resultType": "complete" },
+    { "tool": "health_get_projection_diagnostics", "resultType": "complete", "observedStatus": "fresh" },
+    { "tool": "health_get_run_evidence", "resultType": "complete" },
+    { "tool": "health_end_run", "resultType": "complete" }
+  ],
+  "mrtr": [],
+  "factIds": [
+    "a026f9e5-12f0-47d6-a479-11e14097789c"
+  ],
+  "receiptIds": [
+    "5fb05877-ac7f-49b7-aad9-426b2b2155ae",
+    "ffe27f2a-ca06-4b3f-9157-3b0a24647d54",
+    "756dea79-4972-446c-a650-086a69877d88",
+    "715a05d8-c5e6-438f-933b-ba0dd9367e33"
+  ],
+  "outboxIds": [
+    "baf93842-6876-45de-972c-3934b8534534"
+  ],
+  "stateRevisions": [1],
+  "projectionRecovery": {
+    "before": { "status": "failed", "pending": 0, "processing": 0, "deadLetter": 1 },
+    "replay": { "revived": 1, "drained": 1 },
+    "after": { "status": "fresh", "pending": 0, "processing": 0, "deadLetter": 0 },
+    "projectedWaterTotalMl": 209
+  },
+  "invariants": {
+    "sourceFacts": 1,
+    "sourceOutboxEvents": 1,
+    "sourceWriteReceipts": 1,
+    "replayReceipts": 1,
+    "replayAudits": 1,
+    "duplicateFacts": 0
+  },
+  "userDecision": "accepted",
+  "failureLayer": "projection",
+  "conclusion": "Actual Codex observed the controlled failure, replayed it to fresh revision 1, and produced no duplicate fact."
+}

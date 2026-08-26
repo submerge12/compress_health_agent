@@ -6,9 +6,12 @@
  *   command = "node"
  *   args = ["G:/compress_health_agent/dist/mcp/stdio.js"]
  *   [mcp_servers.compass_health.env]
+ *   CODEX_MCP_PROTOCOL_VERSION = "2026-07-28"
  *   COMPASS_HEALTH_USER_BINDING = "compass-health:1"
  *
  * Environment:
+ * - CODEX_MCP_PROTOCOL_VERSION       (required by Codex for modern STDIO;
+ *                                     must be 2026-07-28)
  * - DATABASE_URL                     (required) PostgreSQL DSN
  * - COMPASS_HEALTH_USER_BINDING      (required) external id of the single
  *                                     local user; no binding, no tools
@@ -36,11 +39,15 @@ import { createHealthMcpServer } from "./server-core.js";
 import { createSensitivePayloadService } from "./evidence/sensitive-payloads.js";
 
 async function main(): Promise<void> {
-  const databaseUrl = process.env.DATABASE_URL
-    ?? "postgres://compass:compass@localhost:5433/compass_health";
+  const databaseUrl = process.env.DATABASE_URL?.trim();
   const externalUserId = process.env.COMPASS_HEALTH_USER_BINDING;
   const allowUserProvisioning = process.env.COMPASS_HEALTH_ALLOW_USER_PROVISIONING
     ?.trim().toLowerCase() === "true";
+
+  if (!databaseUrl) {
+    process.stderr.write("compass-health MCP: DATABASE_URL is required\n");
+    process.exit(2);
+  }
 
   if (!externalUserId) {
     // Fail loudly on stderr (stdout is the MCP channel) and exit — a server
@@ -117,7 +124,7 @@ async function main(): Promise<void> {
       },
     });
   process.stderr.write(
-    `compass-health MCP: ready on stdio (binding=${externalUserId}, projection=${projectionMode}, media=${media.mode}${media.baseUrl ? `:${media.baseUrl}` : ""})\n`,
+    `compass-health MCP: ready on stdio (binding=verified, projection=${projectionMode}, media=${media.mode}${media.baseUrl ? `:${media.baseUrl}` : ""})\n`,
   );
 
   let shuttingDown = false;
