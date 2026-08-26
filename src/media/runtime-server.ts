@@ -1,6 +1,5 @@
 import { randomBytes } from "node:crypto";
-import { createReadStream } from "node:fs";
-import { stat } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -14,6 +13,8 @@ import {
 } from "./signed-stream-url.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
+const MAX_RENDERED_SEGMENT_BYTES = 64 * 1024 * 1024;
+const MAX_CACHED_SEGMENTS = 4;
 
 export type MediaRuntimeMode = "embedded" | "external" | "off";
 
@@ -28,7 +29,8 @@ export async function startMediaRuntime(options: {
   db: Db;
   mode: MediaRuntimeMode;
   baseUrl?: string;
-  signingSecret?: string;
+    signingSecret?: string;
+    ffmpegPath?: string;
   ttlMs?: number;
   now?: () => Date;
 }): Promise<MediaRuntimeHandle> {
@@ -57,6 +59,9 @@ export async function startMediaRuntime(options: {
 
   const requested = embeddedAddress(options.baseUrl);
   const secret = options.signingSecret ?? randomBytes(32).toString("hex");
+  const ffmpegPath = options.ffmpegPath?.trim() || "ffmpeg";
+  await assertFfmpegAvailable(ffmpegPath);
+  const renderer = createSegmentRenderer(ffmpegPath);
   let signed = createSignedStreamUrlService({
     baseUrl: `http://127.0.0.1:${requested.port}`,
     secret,
@@ -64,7 +69,7 @@ export async function startMediaRuntime(options: {
     ...(options.now ? { now: options.now } : {}),
   });
   const server = createServer((request, response) => {
-    void serveMedia(options.db, signed, request, response).catch(() => {
+    void serveMedia(options.db, signed, renderer, request, response).catch(() => {
       if (!response.headersSent) send(response, 500, "media runtime failure");
       else response.destroy();
     });
@@ -91,7 +96,10 @@ export async function startMediaRuntime(options: {
     baseUrl,
     issueStreamUrl: signed.issue,
     stop: () => new Promise<void>((resolve, reject) => {
-      server.close((error) => error ? reject(error) : resolve());
+      server.close((error) => {
+        renderer.clear();
+        error ? reject(error) : resolve();
+      });
     }),
   };
 }
@@ -99,6 +107,7 @@ export async function startMediaRuntime(options: {
 async function serveMedia(
   db: Db,
   signed: ReturnType<typeof createSignedStreamUrlService>,
+  renderer: SegmentRenderer,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -159,49 +168,169 @@ async function serveMedia(
     return;
   }
 
-  let totalBytes: number;
+  let representation: Buffer;
   try {
-    totalBytes = (await stat(row.localPath)).size;
+    representation = await renderer.render({
+      segmentId,
+      localPath: row.localPath,
+      startMs: row.segmentStartMs,
+      endMs: row.segmentEndMs,
+    });
   } catch {
-    send(response, 503, "media file unavailable");
+    send(response, 503, "media segment unavailable");
     return;
   }
-  if (totalBytes <= 0 || !row.durationMs || row.durationMs <= 0) {
-    send(response, 503, "media metadata unavailable");
-    return;
-  }
-  const bytesPerMs = totalBytes / row.durationMs;
-  const windowStart = Math.min(totalBytes - 1, Math.floor(row.segmentStartMs * bytesPerMs));
-  const windowEnd = Math.min(totalBytes - 1, Math.ceil(row.segmentEndMs * bytesPerMs) - 1);
-  const windowLength = windowEnd - windowStart + 1;
-  if (windowLength <= 0) {
+  const totalBytes = representation.byteLength;
+  if (totalBytes <= 0) {
     send(response, 416, "empty media window");
     return;
   }
-  const requested = parseRange(request.headers.range, windowLength);
+  const requested = parseRange(request.headers.range, totalBytes);
   if (requested === null) {
-    response.writeHead(416, { "Content-Range": `bytes */${windowLength}` });
+    response.writeHead(416, { "Content-Range": `bytes */${totalBytes}` });
     response.end();
     return;
   }
-  const actualStart = windowStart + requested.start;
-  const actualEnd = windowStart + requested.end;
   response.writeHead(requested.partial ? 206 : 200, {
     "Content-Type": row.contentType,
     "Content-Length": String(requested.end - requested.start + 1),
     "Accept-Ranges": "bytes",
     ...(requested.partial
-      ? { "Content-Range": `bytes ${requested.start}-${requested.end}/${windowLength}` }
+      ? { "Content-Range": `bytes ${requested.start}-${requested.end}/${totalBytes}` }
       : {}),
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
   });
-  await new Promise<void>((resolve) => {
-    const stream = createReadStream(row.localPath, { start: actualStart, end: actualEnd });
-    stream.once("error", () => { response.destroy(); resolve(); });
-    response.once("close", resolve);
-    stream.pipe(response).once("finish", resolve);
+  response.end(representation.subarray(requested.start, requested.end + 1));
+}
+
+interface SegmentRenderer {
+  render(input: {
+    segmentId: string;
+    localPath: string;
+    startMs: number;
+    endMs: number;
+  }): Promise<Buffer>;
+  clear(): void;
+}
+
+/**
+ * Render one independently playable fragmented MP4 for the exact segment
+ * window. Byte/time ratios are invalid for variable-bitrate media and can cut
+ * away MP4 headers or keyframes, so the bounded representation is produced by
+ * decoding and re-encoding the selected time range.
+ */
+function createSegmentRenderer(ffmpegPath: string): SegmentRenderer {
+  const cache = new Map<string, Promise<Buffer>>();
+  return {
+    async render(input) {
+      if (input.startMs < 0 || input.endMs <= input.startMs) {
+        throw new RangeError("invalid media segment time window");
+      }
+      const key = `${input.segmentId}:${input.startMs}:${input.endMs}`;
+      const existing = cache.get(key);
+      if (existing) {
+        cache.delete(key);
+        cache.set(key, existing);
+        return existing;
+      }
+      const pending = renderMp4Window(ffmpegPath, input);
+      cache.set(key, pending);
+      while (cache.size > MAX_CACHED_SEGMENTS) {
+        const oldest = cache.keys().next().value as string | undefined;
+        if (oldest === undefined) break;
+        cache.delete(oldest);
+      }
+      try {
+        return await pending;
+      } catch (error) {
+        if (cache.get(key) === pending) cache.delete(key);
+        throw error;
+      }
+    },
+    clear() {
+      cache.clear();
+    },
+  };
+}
+
+async function renderMp4Window(
+  ffmpegPath: string,
+  input: { localPath: string; startMs: number; endMs: number },
+): Promise<Buffer> {
+  const durationMs = input.endMs - input.startMs;
+  return runBinary(ffmpegPath, [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-i", input.localPath,
+    "-ss", seconds(input.startMs),
+    "-t", seconds(durationMs),
+    "-map", "0:v:0?",
+    "-map", "0:a:0?",
+    "-c:v", "libx264",
+    "-preset", "veryfast",
+    "-crf", "23",
+    "-c:a", "aac",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    "-f", "mp4",
+    "pipe:1",
+  ], MAX_RENDERED_SEGMENT_BYTES);
+}
+
+async function assertFfmpegAvailable(ffmpegPath: string): Promise<void> {
+  await runBinary(ffmpegPath, ["-version"], 1024 * 1024, 10_000);
+}
+
+function runBinary(command: string, args: string[], maxBytes: number, timeoutMs = 120_000): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    let stdoutBytes = 0;
+    let stderr = "";
+    let overflowed = false;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, timeoutMs);
+    timer.unref();
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdoutBytes += chunk.byteLength;
+      if (stdoutBytes > maxBytes) {
+        overflowed = true;
+        child.kill();
+        return;
+      }
+      stdout.push(chunk);
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      if (stderr.length < 8_000) stderr += chunk.toString("utf8");
+    });
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error("ffmpeg timed out"));
+      } else if (overflowed) {
+        reject(new Error("rendered media segment exceeds memory limit"));
+      } else if (code !== 0) {
+        reject(new Error(`ffmpeg failed with exit ${code}: ${stderr.slice(0, 500)}`));
+      } else {
+        resolve(Buffer.concat(stdout, stdoutBytes));
+      }
+    });
   });
+}
+
+function seconds(milliseconds: number): string {
+  return (milliseconds / 1_000).toFixed(3);
 }
 
 function embeddedAddress(baseUrl: string | undefined): { port: number } {

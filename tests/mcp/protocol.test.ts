@@ -130,6 +130,7 @@ describe.skipIf(!isDbAvailable)("MCP server core (P1)", () => {
     // Unknown tools surface as isError results (P2 semantics), not rejections.
     const unknown = await client.callTool({ name: "health_nonexistent", arguments: {} });
     expect(unknown.isError).toBe(true);
-    expect((unknown.content as Array<{ text: string }>)[0]!.text).toContain("not_found");
+    expect(JSON.parse((unknown.content as Array<{ text: string }>)[0]!.text))
+      .toMatchObject({ error: "tool_not_found" });
   });
 });

@@ -38,10 +38,11 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
   let worker: ReturnType<typeof createProjectionWorker>;
   let training: ReturnType<typeof createTrainingService>;
   const today = new Date().toISOString().slice(0, 10);
+  const externalUserId = `worker-fault-user-${process.pid}-${Date.now()}`;
 
   beforeAll(async () => {
     ctx = await initToolContext({
-      externalUserId: "worker-fault-user",
+      externalUserId,
       locale: "zh",
       databaseUrl: DATABASE_URL,
       timezone: "Asia/Shanghai",
@@ -235,7 +236,10 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
     const release = new Promise<void>((resolve) => { releaseLock = resolve; });
     const lockTask = lockPool.begin(async (tx) => {
-      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
+      // Block the read-model build long enough for the injected heartbeat to
+      // run. The projection table itself is intentionally left writable so
+      // the test can prove the stale worker never reaches it.
+      await tx.unsafe("LOCK TABLE compass_health.health_observation_events IN ACCESS EXCLUSIVE MODE");
       reportLocked();
       await release;
     });
@@ -276,38 +280,40 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
       payloadJson: { observedOn: today },
     }).returning();
     if (!event) throw new Error("heartbeat failure setup failed");
+    const [projectionBefore] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
+      .from(schema.dailyHealthStateProjection)
+      .where(and(
+        eq(schema.dailyHealthStateProjection.userId, ctx.userId),
+        eq(schema.dailyHealthStateProjection.stateDate, today),
+      ));
 
-    const lockPool = postgres(DATABASE_URL, { max: 1, prepare: false });
-    let releaseLock!: () => void;
-    let reportLocked!: () => void;
+    let releaseProjection!: () => void;
+    let reportBlocked!: () => void;
     let reportHeartbeat!: () => void;
-    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const projectionBlocked = new Promise<void>((resolve) => { reportBlocked = resolve; });
     const heartbeatAttempted = new Promise<void>((resolve) => { reportHeartbeat = resolve; });
-    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
-    const lockTask = lockPool.begin(async (tx) => {
-      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
-      reportLocked();
-      await release;
-    });
+    const release = new Promise<void>((resolve) => { releaseProjection = resolve; });
 
     try {
-      await locked;
       const failedWorker = createProjectionWorker(ctx.db!, ctx.repo, {
         workerId: "heartbeat-db-failure-worker",
         leaseMs: 90,
         batchSize: 1,
+        beforeProjection: async () => {
+          reportBlocked();
+          await release;
+        },
         renewLease: async () => {
           reportHeartbeat();
           throw new Error("injected heartbeat database failure");
         },
       });
       const firstRun = failedWorker.runOnce(undefined, ctx.userId);
-      await waitForAttempts(event.id, 1);
+      await projectionBlocked;
       await heartbeatAttempted;
-      releaseLock();
+      releaseProjection();
 
       const firstResult = await firstRun;
-      await lockTask;
       expect(firstResult).toMatchObject({ succeeded: 0, leaseLost: 1 });
 
       const [abandoned] = await db.select().from(schema.outboxEvents)
@@ -324,6 +330,13 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
       const [done] = await db.select().from(schema.outboxEvents)
         .where(eq(schema.outboxEvents.id, event.id));
       expect(done).toMatchObject({ status: "done", attempts: 2 });
+      const [projectionAfter] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
+        .from(schema.dailyHealthStateProjection)
+        .where(and(
+          eq(schema.dailyHealthStateProjection.userId, ctx.userId),
+          eq(schema.dailyHealthStateProjection.stateDate, today),
+        ));
+      expect(projectionAfter?.revision).toBe((projectionBefore?.revision ?? -1) + 1);
 
       const evidence = await db.select().from(schema.interactionEvents).where(and(
         eq(schema.interactionEvents.stage, "projection"),
@@ -336,9 +349,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
         heartbeatError: "injected heartbeat database failure",
       });
     } finally {
-      releaseLock();
-      await lockTask.catch(() => undefined);
-      await lockPool.end({ timeout: 3 });
+      releaseProjection();
     }
   }, 20_000);
 
@@ -351,26 +362,29 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
       payloadJson: { observedOn: today },
     }).returning();
     if (!event) throw new Error("lease takeover setup failed");
+    const [projectionBefore] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
+      .from(schema.dailyHealthStateProjection)
+      .where(and(
+        eq(schema.dailyHealthStateProjection.userId, ctx.userId),
+        eq(schema.dailyHealthStateProjection.stateDate, today),
+      ));
 
-    const lockPool = postgres(DATABASE_URL, { max: 1, prepare: false });
-    let releaseLock!: () => void;
-    let reportLocked!: () => void;
+    let releaseProjection!: () => void;
+    let reportBlocked!: () => void;
     let reportLost!: () => void;
-    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const projectionBlocked = new Promise<void>((resolve) => { reportBlocked = resolve; });
     const leaseReportedLost = new Promise<void>((resolve) => { reportLost = resolve; });
-    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
-    const lockTask = lockPool.begin(async (tx) => {
-      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
-      reportLocked();
-      await release;
-    });
+    const release = new Promise<void>((resolve) => { releaseProjection = resolve; });
 
     try {
-      await locked;
       const staleWorker = createProjectionWorker(ctx.db!, ctx.repo, {
         workerId: "lease-worker-a",
         leaseMs: 90,
         batchSize: 1,
+        beforeProjection: async () => {
+          reportBlocked();
+          await release;
+        },
         renewLease: async () => {
           reportLost();
           return false;
@@ -381,7 +395,7 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
         batchSize: 1,
       });
       const staleRun = staleWorker.runOnce(undefined, ctx.userId);
-      await waitForAttempts(event.id, 1);
+      await projectionBlocked;
       await leaseReportedLost;
 
       const successorRun = successor.runOnce(new Date(Date.now() + 1_000), ctx.userId);
@@ -390,19 +404,24 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
         .where(eq(schema.outboxEvents.id, event.id));
       expect(takenOver).toMatchObject({ status: "processing", lockedBy: "lease-worker-b", attempts: 2 });
 
-      releaseLock();
-      const [staleResult, successorResult] = await Promise.all([staleRun, successorRun]);
-      await lockTask;
+      const successorResult = await successorRun;
+      releaseProjection();
+      const staleResult = await staleRun;
       expect(staleResult).toMatchObject({ succeeded: 0, leaseLost: 1 });
       expect(successorResult).toMatchObject({ succeeded: 1, leaseLost: 0 });
 
       const [done] = await db.select().from(schema.outboxEvents)
         .where(eq(schema.outboxEvents.id, event.id));
       expect(done).toMatchObject({ status: "done", attempts: 2, lockedBy: null });
+      const [projectionAfter] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
+        .from(schema.dailyHealthStateProjection)
+        .where(and(
+          eq(schema.dailyHealthStateProjection.userId, ctx.userId),
+          eq(schema.dailyHealthStateProjection.stateDate, today),
+        ));
+      expect(projectionAfter?.revision).toBe((projectionBefore?.revision ?? -1) + 1);
     } finally {
-      releaseLock();
-      await lockTask.catch(() => undefined);
-      await lockPool.end({ timeout: 3 });
+      releaseProjection();
     }
   }, 20_000);
 

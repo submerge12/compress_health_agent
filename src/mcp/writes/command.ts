@@ -238,77 +238,77 @@ export function createWriteCommandService(db: Db) {
       throw new WriteCommandError("run_handle_invalid", "run is already closed");
     }
 
-      const mutation = await mutate(tx);
-      const auditEventIds = mutation.auditEventIds ?? [];
-      if (
-        mutation.factRefs.length === 0
-        || (mutation.outboxEventIds.length === 0 && auditEventIds.length === 0)
-      ) {
-        throw new WriteCommandError(
-          "write_contract_failed",
-          "write must return at least one fact and one outbox or operational audit event",
-        );
-      }
+    const mutation = await mutate(tx);
+    const auditEventIds = mutation.auditEventIds ?? [];
+    if (
+      mutation.factRefs.length === 0
+      || (mutation.outboxEventIds.length === 0 && auditEventIds.length === 0)
+    ) {
+      throw new WriteCommandError(
+        "write_contract_failed",
+        "write must return at least one fact and one outbox or operational audit event",
+      );
+    }
 
-      const receiptId = crypto.randomUUID();
-      const response = { ...mutation.response, receiptId, replayed: false };
-      await tx.insert(schema.mcpWriteReceipts).values({
-        id: receiptId,
-        userId: input.userId,
-        runId: input.runHandle,
-        verifiedActor: input.verifiedActor,
-        toolName: input.toolName,
-        scopeKey: input.scopeKey,
-        idempotencyKey: input.idempotencyKey,
-        argumentHash,
-        factRefsJson: mutation.factRefs,
-        outboxEventIdsJson: mutation.outboxEventIds,
-        responseJson: response,
-      });
-      if (mutation.outboxEventIds.length > 0) {
-        const outboxReadBack = await tx.select({ id: schema.outboxEvents.id })
-          .from(schema.outboxEvents)
-          .where(inArray(schema.outboxEvents.id, mutation.outboxEventIds));
-        if (outboxReadBack.length !== mutation.outboxEventIds.length) {
-          throw new WriteCommandError("write_contract_failed", "outbox read-back did not match mutation");
-        }
+    const receiptId = crypto.randomUUID();
+    const response = { ...mutation.response, receiptId, replayed: false };
+    await tx.insert(schema.mcpWriteReceipts).values({
+      id: receiptId,
+      userId: input.userId,
+      runId: input.runHandle,
+      verifiedActor: input.verifiedActor,
+      toolName: input.toolName,
+      scopeKey: input.scopeKey,
+      idempotencyKey: input.idempotencyKey,
+      argumentHash,
+      factRefsJson: mutation.factRefs,
+      outboxEventIdsJson: mutation.outboxEventIds,
+      responseJson: response,
+    });
+    if (mutation.outboxEventIds.length > 0) {
+      const outboxReadBack = await tx.select({ id: schema.outboxEvents.id })
+        .from(schema.outboxEvents)
+        .where(inArray(schema.outboxEvents.id, mutation.outboxEventIds));
+      if (outboxReadBack.length !== mutation.outboxEventIds.length) {
+        throw new WriteCommandError("write_contract_failed", "outbox read-back did not match mutation");
       }
-      if (auditEventIds.length > 0) {
-        const auditReadBack = await tx.select({ id: schema.interactionEvents.id })
-          .from(schema.interactionEvents)
-          .where(and(
-            inArray(schema.interactionEvents.id, auditEventIds),
-            eq(schema.interactionEvents.userId, input.userId),
-          ));
-        if (auditReadBack.length !== auditEventIds.length) {
-          throw new WriteCommandError("write_contract_failed", "audit read-back did not match mutation");
-        }
+    }
+    if (auditEventIds.length > 0) {
+      const auditReadBack = await tx.select({ id: schema.interactionEvents.id })
+        .from(schema.interactionEvents)
+        .where(and(
+          inArray(schema.interactionEvents.id, auditEventIds),
+          eq(schema.interactionEvents.userId, input.userId),
+        ));
+      if (auditReadBack.length !== auditEventIds.length) {
+        throw new WriteCommandError("write_contract_failed", "audit read-back did not match mutation");
       }
-      const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
-        eq(schema.mcpWriteReceipts.id, receiptId),
-        eq(schema.mcpWriteReceipts.userId, input.userId),
-        eq(schema.mcpWriteReceipts.runId, input.runHandle),
-      )).limit(1);
-      if (!storedReceipt) throw new WriteCommandError("write_contract_failed", "write receipt read-back failed");
+    }
+    const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
+      eq(schema.mcpWriteReceipts.id, receiptId),
+      eq(schema.mcpWriteReceipts.userId, input.userId),
+      eq(schema.mcpWriteReceipts.runId, input.runHandle),
+    )).limit(1);
+    if (!storedReceipt) throw new WriteCommandError("write_contract_failed", "write receipt read-back failed");
 
-      const [sequenceRow] = await tx.select({
-        max: sql<number>`coalesce(max(${schema.agentRunSteps.sequence}), -1)::int`,
-      }).from(schema.agentRunSteps).where(eq(schema.agentRunSteps.runId, input.runHandle));
-      await tx.insert(schema.agentRunSteps).values({
-        runId: input.runHandle,
-        sequence: (sequenceRow?.max ?? -1) + 1,
-        stage: "tool_commit",
-        mcpMethod: "tools/call",
-        mcpName: input.toolName,
-        status: "ok",
-        argumentsRedactedJson: redactArguments(input.arguments),
-        resultSummaryJson: {
-          receiptId,
-          facts: mutation.factRefs,
-          outboxEventIds: mutation.outboxEventIds,
-          auditEventIds,
-        },
-      });
+    const [sequenceRow] = await tx.select({
+      max: sql<number>`coalesce(max(${schema.agentRunSteps.sequence}), -1)::int`,
+    }).from(schema.agentRunSteps).where(eq(schema.agentRunSteps.runId, input.runHandle));
+    await tx.insert(schema.agentRunSteps).values({
+      runId: input.runHandle,
+      sequence: (sequenceRow?.max ?? -1) + 1,
+      stage: "tool_commit",
+      mcpMethod: "tools/call",
+      mcpName: input.toolName,
+      status: "ok",
+      argumentsRedactedJson: redactArguments(input.arguments),
+      resultSummaryJson: {
+        receiptId,
+        facts: mutation.factRefs,
+        outboxEventIds: mutation.outboxEventIds,
+        auditEventIds,
+      },
+    });
 
     return { response: storedReceipt.responseJson, replayed: false, receiptId };
   }

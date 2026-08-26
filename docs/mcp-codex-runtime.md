@@ -45,13 +45,17 @@ separate HTTP listener on an ephemeral `127.0.0.1` port while MCP traffic
 continues over STDIO. `health_search_training_media` returns an absolute,
 five-minute HMAC-signed `streamUrl`, `expiresAt`, and `contentType`; it never
 returns the asset's `localPath`. The stream endpoint supports byte ranges and
-serves only the segment's validated time window.
+serves an independently playable fragmented MP4 rendered from the segment's
+validated time window. It decodes and re-encodes the window; it never assumes
+that variable-bitrate media can be sliced by a byte/time ratio.
 
 Available modes are:
 
 - `embedded`: the default local Codex mode. An optional
   `COMPASS_HEALTH_MEDIA_BASE_URL=http://127.0.0.1:<port>` pins the loopback
-  port; omitting it chooses a free port.
+  port; omitting it chooses a free port. `ffmpeg` with `libx264` and AAC must
+  be available on `PATH`, or set `COMPASS_HEALTH_FFMPEG_PATH` to its executable.
+  Startup fails before advertising media URLs when this dependency is absent.
 - `external`: no listener is started. Both `COMPASS_HEALTH_MEDIA_BASE_URL`
   and a secret of at least 32 bytes in
   `COMPASS_HEALTH_MEDIA_SIGNING_SECRET` are required. The external service

@@ -389,6 +389,7 @@ function terminalEvidence(toolName: string, outcome: ToolOutcome): {
 }
 
 function failureStageFor(toolName: string, errorCode: string): string {
+  if (errorCode === "tool_not_found") return "tool_lookup";
   if (["actor_mismatch", "not_owned", "run_handle_invalid", "unauthorized_actor"].includes(errorCode)) {
     return "authorization";
   }

@@ -13,13 +13,17 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
-import { createDailyStateService, type DailyStateService } from "./daily-state.js";
+import {
+  createDailyStateService,
+  type DailyStateReadModel,
+  type DailyStateService,
+} from "./daily-state.js";
 import { createTimezoneResolver, createUserLocalDateResolver } from "./timezone.js";
-import type { Repository } from "../db/repository.js";
+import { createRepository, type Repository } from "../db/repository.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -71,10 +75,12 @@ export interface ProjectionWorkerOptions {
   now?: () => Date;
   /** Fault-injection/adapter seam. Return false when this worker no longer owns the row. */
   renewLease?: (eventId: string, expiresAt: Date, workerId: string) => Promise<boolean>;
+  /** Test/fault seam used to hold projection work without taking database locks. */
+  beforeProjection?: (eventId: string) => Promise<void>;
 }
 
 type ProcessOutcome =
-  | { kind: "success" }
+  | { kind: "success"; state: DailyStateReadModel }
   | { kind: "unsupported"; lastError: string }
   | { kind: "failed"; lastError: string };
 
@@ -160,11 +166,18 @@ export function createProjectionWorker(
     );
   }
 
+  function activelyOwnedEvent(eventId: string, at: Date) {
+    return and(
+      ownedEvent(eventId),
+      gt(schema.outboxEvents.lockExpiresAt, at),
+    );
+  }
+
   async function renewLease(eventId: string, expiresAt: Date): Promise<boolean> {
     if (options.renewLease) return options.renewLease(eventId, expiresAt, workerId);
     const renewed = await db.update(schema.outboxEvents)
       .set({ lockExpiresAt: expiresAt })
-      .where(ownedEvent(eventId))
+      .where(activelyOwnedEvent(eventId, now()))
       .returning({ id: schema.outboxEvents.id });
     return renewed.length === 1;
   }
@@ -211,10 +224,11 @@ export function createProjectionWorker(
       if (!SUPPORTED_AGGREGATE_TYPES.has(event.aggregateType)) {
         throw new Error(`unsupported_event_type:${event.aggregateType}`);
       }
+      await options.beforeProjection?.(event.id);
       // Every known aggregate feeds the user/day projection of its event day.
       const tz = await resolveTimezone(event.userId);
-      await dailyState.persistDailyProjection(event.userId, await extractEventDay(event), tz);
-      return { kind: "success" };
+      const state = await dailyState.buildDailyState(event.userId, await extractEventDay(event), tz);
+      return { kind: "success", state };
     } catch (error) {
       if (String(error instanceof Error ? error.message : error).startsWith("unsupported_event_type")) {
         return { kind: "unsupported", lastError: `unsupported_event_type:${event.aggregateType}` };
@@ -240,6 +254,38 @@ export function createProjectionWorker(
         workerId,
         ...(heartbeatError ? { heartbeatError } : {}),
       },
+    });
+  }
+
+  async function commitSuccessfulProjection(
+    event: typeof schema.outboxEvents.$inferSelect,
+    state: DailyStateReadModel,
+  ): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      const commitAt = now();
+      const [owned] = await tx.select({ id: schema.outboxEvents.id })
+        .from(schema.outboxEvents)
+        .where(activelyOwnedEvent(event.id, commitAt))
+        .limit(1)
+        .for("update");
+      if (!owned) return false;
+
+      const transactionDb = tx as unknown as Db;
+      const transactionState = createDailyStateService(
+        transactionDb,
+        createRepository(transactionDb),
+      );
+      await transactionState.persistBuiltProjection(state);
+      const completed = await tx.update(schema.outboxEvents).set({
+        status: "done",
+        processedAt: commitAt,
+        lockedBy: null,
+        lockExpiresAt: null,
+      }).where(activelyOwnedEvent(event.id, commitAt)).returning({ id: schema.outboxEvents.id });
+      if (completed.length !== 1) {
+        throw new Error("projection lease changed while its row was locked");
+      }
+      return true;
     });
   }
 
@@ -269,13 +315,7 @@ export function createProjectionWorker(
       }
 
       if (outcome.kind === "success") {
-        const completed = await db.update(schema.outboxEvents).set({
-          status: "done",
-          processedAt: now(),
-          lockedBy: null,
-          lockExpiresAt: null,
-        }).where(ownedEvent(event.id)).returning({ id: schema.outboxEvents.id });
-        if (completed.length === 1) {
+        if (await commitSuccessfulProjection(event, outcome.state)) {
           result.succeeded += 1;
         } else {
           result.leaseLost += 1;
@@ -290,7 +330,7 @@ export function createProjectionWorker(
           lastError: outcome.lastError,
           lockedBy: null,
           lockExpiresAt: null,
-        }).where(ownedEvent(event.id)).returning({ id: schema.outboxEvents.id });
+        }).where(activelyOwnedEvent(event.id, now())).returning({ id: schema.outboxEvents.id });
         if (deadLettered.length === 1) {
           await db.insert(schema.interactionEvents).values({
             userId: event.userId,
@@ -323,7 +363,7 @@ export function createProjectionWorker(
             lockedBy: null,
             lockExpiresAt: null,
           })
-        .where(ownedEvent(event.id))
+        .where(activelyOwnedEvent(event.id, now()))
         .returning({ id: schema.outboxEvents.id });
       if (failed.length === 0) {
         result.leaseLost += 1;

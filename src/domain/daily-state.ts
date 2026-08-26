@@ -96,6 +96,8 @@ export interface DailyStateReadModel {
   projection: { status: string; builtAt: string };
 }
 
+type ProjectionStatus = "fresh" | "lagging" | "failed" | "rebuilding";
+
 export function createDailyStateService(db: Db, repo: Repository) {
   // ── Facts ────────────────────────────────────────────────────────────────
 
@@ -298,8 +300,21 @@ export function createDailyStateService(db: Db, repo: Repository) {
     userId: string,
     localDate: string,
     timezone: string,
-    status: "fresh" | "lagging" | "failed" | "rebuilding" = "fresh",
+    status: ProjectionStatus = "fresh",
   ): Promise<DailyStateReadModel> {
+    return persistBuiltProjection(await buildDailyState(userId, localDate, timezone), status);
+  }
+
+  /**
+   * Persist an already-built read model. A projection worker can call this on
+   * a transaction-scoped service after locking and re-checking its outbox
+   * lease, so a stale worker never mutates the projection.
+   */
+  async function persistBuiltProjection(
+    state: DailyStateReadModel,
+    status: ProjectionStatus = "fresh",
+  ): Promise<DailyStateReadModel> {
+    const { userId, localDate, timezone } = state;
     const [existing] = await db.select({ revision: schema.dailyHealthStateProjection.revision })
       .from(schema.dailyHealthStateProjection)
       .where(and(
@@ -307,8 +322,6 @@ export function createDailyStateService(db: Db, repo: Repository) {
         eq(schema.dailyHealthStateProjection.stateDate, localDate),
       ))
       .limit(1);
-
-    const state = await buildDailyState(userId, localDate, timezone);
     const revision = (existing?.revision ?? -1) + 1;
     const payload = { ...state, revision };
 
@@ -388,6 +401,7 @@ export function createDailyStateService(db: Db, repo: Repository) {
     listActiveConstraints,
     buildDailyState,
     persistDailyProjection,
+    persistBuiltProjection,
     getDailyProjection,
     checkAndRecordIdempotency,
   };

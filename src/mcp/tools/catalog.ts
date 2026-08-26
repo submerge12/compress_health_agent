@@ -2452,7 +2452,7 @@ export function createHealthToolCatalog(
     async call(name: string, invocation: ToolInvocation): Promise<ToolOutcome> {
       const tool = toolDefs.find((t) => t.name === name);
       if (!tool) {
-        return toolError("not_found", `unknown tool: ${name}`);
+        return toolError("tool_not_found", `unknown tool: ${name}`);
       }
       try {
         return await tool.execute(invocation);

@@ -1,7 +1,7 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
-import { unlink, writeFile } from "node:fs/promises";
+import { stat, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -31,6 +31,52 @@ const codexFixture = JSON.parse(readFileSync(
   };
 };
 
+function runTestBinary(command: string, args: string[], input?: Buffer): Promise<Buffer> {
+  return new Promise((resolveRun, rejectRun) => {
+    const child = spawn(command, args, {
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const stdout: Buffer[] = [];
+    const stderr: Buffer[] = [];
+    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    child.once("error", rejectRun);
+    child.once("close", (code) => {
+      if (code === 0) resolveRun(Buffer.concat(stdout));
+      else rejectRun(new Error(`${command} exited ${code}: ${Buffer.concat(stderr).toString("utf8").slice(0, 1000)}`));
+    });
+    child.stdin.end(input);
+  });
+}
+
+async function generateTestVideo(outputPath: string): Promise<void> {
+  await runTestBinary("ffmpeg", [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-f", "lavfi",
+    "-i", "testsrc2=duration=30:size=160x90:rate=10",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-crf", "25",
+    "-pix_fmt", "yuv420p",
+    "-movflags", "+faststart",
+    "-y",
+    outputPath,
+  ]);
+}
+
+async function probeVideoDuration(video: Buffer): Promise<number> {
+  const output = await runTestBinary("ffprobe", [
+    "-v", "error",
+    "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    "pipe:0",
+  ], video);
+  return Number(output.toString("utf8").trim());
+}
+
 interface JsonRpcResponse {
   jsonrpc: "2.0";
   id: string | number | null;
@@ -48,6 +94,7 @@ class WireClient {
     externalUserId?: string;
     actor?: string;
     runtimeVersion?: string;
+    mediaRuntime?: "embedded" | "external" | "off";
     allowUserProvisioning?: boolean;
     testNow?: string;
   } = {}) {
@@ -65,6 +112,7 @@ class WireClient {
           ? { COMPASS_HEALTH_RUNTIME_VERSION: options.runtimeVersion } : {}),
         COMPASS_HEALTH_ALLOW_USER_PROVISIONING:
           options.allowUserProvisioning === false ? "false" : "true",
+        COMPASS_HEALTH_MEDIA_RUNTIME: options.mediaRuntime ?? "off",
         ...(options.testNow ? { COMPASS_HEALTH_TEST_NOW: options.testNow } : {}),
         NODE_ENV: "test",
       },
@@ -270,6 +318,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
         DATABASE_URL,
         COMPASS_HEALTH_USER_BINDING: binding,
         COMPASS_HEALTH_ALLOW_USER_PROVISIONING: "false",
+        COMPASS_HEALTH_MEDIA_RUNTIME: "off",
         NODE_ENV: "production",
       },
       stdio: "pipe",
@@ -2158,7 +2207,10 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }));
     expect(projection.result?.structuredContent).toMatchObject({ error: "domain_unavailable" });
 
-    const evidence = await client.request(toolCall(9, "health_get_run_evidence", { runHandle }));
+    const wrongTool = await client.request(toolCall(9, "health_record_sets", { runHandle }));
+    expect(wrongTool.result?.structuredContent).toMatchObject({ error: "tool_not_found" });
+
+    const evidence = await client.request(toolCall(10, "health_get_run_evidence", { runHandle }));
     const terminalFailures = (evidence.result?.structuredContent as {
       steps: Array<{
         stage: string;
@@ -2187,16 +2239,19 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(byTool.get("health_replay_projection")).toMatchObject({
       status: "failed", errorCode: "domain_unavailable", failureStage: "projection",
     });
+    expect(byTool.get("health_record_sets")).toMatchObject({
+      status: "failed", errorCode: "tool_not_found", failureStage: "tool_lookup",
+    });
   }, 40_000);
 
-  it("executes J06 safe media ranking and feedback without exposing local paths", async () => {
+  it("executes J06 with a playable time-window Range stream and no local-path leak", async () => {
     const binding = `mcp-wire-j06-${process.pid}-${Date.now()}`;
     const marker = `wire-j06-${process.pid}-${Date.now()}`;
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     const segmentIds = new Map<string, string>();
     testMediaPath = join(tmpdir(), `compass-health-wire-media-${process.pid}-${Date.now()}.mp4`);
-    const mediaBytes = Buffer.from(Array.from({ length: 8192 }, (_, index) => index % 251));
-    await writeFile(testMediaPath, mediaBytes);
+    await generateTestVideo(testMediaPath);
+    const mediaByteLength = (await stat(testMediaPath)).size;
     const fixtures = [
       {
         key: "curun-confirmed",
@@ -2288,7 +2343,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
             ('video', ${fixture.trainer}, ${fixture.sourceRole}, ${`${marker}-${fixture.key}`},
              ${testMediaPath}, ${`${marker}-${fixture.key}`}, 60000,
              ${fixture.probeStatus}, ${fixture.fullDecodeStatus}, ${fixture.decodeErrorAtMs},
-             ${fixture.usableVideoUntilMs}, 'video/mp4', ${mediaBytes.length})
+             ${fixture.usableVideoUntilMs}, 'video/mp4', ${mediaByteLength})
           RETURNING id`;
         testMediaAssetIds.add(String(asset!.id));
         const [pairing] = await sql`
@@ -2314,7 +2369,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
       await sql.end({ timeout: 3 });
     }
 
-    const client = new WireClient({ externalUserId: binding });
+    const client = new WireClient({ externalUserId: binding, mediaRuntime: "embedded" });
     clients.push(client);
     const begun = await client.request(toolCall(1, "health_begin_run", {
       objective: "wire J06 media",
@@ -2339,6 +2394,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
         streamUrl: string;
         expiresAt: string;
         contentType: string;
+        startMs: number;
+        endMs: number;
         localPath?: string;
       }>;
     }).segments;
@@ -2356,6 +2413,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
       sourceRole: "chest_specialist",
       reviewStatus: "confirmed",
       contentType: "video/mp4",
+      startMs: 1_000,
+      endMs: 5_000,
     });
     const streamUrl = new URL(segments[0]!.streamUrl);
     expect(streamUrl.hostname).toBe("127.0.0.1");
@@ -2366,13 +2425,19 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(segments.every((segment) => segment.localPath === undefined)).toBe(true);
 
     const streamed = await fetch(segments[0]!.streamUrl, {
-      headers: { Range: "bytes=0-31" },
+      headers: { Range: "bytes=0-" },
     });
     expect(streamed.status).toBe(206);
     expect(streamed.headers.get("content-type")).toBe("video/mp4");
     expect(streamed.headers.get("accept-ranges")).toBe("bytes");
-    expect(streamed.headers.get("content-range")).toMatch(/^bytes 0-31\/\d+$/);
-    expect(Buffer.from(await streamed.arrayBuffer())).toEqual(mediaBytes.subarray(136, 168));
+    const rendered = Buffer.from(await streamed.arrayBuffer());
+    const contentRange = /^bytes 0-(\d+)\/(\d+)$/u.exec(streamed.headers.get("content-range") ?? "");
+    expect(contentRange?.[1]).toBe(String(rendered.byteLength - 1));
+    expect(contentRange?.[2]).toBe(String(rendered.byteLength));
+    expect(rendered.subarray(4, 8).toString("ascii")).toBe("ftyp");
+    const renderedDuration = await probeVideoDuration(rendered);
+    expect(renderedDuration).toBeGreaterThanOrEqual(3.8);
+    expect(renderedDuration).toBeLessThanOrEqual(4.2);
 
     for (let index = 0; index < 3; index += 1) {
       const feedback = await client.request(toolCall(3 + index, "health_record_media_feedback", {
@@ -2395,7 +2460,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const rerankedIds = rerankedSegments.map((segment) => segment.segmentId);
     expect(rerankedIds[0]).toBe(segmentIds.get("tanchengyi-confirmed"));
     expect(rerankedIds.indexOf(segmentIds.get("curun-draft-popular")!)).toBeGreaterThan(1);
-  }, 35_000);
+  }, 60_000);
 
   it("executes J07 non-empty plan diff, activation, next prepare, and rollback", async () => {
     const binding = `mcp-wire-j07-${process.pid}-${Date.now()}`;

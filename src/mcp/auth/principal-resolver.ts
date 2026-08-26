@@ -6,11 +6,9 @@
  *   (STDIO local mode) or verified from the bearer token (HTTP mode). It is
  *   NEVER taken from tool arguments — a client cannot impersonate another
  *   user by passing a different externalUserId.
- * - The ACTOR names which agent runtime is acting (codex-primary, pi, dsh,
- *   reviewer, …). Clients may declare an actor via the X-Compass-Actor-style
- *   field in _meta, but the server records it verbatim for evidence only;
- *   authorization derives from the transport-verified principal, not the
- *   declared actor string.
+ * - The ACTOR names which verified server-configured runtime is acting
+ *   (codex-primary, pi, dsh, reviewer, …). Request metadata cannot override
+ *   this identity. Runs and receipts bind the resolved formal Actor Profile.
  */
 import { eq } from "drizzle-orm";
 

@@ -17,6 +17,8 @@
  * - COMPASS_HEALTH_AGENT_PROFILE / AGENT_PROFILE_VERSION
  * - COMPASS_HEALTH_MODEL_PROVIDER / MODEL_NAME
  *                                     (optional) formal Actor Profile fields
+ * - COMPASS_HEALTH_FFMPEG_PATH         (optional) ffmpeg executable for exact
+ *                                     embedded media-window rendering
  * - COMPASS_HEALTH_ALLOW_USER_PROVISIONING (optional) explicit opt-in; default false
  *
  * MCP traffic remains STDIO-only. In embedded media mode a separate,
@@ -79,6 +81,8 @@ async function main(): Promise<void> {
       ? { baseUrl: process.env.COMPASS_HEALTH_MEDIA_BASE_URL } : {}),
     ...(process.env.COMPASS_HEALTH_MEDIA_SIGNING_SECRET
       ? { signingSecret: process.env.COMPASS_HEALTH_MEDIA_SIGNING_SECRET } : {}),
+    ...(process.env.COMPASS_HEALTH_FFMPEG_PATH
+      ? { ffmpegPath: process.env.COMPASS_HEALTH_FFMPEG_PATH } : {}),
   });
 
   let handle: StdioServerHandle | undefined;
