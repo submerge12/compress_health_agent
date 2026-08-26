@@ -753,12 +753,32 @@ describe("MCP 2026-07-28 stdio wire", () => {
         INSERT INTO compass_health.active_plan_assignments
           (user_id, scope, plan_version_id)
         VALUES (${user!.id}::uuid, ${scope}, ${parentId}::uuid)`;
+      const governedContent = (label: string) => JSON.stringify({
+        days: {},
+        planDiff: {
+          changes: [{ kind: "wire_fixture", target: {}, before: null, after: { label } }],
+          changedDays: [],
+        },
+        governance: {
+          schemaVersion: "plan-governance.v1",
+          proposalArgumentHash: `wire-${label}`,
+          reviewedBy: "deterministic_plan_governance.v1",
+          reviewStatus: "approved",
+          reviewReasons: ["wire fixture deterministic review passed"],
+          rollbackTargetVersionId: parentId,
+          validationQuestions: [`validate ${label}`],
+          highFrequencyCycle: false,
+          recoveryEvidence: null,
+        },
+      });
       const drafts = await sql`
         INSERT INTO compass_health.plan_versions
-          (user_id, scope, status, parent_version_id, content_json, version_number)
+          (user_id, scope, status, parent_version_id, content_json, validation_questions, version_number)
         VALUES
-          (${user!.id}::uuid, ${scope}, 'draft', ${parentId}::uuid, '{}'::jsonb, 2),
-          (${user!.id}::uuid, ${scope}, 'draft', ${parentId}::uuid, '{}'::jsonb, 3)
+          (${user!.id}::uuid, ${scope}, 'draft', ${parentId}::uuid,
+           ${governedContent("plan-a")}::jsonb, '["validate plan-a"]'::jsonb, 2),
+          (${user!.id}::uuid, ${scope}, 'draft', ${parentId}::uuid,
+           ${governedContent("plan-b")}::jsonb, '["validate plan-b"]'::jsonb, 3)
         RETURNING id, version_number`;
       drafts.sort((left, right) => Number(left.version_number) - Number(right.version_number));
       planA = String(drafts[0]!.id);
@@ -919,10 +939,29 @@ describe("MCP 2026-07-28 stdio wire", () => {
           (user_id, scope, status, content_json, version_number)
         VALUES (${user!.id}::uuid, ${scope}, 'active', '{"days":{}}'::jsonb, 1)
         RETURNING id`;
+      const governedChildContent = JSON.stringify({
+        days: {},
+        planDiff: {
+          changes: [{ kind: "wire_fixture", target: {}, before: null, after: { replay: true } }],
+          changedDays: [],
+        },
+        governance: {
+          schemaVersion: "plan-governance.v1",
+          proposalArgumentHash: "wire-activation-replay",
+          reviewedBy: "deterministic_plan_governance.v1",
+          reviewStatus: "approved",
+          reviewReasons: ["wire fixture deterministic review passed"],
+          rollbackTargetVersionId: String(parent!.id),
+          validationQuestions: ["validate activation receipt replay"],
+          highFrequencyCycle: false,
+          recoveryEvidence: null,
+        },
+      });
       const [child] = await sql`
         INSERT INTO compass_health.plan_versions
-          (user_id, scope, status, parent_version_id, content_json, version_number)
-        VALUES (${user!.id}::uuid, ${scope}, 'draft', ${parent!.id}::uuid, '{"days":{}}'::jsonb, 2)
+          (user_id, scope, status, parent_version_id, content_json, validation_questions, version_number)
+        VALUES (${user!.id}::uuid, ${scope}, 'draft', ${parent!.id}::uuid,
+          ${governedChildContent}::jsonb, '["validate activation receipt replay"]'::jsonb, 2)
         RETURNING id`;
       await sql`
         INSERT INTO compass_health.active_plan_assignments (user_id, scope, plan_version_id)
@@ -2710,6 +2749,37 @@ describe("MCP 2026-07-28 stdio wire", () => {
       idempotencyKey: "wire-j07-reflection",
     }));
     const reflectionId = (reflected.result?.structuredContent as { reflectionId: string }).reflectionId;
+    const governanceSql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let cueSegmentId: string;
+    try {
+      const [asset] = await governanceSql`
+        INSERT INTO compass_health.media_assets
+          (kind, trainer, source_role, title, local_path, sha256, duration_ms,
+           probe_status, full_decode_status, usable_video_until_ms, content_type, bytes)
+        VALUES
+          ('video', 'wire-governance', 'technique_details', ${`wire-j07-${binding}`},
+           'wire-j07-governance.mp4', ${`wire-j07-${binding}`}, 60000,
+           'ok', 'ok', 60000, 'video/mp4', 1)
+        RETURNING id`;
+      testMediaAssetIds.add(String(asset!.id));
+      const [pairing] = await governanceSql`
+        INSERT INTO compass_health.media_pairings
+          (video_asset_id, match_method, completeness, subtitle_end_ms, usable_until_ms)
+        VALUES (${asset!.id}::uuid, 'manifest', 'complete', 60000, 60000)
+        RETURNING id`;
+      const [segment] = await governanceSql`
+        INSERT INTO compass_health.video_segments
+          (pairing_id, start_ms, end_ms, trainer, source_role, title, body_part,
+           movement_pattern, exercise_slug, category, cues_text, review_status)
+        VALUES
+          (${pairing!.id}::uuid, 1000, 10000, 'wire-governance', 'technique_details',
+           'incline press technique', 'upper_chest', 'horizontal_push',
+           'incline_dumbbell_press', 'correction', 'validated incline press cue', 'confirmed')
+        RETURNING id`;
+      cueSegmentId = String(segment!.id);
+    } finally {
+      await governanceSql.end({ timeout: 3 });
+    }
     const proposed = await client.request(toolCall(6, "health_propose_plan_change", {
       runHandle,
       reflectionId,
@@ -2738,7 +2808,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
            kind: "update_cue_refs",
            dayRole: "A",
            exerciseSlug: "incline_dumbbell_press",
-           cueRefs: ["segment-j07-technique"],
+           cueRefs: [cueSegmentId],
          },
          { kind: "update_cycle_pattern", cyclePattern: ["A", "REST", "B", "C", "REST"] },
        ],
@@ -2756,6 +2826,18 @@ describe("MCP 2026-07-28 stdio wire", () => {
     };
     const childVersionId = proposedBody.childVersionId;
     const parentVersionId = proposedBody.parentVersionId;
+    const conflictingProposal = await client.request(toolCall(60, "health_propose_plan_change", {
+      runHandle,
+      reflectionId,
+      changes: [{ kind: "update_sets", dayRole: "A", exerciseSlug: "barbell_bench_press", sets: 2 }],
+      reason: "same reflection with different arguments",
+      idempotencyKey: "wire-j07-proposal-conflict",
+    }));
+    expect(conflictingProposal.result).toMatchObject({
+      resultType: "complete",
+      isError: true,
+      structuredContent: { error: "proposal_conflict" },
+    });
     expect(proposedBody.diff.changedDays).toEqual(expect.arrayContaining([
       expect.objectContaining({
         dayRole: "A",
@@ -2796,6 +2878,9 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(activationMessage).toContain("incline_dumbbell_press");
     expect(activationMessage).toContain("beforeOrder");
     expect(activationMessage).toContain("afterOrder");
+    expect(activationMessage).toContain("确定性审查");
+    expect(activationMessage).toContain("回滚目标");
+    expect(activationMessage).toContain("验证问题");
     const activated = await client.request(toolCall(8, "health_activate_plan_version", activationArgs, {
       requestState: pending.result?.requestState as string,
       inputResponses: {
@@ -2837,7 +2922,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
       repRangeHigh: 8,
       rirLow: 1,
       rirHigh: 2,
-      cueRefs: ["segment-j07-technique"],
+      cueRefs: [cueSegmentId],
     });
 
     const postActivation = postgres(DATABASE_URL, { max: 1, prepare: false });

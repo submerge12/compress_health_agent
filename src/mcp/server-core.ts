@@ -380,6 +380,7 @@ function terminalEvidence(toolName: string, outcome: ToolOutcome): {
     "not_found",
     "not_owned",
     "proposal_stale",
+    "proposal_conflict",
     "run_handle_invalid",
     "state_conflict",
     "unauthorized_actor",
@@ -397,7 +398,7 @@ function failureStageFor(toolName: string, errorCode: string): string {
     return "authorization";
   }
   if (errorCode === "not_found") return "target_lookup";
-  if (["proposal_stale", "state_conflict", "idempotency_conflict", "invalid_session_state"].includes(errorCode)) {
+  if (["proposal_stale", "proposal_conflict", "state_conflict", "idempotency_conflict", "invalid_session_state"].includes(errorCode)) {
     return "precondition";
   }
   if (errorCode === "health_safety_block") return "safety";

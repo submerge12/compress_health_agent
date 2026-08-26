@@ -130,6 +130,27 @@ describe("migrations (live, throwaway databases)", () => {
     expect(String(redactedRun?.objective)).toMatch(/^<legacy-redacted:/);
     expect(String(redactedRun?.response_summary)).toMatch(/^<legacy-redacted:/);
     expect(JSON.stringify(redactedRun)).not.toContain("shoulder pain");
+
+    const [otherPlanUser] = await sql`
+      INSERT INTO compass_health.users (external_id)
+      VALUES (${"migration-plan-version-other"}) RETURNING id`;
+    await sql`
+      INSERT INTO compass_health.plan_versions (user_id, scope, version_number, content_json)
+      VALUES (${legacyEvidenceUser!.id}::uuid, 'training_template', 1, '{}'::jsonb)`;
+    await expect(sql`
+      INSERT INTO compass_health.plan_versions (user_id, scope, version_number, content_json)
+      VALUES (${legacyEvidenceUser!.id}::uuid, 'training_template', 1, '{}'::jsonb)`)
+      .rejects.toThrow();
+    await sql`
+      INSERT INTO compass_health.plan_versions (user_id, scope, version_number, content_json)
+      VALUES (${otherPlanUser!.id}::uuid, 'training_template', 1, '{}'::jsonb)`;
+    const [governanceColumns] = await sql`
+      SELECT
+        count(*) FILTER (WHERE table_name = 'training_reflections' AND column_name = 'proposal_argument_hash')::int AS proposal_hash,
+        count(*) FILTER (WHERE table_name = 'exercise_definitions' AND column_name = 'range_of_motion')::int AS range_of_motion
+      FROM information_schema.columns
+      WHERE table_schema = 'compass_health'`;
+    expect(governanceColumns).toMatchObject({ proposal_hash: 1, range_of_motion: 1 });
     await sql.end({ timeout: 3 });
 
     await assertSchemaReady(cleanUrl);

@@ -347,6 +347,7 @@ export const planVersions = compass.table("plan_versions", {
   ...timestamps()
 }, (t) => [
   index("plan_versions_user_scope_idx").on(t.userId, t.scope, t.status),
+  unique("plan_versions_user_scope_version_key").on(t.userId, t.scope, t.versionNumber),
 ]);
 
 /** Single active pointer per user+scope; plan changes swap this row atomically. */
@@ -479,11 +480,14 @@ export const exerciseDefinitions = compass.table("exercise_definitions", {
   secondaryMuscles: jsonb("secondary_muscles").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   equipment: text("equipment"),
   stabilityDemand: text("stability_demand").notNull().default("medium"), // low | medium | high
+  rangeOfMotion: text("range_of_motion").notNull().default("full"), // reduced | full | extended
   contraindicationTags: jsonb("contraindication_tags").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   regressions: jsonb("regressions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   progressions: jsonb("progressions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   ...timestamps()
-});
+}, (t) => [
+  check("exercise_definitions_range_of_motion_check", sql`${t.rangeOfMotion} IN ('reduced', 'full', 'extended')`),
+]);
 
 /** Per-user exercise substitution graph (user may edit; seeded from defaults). */
 export const exerciseSubstitutions = compass.table("exercise_substitutions", {
@@ -586,6 +590,7 @@ export const trainingReflections = compass.table("training_reflections", {
   proposedAdjustmentsJson: jsonb("proposed_adjustments_json").$type<Array<Record<string, unknown>>>().notNull().default(sql`'[]'::jsonb`),
   nextValidationQuestions: jsonb("next_validation_questions").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   proposalPlanVersionId: uuid("proposal_plan_version_id"),
+  proposalArgumentHash: text("proposal_argument_hash"),
   userAcceptedAt: timestamp("user_accepted_at", { withTimezone: true }),
   ...timestamps()
 });

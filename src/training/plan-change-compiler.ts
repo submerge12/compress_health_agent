@@ -1,5 +1,35 @@
 type PlanDayItem = Record<string, unknown> & { exerciseSlug: string };
 
+export interface PlanExerciseProfile {
+  nameZh?: string;
+  movementPattern?: string;
+  trainingPurpose?: string;
+  primaryMuscles?: string[];
+  stabilityDemand?: string;
+  equipment?: string | null;
+  rangeOfMotion?: string;
+  contraindicationTags?: string[];
+}
+
+export interface CueReferenceProfile {
+  valid: boolean;
+  reason?: string;
+  exerciseSlug?: string | null;
+  movementPattern?: string | null;
+  bodyPart?: string | null;
+  problemTags?: string[];
+}
+
+export interface PlanCompileContext {
+  exerciseCatalog?: ReadonlyMap<string, PlanExerciseProfile>;
+  blockedExerciseSlugs?: ReadonlySet<string>;
+  blockedMovementPatterns?: ReadonlySet<string>;
+  unavailableEquipment?: ReadonlySet<string>;
+  activeJointConstraints?: ReadonlySet<string>;
+  cueReferences?: ReadonlyMap<string, CueReferenceProfile>;
+  reflectionIssueTargets?: ReadonlySet<string>;
+}
+
 export type PlanChange =
   | { kind: "reorder_exercises"; dayRole: string; order: string[] }
   | { kind: "replace_exercise"; dayRole: string; exerciseSlug: string; replacementExerciseSlug: string }
@@ -41,6 +71,13 @@ export interface PlanChangeDiff {
   target: { dayRole?: string; exerciseSlug?: string };
   before: unknown;
   after: unknown;
+  assessment?: {
+    preserved: string[];
+    lost: string[];
+    volume: { beforeSets: number | null; afterSets: number | null; changed: boolean };
+    allowedBecause: string[];
+    nextValidation: string[];
+  };
 }
 
 export interface PlanVersionDiff {
@@ -73,9 +110,7 @@ const MAX_LIST_REFS = 20;
 export function compilePlanChanges(
   parentContent: Record<string, unknown>,
   rawChanges: readonly unknown[],
-  options: {
-    exerciseCatalog?: ReadonlyMap<string, { nameZh?: string; movementPattern?: string }>;
-  } = {},
+  options: PlanCompileContext = {},
 ): {
   content: CompiledPlanContent;
   changes: PlanChange[];
@@ -125,15 +160,13 @@ export function compilePlanChanges(
         if (list.some((candidate) => candidate.exerciseSlug === change.replacementExerciseSlug)) {
           fail(`exercise ${change.replacementExerciseSlug} already exists on day ${change.dayRole}`);
         }
-        const catalog = requireCatalogExercise(change.replacementExerciseSlug, options.exerciseCatalog, fail);
-        const replacement: PlanDayItem = {
-          ...item,
-          exerciseSlug: change.replacementExerciseSlug,
-          ...(catalog?.nameZh ? { nameZh: catalog.nameZh } : {}),
-          ...(catalog?.movementPattern ? { movementPattern: catalog.movementPattern } : {}),
-        };
+        if (!options.exerciseCatalog) fail("exercise catalog is required for replacement validation");
+        const originalProfile = requireCatalogExercise(change.exerciseSlug, options.exerciseCatalog, fail)!;
+        const catalog = requireCatalogExercise(change.replacementExerciseSlug, options.exerciseCatalog, fail)!;
+        const assessment = assessReplacement(item, originalProfile, catalog, change, options, fail);
+        const replacement: PlanDayItem = replacementPrescription(item, change.replacementExerciseSlug, catalog);
         list[itemIndex] = replacement;
-        diffs.push(diff(change, clone(item), clone(replacement)));
+        diffs.push(diff(change, clone(item), clone(replacement), assessment));
         break;
       }
       case "update_sets": {
@@ -181,6 +214,7 @@ export function compilePlanChanges(
       case "update_cue_refs": {
         const cueRefs = validateRefs(change.cueRefs, "cueRefs", fail);
         const { item } = requireTarget(days, change, fail);
+        validateCueReferences(cueRefs, item, options, fail);
         const before = { cueRefs: [...asStringArray(item["cueRefs"])] };
         const after = { cueRefs };
         if (same(before, after)) fail("cue refs change has no effect");
@@ -190,6 +224,7 @@ export function compilePlanChanges(
       }
       case "update_cycle_pattern": {
         const after = normalizeCycle(change.cyclePattern, Object.keys(days), index);
+        validateCycleStructure(after, days, options.exerciseCatalog, fail);
         const before = [...cyclePattern];
         if (same(before, after)) fail("cycle pattern change has no effect");
         cyclePattern = after;
@@ -231,7 +266,9 @@ export function compilePlanChanges(
           ...(change.rirLow !== undefined ? { rirLow: change.rirLow } : {}),
           ...(change.rirHigh !== undefined ? { rirHigh: change.rirHigh } : {}),
           ...(alternatives ? { alternates: alternatives } : {}),
-          ...(change.cueRefs ? { cueRefs: validateRefs(change.cueRefs, "cueRefs", fail) } : {}),
+          ...(change.cueRefs ? {
+            cueRefs: validateAndReturnCueRefs(change.cueRefs, createdCueTarget(change.exerciseSlug, catalog), options, fail),
+          } : {}),
           ...(change.note ? { note: change.note } : {}),
         };
         list.push(created);
@@ -416,7 +453,12 @@ function buildDiff(
   };
 }
 
-function diff(change: PlanChange, before: unknown, after: unknown): PlanChangeDiff {
+function diff(
+  change: PlanChange,
+  before: unknown,
+  after: unknown,
+  assessment?: PlanChangeDiff["assessment"],
+): PlanChangeDiff {
   return {
     kind: change.kind,
     target: {
@@ -425,7 +467,233 @@ function diff(change: PlanChange, before: unknown, after: unknown): PlanChangeDi
     },
     before,
     after,
+    ...(assessment ? { assessment } : {}),
   };
+}
+
+const PRESCRIPTION_KEYS = [
+  "order",
+  "sets",
+  "repRangeLow",
+  "repRangeHigh",
+  "rirLow",
+  "rirHigh",
+  "tempo",
+  "restSeconds",
+] as const;
+
+function replacementPrescription(
+  source: PlanDayItem,
+  replacementExerciseSlug: string,
+  profile: PlanExerciseProfile,
+): PlanDayItem {
+  const prescription: Record<string, unknown> = {};
+  for (const key of PRESCRIPTION_KEYS) {
+    if (source[key] !== undefined) prescription[key] = clone(source[key]);
+  }
+  return {
+    ...prescription,
+    exerciseSlug: replacementExerciseSlug,
+    ...(profile.nameZh ? { nameZh: profile.nameZh } : {}),
+    ...(profile.movementPattern ? { movementPattern: profile.movementPattern } : {}),
+    ...(profile.trainingPurpose ? { trainingPurpose: profile.trainingPurpose } : {}),
+    ...(profile.primaryMuscles ? { primaryMuscles: [...profile.primaryMuscles] } : {}),
+    ...(profile.equipment !== undefined ? { equipment: profile.equipment } : {}),
+    ...(profile.stabilityDemand ? { stabilityDemand: profile.stabilityDemand } : {}),
+    ...(profile.rangeOfMotion ? { rangeOfMotion: profile.rangeOfMotion } : {}),
+  } as PlanDayItem;
+}
+
+function assessReplacement(
+  source: PlanDayItem,
+  original: PlanExerciseProfile,
+  replacement: PlanExerciseProfile,
+  change: Extract<PlanChange, { kind: "replace_exercise" }>,
+  context: PlanCompileContext,
+  fail: (message: string) => never,
+): NonNullable<PlanChangeDiff["assessment"]> {
+  const required = (profile: PlanExerciseProfile, label: string) => {
+    if (!profile.trainingPurpose) fail(`${label} exercise has no training purpose`);
+    if (!profile.movementPattern) fail(`${label} exercise has no movement pattern`);
+    if (!profile.primaryMuscles || profile.primaryMuscles.length === 0) fail(`${label} exercise has no primary muscles`);
+    if (!profile.stabilityDemand) fail(`${label} exercise has no stability demand`);
+    if (profile.equipment === undefined) fail(`${label} exercise has no equipment profile`);
+    if (!profile.rangeOfMotion) fail(`${label} exercise has no range-of-motion profile`);
+  };
+  required(original, "original");
+  required(replacement, "replacement");
+
+  if (original.trainingPurpose !== replacement.trainingPurpose) {
+    fail(`training purpose mismatch: ${original.trainingPurpose} -> ${replacement.trainingPurpose}`);
+  }
+  const originalMuscles = new Set(original.primaryMuscles);
+  const sharedMuscles = replacement.primaryMuscles!.filter((muscle) => originalMuscles.has(muscle));
+  if (sharedMuscles.length === 0) {
+    fail(`primary muscle mismatch: ${original.primaryMuscles!.join("|")} -> ${replacement.primaryMuscles!.join("|")}`);
+  }
+  const originalCoverage = sharedMuscles.length / original.primaryMuscles!.length;
+  if (original.movementPattern !== replacement.movementPattern && originalCoverage < 0.5) {
+    fail(`movement pattern mismatch loses primary-muscle purpose: ${original.movementPattern} -> ${replacement.movementPattern}`);
+  }
+
+  if (context.blockedExerciseSlugs?.has(change.replacementExerciseSlug)) {
+    fail(`replacement exercise ${change.replacementExerciseSlug} is blocked by an active pain constraint`);
+  }
+  if (context.blockedMovementPatterns?.has(replacement.movementPattern!)) {
+    fail(`replacement movement pattern ${replacement.movementPattern} is blocked by an active pain constraint`);
+  }
+  const equipment = replacement.equipment?.trim().toLowerCase();
+  if (equipment && context.unavailableEquipment?.has(equipment)) {
+    fail(`replacement equipment ${replacement.equipment} is unavailable`);
+  }
+  const jointConflicts = (replacement.contraindicationTags ?? [])
+    .filter((tag) => context.activeJointConstraints?.has(tag));
+  if (jointConflicts.length > 0) {
+    fail(`replacement conflicts with active joint constraints: ${jointConflicts.join(", ")}`);
+  }
+
+  const stabilityRank = new Map([["low", 0], ["medium", 1], ["high", 2]]);
+  const originalStability = stabilityRank.get(original.stabilityDemand!);
+  const replacementStability = stabilityRank.get(replacement.stabilityDemand!);
+  if (originalStability === undefined || replacementStability === undefined) {
+    fail("stability demand must be low, medium, or high");
+  }
+  if (replacementStability > originalStability + 1) {
+    fail(`stability demand increases too far: ${original.stabilityDemand} -> ${replacement.stabilityDemand}`);
+  }
+
+  const romRank = new Map([["reduced", 0], ["full", 1], ["extended", 2]]);
+  const originalRom = romRank.get(original.rangeOfMotion!);
+  const replacementRom = romRank.get(replacement.rangeOfMotion!);
+  if (originalRom === undefined || replacementRom === undefined) {
+    fail("range of motion must be reduced, full, or extended");
+  }
+  if (replacementRom > originalRom) {
+    fail(`range of motion increases without validation: ${original.rangeOfMotion} -> ${replacement.rangeOfMotion}`);
+  }
+
+  const beforeSets = finiteNumberOrNull(source["sets"]);
+  const afterSets = beforeSets;
+  const preserved = [
+    `training purpose: ${original.trainingPurpose}`,
+    `primary muscles: ${sharedMuscles.join(", ")}`,
+    ...(original.movementPattern === replacement.movementPattern
+      ? [`movement pattern: ${original.movementPattern}`] : []),
+  ];
+  const lost = [
+    ...(original.movementPattern !== replacement.movementPattern
+      ? [`movement pattern changes: ${original.movementPattern} -> ${replacement.movementPattern}`] : []),
+    ...original.primaryMuscles!.filter((muscle) => !replacement.primaryMuscles!.includes(muscle))
+      .map((muscle) => `primary muscle emphasis: ${muscle}`),
+    ...(original.equipment !== replacement.equipment
+      ? [`equipment familiarity: ${String(original.equipment)} -> ${String(replacement.equipment)}`] : []),
+    ...(original.stabilityDemand !== replacement.stabilityDemand
+      ? [`stability demand: ${original.stabilityDemand} -> ${replacement.stabilityDemand}`] : []),
+    ...(original.rangeOfMotion !== replacement.rangeOfMotion
+      ? [`range of motion: ${original.rangeOfMotion} -> ${replacement.rangeOfMotion}`] : []),
+  ];
+  return {
+    preserved,
+    lost,
+    volume: { beforeSets, afterSets, changed: beforeSets !== afterSets },
+    allowedBecause: [
+      "training purpose matches",
+      "primary-muscle overlap is sufficient",
+      "active pain, joint, equipment, stability, and range-of-motion checks passed",
+    ],
+    nextValidation: [
+      `validate target-muscle feel and pain response for ${change.replacementExerciseSlug}`,
+      "confirm prescribed volume and technique quality before retaining the replacement",
+    ],
+  };
+}
+
+function finiteNumberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function validateAndReturnCueRefs(
+  refs: string[],
+  target: PlanDayItem,
+  context: PlanCompileContext,
+  fail: (message: string) => never,
+): string[] {
+  const validated = validateRefs(refs, "cueRefs", fail);
+  validateCueReferences(validated, target, context, fail);
+  return validated;
+}
+
+function createdCueTarget(exerciseSlug: string, profile: PlanExerciseProfile | undefined): PlanDayItem {
+  return {
+    exerciseSlug,
+    ...(profile?.movementPattern ? { movementPattern: profile.movementPattern } : {}),
+  };
+}
+
+function validateCueReferences(
+  refs: string[],
+  target: PlanDayItem,
+  context: PlanCompileContext,
+  fail: (message: string) => never,
+): void {
+  if (!context.cueReferences) fail("validated media segment catalog is required for cue refs");
+  const targetProfile = context.exerciseCatalog?.get(target.exerciseSlug);
+  const movementPattern = targetProfile?.movementPattern
+    ?? (typeof target["movementPattern"] === "string" ? target["movementPattern"] : undefined);
+  const primaryMuscles = new Set(targetProfile?.primaryMuscles ?? asStringArray(target["primaryMuscles"]));
+  for (const ref of refs) {
+    const segment = context.cueReferences.get(ref);
+    if (!segment) fail(`cue reference ${ref} does not exist`);
+    if (!segment.valid) fail(`cue reference ${ref} is invalid: ${segment.reason ?? "media integrity check failed"}`);
+    const issueMatch = [
+      segment.exerciseSlug,
+      segment.movementPattern,
+      segment.bodyPart,
+      ...(segment.problemTags ?? []),
+    ].some((value) => typeof value === "string" && context.reflectionIssueTargets?.has(value));
+    const matches = segment.exerciseSlug === target.exerciseSlug
+      || (movementPattern !== undefined && segment.movementPattern === movementPattern)
+      || (segment.bodyPart !== null && segment.bodyPart !== undefined && primaryMuscles.has(segment.bodyPart))
+      || issueMatch;
+    if (!matches) fail(`cue reference ${ref} does not match the target exercise, body part, movement, or reflection problem`);
+  }
+}
+
+function validateCycleStructure(
+  cycle: string[],
+  days: Record<string, PlanDayItem[]>,
+  catalog: ReadonlyMap<string, PlanExerciseProfile> | undefined,
+  fail: (message: string) => never,
+): void {
+  let run = 0;
+  let maximumRun = 0;
+  for (let index = 0; index < cycle.length * 2; index += 1) {
+    const role = cycle[index % cycle.length]!;
+    run = role === "REST" ? 0 : Math.min(run + 1, cycle.length + 1);
+    maximumRun = Math.max(maximumRun, run);
+  }
+  if (maximumRun > 3) fail("cyclePattern cannot exceed three consecutive training days, including the repeat boundary");
+
+  const musclesByRole = new Map<string, Set<string>>();
+  for (const [role, items] of Object.entries(days)) {
+    const muscles = new Set<string>();
+    for (const item of items) {
+      const profile = catalog?.get(item.exerciseSlug);
+      for (const muscle of profile?.primaryMuscles ?? asStringArray(item["primaryMuscles"])) muscles.add(muscle);
+    }
+    musclesByRole.set(role, muscles);
+  }
+  for (let index = 0; index < cycle.length; index += 1) {
+    const current = cycle[index]!;
+    const next = cycle[(index + 1) % cycle.length]!;
+    if (current === "REST" || next === "REST") continue;
+    if (current === next) fail(`cyclePattern repeats body-part day ${current} on consecutive positions`);
+    const currentMuscles = musclesByRole.get(current) ?? new Set<string>();
+    const overlap = [...(musclesByRole.get(next) ?? [])].filter((muscle) => currentMuscles.has(muscle));
+    if (overlap.length > 0) {
+      fail(`cyclePattern trains the same primary muscles on consecutive positions: ${overlap.join(", ")}`);
+    }
+  }
 }
 
 function requireTarget(

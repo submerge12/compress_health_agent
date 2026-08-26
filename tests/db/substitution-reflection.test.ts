@@ -16,7 +16,11 @@ import * as schema from "../../src/db/schema.js";
 import { initToolContext } from "../../src/tools/context.js";
 import { createTrainingService } from "../../src/training/training-service.js";
 import { createSubstitutionEngine } from "../../src/training/substitution-engine.js";
-import { createReflectionEngine } from "../../src/training/reflection-engine.js";
+import {
+  createReflectionEngine,
+  PlanActivationBlockedError,
+  ProposalConflictError,
+} from "../../src/training/reflection-engine.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgres://compass:compass@localhost:5433/compass_health";
@@ -54,6 +58,7 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
       SELECT e.id FROM compass_health.training_session_exercises e
       JOIN compass_health.training_sessions s ON s.id = e.session_id WHERE s.user_id = ${userId}::uuid)`);
     await db.delete(schema.userDecisionEvents).where(eq(schema.userDecisionEvents.userId, userId));
+    await db.delete(schema.healthConstraints).where(eq(schema.healthConstraints.userId, userId));
     await db.delete(schema.trainingSessionExercises).where(sql`session_id IN (
       SELECT id FROM compass_health.training_sessions WHERE user_id = ${userId}::uuid)`);
     await db.delete(schema.trainingReflections).where(sql`session_id IN (
@@ -161,7 +166,7 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
       nextValidationQuestions: ["下次划船时中背是否有更强收缩？"],
     });
 
-    const proposal = await reflection.proposeChildVersion({
+    const proposalInput = {
       userId: ctx.userId,
       reflectionId,
       changes: [{
@@ -172,17 +177,18 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
       reason: "根据本次反思调整动作顺序",
       previousVersionProblems: ["单手划船无感"],
       validationQuestions: ["顺序调整后垂直拉表现是否下降？"],
-    });
+    };
+    const proposal = await reflection.proposeChildVersion(proposalInput);
     expect(proposal.childVersionId).not.toBe(proposal.parentVersionId);
 
     // Re-propose is idempotent — same child returned.
-    const again = await reflection.proposeChildVersion({
-      userId: ctx.userId,
-      reflectionId,
-      changes: [],
-      reason: "duplicate call",
-    });
+    const again = await reflection.proposeChildVersion(proposalInput);
     expect(again.childVersionId).toBe(proposal.childVersionId);
+
+    await expect(reflection.proposeChildVersion({
+      ...proposalInput,
+      reason: "同一反思下的不同提案不得静默复用",
+    })).rejects.toBeInstanceOf(ProposalConflictError);
 
     // Parent content untouched while child is draft.
     const [parentBefore] = await db.select().from(schema.planVersions)
@@ -217,5 +223,178 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
     const [reflectionRow] = await db.select().from(schema.trainingReflections)
       .where(eq(schema.trainingReflections.id, reflectionId));
     expect(reflectionRow?.userAcceptedAt).not.toBeNull();
+  });
+
+  it("serializes concurrent proposals and assigns distinct user-scoped version numbers", async () => {
+    const sessions = await Promise.all([startBWithProgress(), startBWithProgress()]);
+    await Promise.all(sessions.map(({ session }) => training.finishSession(ctx.userId, session.id, "interrupted")));
+    const reflections = await Promise.all(sessions.map(({ session }, index) => reflection.record({
+      userId: ctx.userId,
+      sessionId: session.id,
+      nextValidationQuestions: [`concurrent validation ${index + 1}`],
+    })));
+
+    const [left, right] = await Promise.all([
+      reflection.proposeChildVersion({
+        userId: ctx.userId,
+        reflectionId: reflections[0]!.reflectionId,
+        changes: [{ kind: "update_sets", dayRole: "B", exerciseSlug: "single_machine_row", sets: 4 }],
+        reason: "concurrent proposal left",
+      }),
+      reflection.proposeChildVersion({
+        userId: ctx.userId,
+        reflectionId: reflections[1]!.reflectionId,
+        changes: [{ kind: "update_sets", dayRole: "B", exerciseSlug: "chest_supported_row", sets: 4 }],
+        reason: "concurrent proposal right",
+      }),
+    ]);
+
+    expect(left.childVersionId).not.toBe(right.childVersionId);
+    expect(new Set([left.versionNumber, right.versionNumber]).size).toBe(2);
+  });
+
+  it("rejects a replacement that intersects a current blocking pain constraint", async () => {
+    const replacementSlug = `plan_governance_press_${process.pid}`;
+    await db.insert(schema.exerciseDefinitions).values({
+      slug: replacementSlug,
+      nameZh: "计划治理测试推举",
+      movementPattern: "horizontal_push",
+      trainingPurpose: "hypertrophy",
+      primaryMuscles: ["chest"],
+      secondaryMuscles: ["triceps"],
+      equipment: "machine",
+      stabilityDemand: "low",
+      rangeOfMotion: "full",
+    }).onConflictDoNothing();
+    const [constraint] = await db.insert(schema.healthConstraints).values({
+      userId: ctx.userId,
+      constraintType: "pain",
+      severity: "block",
+      targetJson: { movementPattern: "horizontal_push", bodyPart: "chest" },
+      reason: "active chest pain test constraint",
+      activeFrom: today,
+    }).returning();
+    try {
+      const { session } = await startBWithProgress();
+      await training.finishSession(ctx.userId, session.id, "interrupted");
+      const { reflectionId } = await reflection.record({ userId: ctx.userId, sessionId: session.id });
+      await expect(reflection.proposeChildVersion({
+        userId: ctx.userId,
+        reflectionId,
+        changes: [{
+          kind: "replace_exercise",
+          dayRole: "A",
+          exerciseSlug: "barbell_bench_press",
+          replacementExerciseSlug: replacementSlug,
+        }],
+        reason: "must not evade current pain constraint",
+      })).rejects.toThrow(/blocked by an active pain constraint/i);
+    } finally {
+      if (constraint) await db.delete(schema.healthConstraints).where(eq(schema.healthConstraints.id, constraint.id));
+      await db.delete(schema.exerciseDefinitions).where(eq(schema.exerciseDefinitions.slug, replacementSlug));
+    }
+  });
+
+  it("rejects an unconfirmed or unusable media segment as a cue reference", async () => {
+    const [asset] = await db.insert(schema.mediaAssets).values({
+      kind: "video",
+      trainer: "governance-test",
+      sourceRole: "technique_details",
+      title: "governance cue validation",
+      localPath: `governance-${process.pid}.mp4`,
+      sha256: `${String(process.pid).padStart(64, "0")}`.slice(-64),
+      durationMs: 60_000,
+      probeStatus: "ok",
+      fullDecodeStatus: "ok",
+      usableVideoUntilMs: 60_000,
+    }).returning();
+    if (!asset) throw new Error("media asset insert failed");
+    const [pairing] = await db.insert(schema.mediaPairings).values({
+      videoAssetId: asset.id,
+      matchMethod: "manifest",
+      completeness: "complete",
+      subtitleEndMs: 60_000,
+      usableUntilMs: 60_000,
+    }).returning();
+    if (!pairing) throw new Error("media pairing insert failed");
+    const [segment] = await db.insert(schema.videoSegments).values({
+      pairingId: pairing.id,
+      startMs: 1_000,
+      endMs: 10_000,
+      trainer: "governance-test",
+      sourceRole: "technique_details",
+      title: "draft bench cue",
+      bodyPart: "chest",
+      movementPattern: "horizontal_push",
+      exerciseSlug: "barbell_bench_press",
+      category: "correction",
+      reviewStatus: "draft",
+    }).returning();
+    if (!segment) throw new Error("media segment insert failed");
+    try {
+      const { session } = await startBWithProgress();
+      await training.finishSession(ctx.userId, session.id, "interrupted");
+      const { reflectionId } = await reflection.record({ userId: ctx.userId, sessionId: session.id });
+      await expect(reflection.proposeChildVersion({
+        userId: ctx.userId,
+        reflectionId,
+        changes: [{
+          kind: "update_cue_refs",
+          dayRole: "A",
+          exerciseSlug: "barbell_bench_press",
+          cueRefs: [segment.id],
+        }],
+        reason: "draft media cannot enter a durable plan",
+      })).rejects.toThrow(/not confirmed/i);
+      await db.update(schema.videoSegments)
+        .set({ reviewStatus: "confirmed", endMs: 70_000 })
+        .where(eq(schema.videoSegments.id, segment.id));
+      await expect(reflection.proposeChildVersion({
+        userId: ctx.userId,
+        reflectionId,
+        changes: [{
+          kind: "update_cue_refs",
+          dayRole: "A",
+          exerciseSlug: "barbell_bench_press",
+          cueRefs: [segment.id],
+        }],
+        reason: "draft media cannot enter a durable plan",
+      })).rejects.toThrow(/outside the verified media window/i);
+    } finally {
+      await db.delete(schema.videoSegments).where(eq(schema.videoSegments.id, segment.id));
+      await db.delete(schema.mediaPairings).where(eq(schema.mediaPairings.id, pairing.id));
+      await db.delete(schema.mediaAssets).where(eq(schema.mediaAssets.id, asset.id));
+    }
+  });
+
+  it("allows a high-frequency draft but blocks activation without two recovery-safe cycles", async () => {
+    const { session } = await startBWithProgress();
+    await training.finishSession(ctx.userId, session.id, "interrupted");
+    const { reflectionId } = await reflection.record({
+      userId: ctx.userId,
+      sessionId: session.id,
+      nextValidationQuestions: ["高频周期后睡眠与疲劳是否保持稳定？"],
+    });
+    const proposal = await reflection.proposeChildVersion({
+      userId: ctx.userId,
+      reflectionId,
+      changes: [{ kind: "update_cycle_pattern", cyclePattern: ["A", "B", "C", "REST"] }],
+      reason: "high frequency requires recovery evidence",
+    });
+    const [draft] = await db.select().from(schema.planVersions)
+      .where(eq(schema.planVersions.id, proposal.childVersionId));
+    expect(draft?.status).toBe("draft");
+    expect(draft?.contentJson).toMatchObject({
+      governance: {
+        reviewStatus: "activation_blocked",
+        highFrequencyCycle: true,
+        recoveryEvidence: {
+          completedCycles: expect.any(Number),
+          sufficientForHighFrequency: false,
+        },
+      },
+    });
+    await expect(reflection.activateVersion(ctx.userId, proposal.childVersionId, today))
+      .rejects.toBeInstanceOf(PlanActivationBlockedError);
   });
 });

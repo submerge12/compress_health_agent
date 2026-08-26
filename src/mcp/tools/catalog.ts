@@ -49,9 +49,9 @@ import {
 } from "../../training/substitution-engine.js";
 import {
   createReflectionEngine,
-  diffPlanContents,
+  PlanActivationBlockedError,
+  ProposalConflictError,
   type PlanActivationResult,
-  type PlanVersionDiff,
 } from "../../training/reflection-engine.js";
 import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
@@ -2217,6 +2217,8 @@ export function createHealthToolCatalog(
           reflectionId: { type: "string" },
           changes: { type: "array", minItems: 1, items: PLAN_CHANGE_SCHEMA },
           reason: { type: "string" },
+          previousVersionProblems: { type: "array", items: { type: "string" }, maxItems: 20 },
+          validationQuestions: { type: "array", items: { type: "string" }, maxItems: 20 },
           idempotencyKey: { type: "string" },
         },
         required: ["runHandle", "reflectionId", "changes", "reason", "idempotencyKey"],
@@ -2235,6 +2237,10 @@ export function createHealthToolCatalog(
               reflectionId,
               changes: changes as Array<Record<string, unknown>>,
               reason: str(inv.args, "reason"),
+              ...(Array.isArray(inv.args["previousVersionProblems"])
+                ? { previousVersionProblems: inv.args["previousVersionProblems"] as string[] } : {}),
+              ...(Array.isArray(inv.args["validationQuestions"])
+                ? { validationQuestions: inv.args["validationQuestions"] as string[] } : {}),
             });
             const [readBack] = await tx.select().from(schema.planVersions)
               .where(and(
@@ -2280,54 +2286,32 @@ export function createHealthToolCatalog(
         await requireRun(inv);
         const planVersionId = str(inv.args, "planVersionId");
         if (inv.requestState === undefined) {
-          const [version] = await db.select().from(schema.planVersions)
-            .where(and(eq(schema.planVersions.id, planVersionId), eq(schema.planVersions.userId, inv.principalUserId)))
-            .limit(1);
-          if (!version) return toolError("not_found", "plan version not found");
-          if (version.status !== "draft" && version.status !== "superseded") {
-            return toolError("invalid_session_state", `version is ${version.status}, only a direct draft child or superseded parent can activate`);
+          const preview = await createReflectionEngine(db).previewActivation(
+            inv.principalUserId,
+            planVersionId,
+            await today(inv.principalUserId),
+          );
+          if (!preview.governanceReview.allowed) {
+            return toolError("health_safety_block", preview.governanceReview.reasons.join("; "));
           }
-          const [assignment] = await db.select().from(schema.activePlanAssignments)
-            .where(and(
-              eq(schema.activePlanAssignments.userId, inv.principalUserId),
-              eq(schema.activePlanAssignments.scope, version.scope),
-            )).limit(1);
-          const [current] = assignment
-            ? await db.select().from(schema.planVersions)
-                .where(eq(schema.planVersions.id, assignment.planVersionId)).limit(1)
-            : [];
-          if (!current) return toolError("invalid_session_state", "active plan assignment is missing");
-          const direction = version.status === "draft" && version.parentVersionId === current.id
-            ? "forward"
-            : version.status === "superseded" && current.parentVersionId === version.id
-              ? "rollback"
-              : undefined;
-          if (!direction) {
-            return toolError(
-              "invalid_session_state",
-              "target must be the active version's direct draft child or direct superseded parent",
-            );
-          }
-          const targetContent = version.contentJson as Record<string, unknown>;
-          const storedChanges = Array.isArray(targetContent["changeSet"])
-            ? targetContent["changeSet"] as Array<Record<string, unknown>>
-            : [];
-          const storedDiff = targetContent["planDiff"] as PlanVersionDiff | undefined;
-          const diff = direction === "forward" && storedDiff?.changes.length
-            ? storedDiff
-            : diffPlanContents(
-                current.contentJson,
-                version.contentJson,
-                direction === "forward"
-                  ? storedChanges
-                  : [{ kind: "rollback", targetVersionId: version.id }],
-              );
           return await makeConfirmation(
             "health_activate_plan_version", planVersionId, inv,
-            `训练计划切换 ${direction === "forward" ? "forward" : "rollback"}: `
-              + `v${current.versionNumber} → v${version.versionNumber}。完整变更：${JSON.stringify(diff)}。确认激活？`,
+            `训练计划切换 ${preview.direction}: `
+              + `v${preview.currentVersionNumber} → v${preview.targetVersionNumber}。`
+              + `确定性审查：${JSON.stringify({ reviewer: preview.governanceReview.reviewedBy, reasons: preview.governanceReview.reasons })}。`
+              + `完整变更：${JSON.stringify(preview.governanceReview.diff)}。`
+              + `回滚目标：${preview.governanceReview.rollbackTargetVersionId}。`
+              + `验证问题：${JSON.stringify(preview.governanceReview.validationQuestions)}。确认激活？`,
             ["确认激活", "暂不激活"],
-            { planVersionId, currentVersionId: current.id, direction, diff },
+            {
+              planVersionId,
+              currentVersionId: preview.currentVersionId,
+              direction: preview.direction,
+              deterministicReview: preview.governanceReview,
+              diff: preview.governanceReview.diff,
+              rollbackTargetVersionId: preview.governanceReview.rollbackTargetVersionId,
+              validationQuestions: preview.governanceReview.validationQuestions,
+            },
           );
         }
         const result = await requestStates.consume(
@@ -2494,6 +2478,9 @@ export function createHealthToolCatalog(
           return toolError("run_handle_invalid", message);
         }
         if (error instanceof TrainingSafetyBlockError) {
+          return toolError(error.code, error.message);
+        }
+        if (error instanceof PlanActivationBlockedError || error instanceof ProposalConflictError) {
           return toolError(error.code, error.message);
         }
         if (error instanceof RangeError) {
