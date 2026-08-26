@@ -21,7 +21,7 @@ import postgres from "postgres";
 const MIGRATIONS_DIR = join(dirname(fileURLToPath(import.meta.url)), "../../drizzle");
 const MIGRATION_TABLE = "compass_health.schema_migrations";
 /** Bump when a new migration lands; the serve.ts gate enforces this. */
-export const MIN_SCHEMA_VERSION = 20;
+export const MIN_SCHEMA_VERSION = 22;
 
 export async function migrate(databaseUrl: string): Promise<{ applied: string[]; skipped: string[] }> {
   const sql = postgres(databaseUrl, { max: 1, prepare: false, onnotice: () => undefined });
@@ -120,6 +120,8 @@ export async function assertSchemaReady(databaseUrl: string): Promise<void> {
       ["mcp_pending_input_requests_state_hash_uidx", "index"],
       ["mcp_write_receipts_idempotency_uidx", "index"],
       ["agent_run_steps_run_sequence_uidx", "index"],
+      ["agent_actors_binding_key_uidx", "index"],
+      ["agent_run_steps.failure_stage", "column"],
       ["media_assets.source_role", "column"],
       ["media_assets.content_type", "column"],
     ];

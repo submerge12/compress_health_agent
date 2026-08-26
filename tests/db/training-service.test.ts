@@ -162,6 +162,91 @@ describe.skipIf(!isDbAvailable)("training domain invariants", () => {
       .rejects.toMatchObject({ code: "invalid_session_state" });
   });
 
+  it("J02 rejects invalid set telemetry before creating fact, outbox, or receipt", async () => {
+    const plan = await service.prepareSession(ctx.userId, today, "A");
+    const session = await service.startSession({
+      userId: ctx.userId,
+      sessionDate: today,
+      dayRole: "A",
+      planVersionId: plan.planVersionId ?? undefined,
+    });
+    const readBack = await service.readBackSession(ctx.userId, session.id);
+    const exercise = readBack.exercisesWithSets[0]!.exercise;
+    type RecordSetInput = Parameters<ReturnType<typeof createTrainingService>["recordSet"]>[0];
+    const base: RecordSetInput = {
+      userId: ctx.userId,
+      sessionId: session.id,
+      sessionExerciseId: exercise.id,
+      setNumber: 1,
+    };
+    const cases: Array<{ label: string; patch: Partial<RecordSetInput> }> = [
+      { label: "zero set number", patch: { setNumber: 0 } },
+      { label: "fractional set number", patch: { setNumber: 1.5 } },
+      { label: "negative reps", patch: { reps: -1 } },
+      { label: "fractional reps", patch: { reps: 8.5 } },
+      { label: "negative load", patch: { loadValue: -0.5 } },
+      { label: "infinite load", patch: { loadValue: Number.POSITIVE_INFINITY } },
+      { label: "negative RIR", patch: { rir: -1 } },
+      { label: "fractional RIR", patch: { rir: 1.5 } },
+      { label: "RIR over ten", patch: { rir: 11 } },
+      { label: "muscle feel below range", patch: { targetMuscleFeel: 0 } },
+      { label: "fractional muscle feel", patch: { targetMuscleFeel: 2.5 } },
+      {
+        label: "too many pain entries",
+        patch: {
+          pain: Array.from({ length: 9 }, (_, index) => ({
+            bodyPart: `joint-${index}`,
+            severity: "mild" as const,
+          })),
+        },
+      },
+      {
+        label: "pain body part too long",
+        patch: { pain: [{ bodyPart: "x".repeat(101), severity: "mild" }] },
+      },
+      {
+        label: "pain description too long",
+        patch: { pain: [{ bodyPart: "knee", severity: "mild", description: "x".repeat(501) }] },
+      },
+    ];
+    const [before] = await db.execute(sql`
+      SELECT
+        (SELECT count(*)::int FROM compass_health.training_set_logs set_log
+         JOIN compass_health.training_session_exercises exercise
+           ON exercise.id = set_log.session_exercise_id
+         WHERE exercise.session_id = ${session.id}::uuid) AS facts,
+        (SELECT count(*)::int FROM compass_health.outbox_events
+         WHERE user_id = ${ctx.userId}::uuid) AS outbox,
+        (SELECT count(*)::int FROM compass_health.mcp_write_receipts
+         WHERE user_id = ${ctx.userId}::uuid) AS receipts`);
+
+    for (const testCase of cases) {
+      await expect(service.recordSet({ ...base, ...testCase.patch }), testCase.label)
+        .rejects.toMatchObject({ code: "validation_failed" });
+    }
+    const dbChecks = await db.execute(sql`
+      SELECT conname FROM pg_constraint
+      WHERE conrelid = 'compass_health.training_set_logs'::regclass
+        AND conname = 'training_set_logs_set_number_check'`);
+    expect(dbChecks).toHaveLength(1);
+    await expect(db.insert(schema.trainingSetLogs).values({
+      sessionExerciseId: exercise.id,
+      setNumber: 0,
+    })).rejects.toThrow();
+
+    const [after] = await db.execute(sql`
+      SELECT
+        (SELECT count(*)::int FROM compass_health.training_set_logs set_log
+         JOIN compass_health.training_session_exercises exercise
+           ON exercise.id = set_log.session_exercise_id
+         WHERE exercise.session_id = ${session.id}::uuid) AS facts,
+        (SELECT count(*)::int FROM compass_health.outbox_events
+         WHERE user_id = ${ctx.userId}::uuid) AS outbox,
+        (SELECT count(*)::int FROM compass_health.mcp_write_receipts
+         WHERE user_id = ${ctx.userId}::uuid) AS receipts`);
+    expect(after).toEqual(before);
+  });
+
   it("J05 invariant: replacement inherits remaining sets — planned volume never stacks", () => {
     // Pure function of the budget rule that substitution-engine will apply;
     // asserted here as the contract M07's engine must satisfy.

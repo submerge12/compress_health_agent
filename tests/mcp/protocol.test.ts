@@ -78,16 +78,26 @@ describe.skipIf(!isDbAvailable)("MCP server core (P1)", () => {
     expect(client.getDiscoverResult()?.supportedVersions).toEqual(["2026-07-28"]);
   });
 
-  it("resources/list is deterministic and covers the P1 catalog", async () => {
+  it("separates directly readable resources from formal URI templates", async () => {
     const first = await client.listResources();
     const second = await client.listResources();
     const uris = first.resources.map((r) => String(r.uri));
     expect(uris).toContain("health://profile");
-    expect(uris).toContain("health://daily-state/{date}");
-    expect(uris).toContain("health://constraints/active/{date}");
+    expect(uris).toContain("health://daily-state/today");
+    expect(uris).toContain("health://constraints/active/today");
     expect(uris).toContain("health://plans/training/active");
+    expect(uris.every((uri) => !uri.includes("{"))).toBe(true);
     expect(uris).toEqual([...uris].sort());
     expect(uris).toEqual(second.resources.map((r) => String(r.uri)));
+
+    const templates = await client.listResourceTemplates();
+    const templateUris = templates.resourceTemplates.map((r) => r.uriTemplate);
+    expect(templateUris).toEqual([
+      "health://constraints/active/{date}",
+      "health://daily-state/{date}",
+      "health://diet/logs/{date}",
+      "health://training/sessions/{sessionId}",
+    ]);
   });
 
   it("resources/read returns profile + daily-state with cache hints", async () => {

@@ -4,11 +4,12 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as schema from "../../db/schema.js";
 import { hashArguments, type HealthTransaction } from "../input/request-state.js";
 import { redactArguments } from "../evidence/run-handles.js";
+import { resolveActor, type ActorProfileInput } from "../auth/actor-registry.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
 export class WriteCommandError extends Error {
-  constructor(readonly code: "run_handle_invalid" | "idempotency_conflict" | "write_contract_failed", message: string) {
+  constructor(readonly code: "run_handle_invalid" | "idempotency_conflict" | "actor_mismatch" | "write_contract_failed", message: string) {
     super(message);
   }
 }
@@ -24,6 +25,8 @@ export interface WriteMutation {
 export interface WriteCommandInput {
   userId: string;
   verifiedActor: string;
+  actorId?: string;
+  actorProfile?: ActorProfileInput;
   runHandle: string;
   toolName: string;
   scopeKey: string;
@@ -40,6 +43,8 @@ export interface WriteCommandResult {
 export interface BeginRunInput {
   userId: string;
   verifiedActor: string;
+  actorId?: string;
+  actorProfile?: ActorProfileInput;
   idempotencyKey: string;
   objective: string;
   inputChannel: string;
@@ -57,6 +62,7 @@ export function createWriteCommandService(db: Db) {
   async function beginRun(input: BeginRunInput): Promise<WriteCommandResult> {
     const argumentHash = hashArguments(input.arguments);
     return db.transaction(async (tx) => {
+      const actor = await resolveCommandActor(tx as unknown as Db, input);
       const [ownedUser] = await tx.select({ id: schema.users.id }).from(schema.users)
         .where(eq(schema.users.id, input.userId))
         .limit(1)
@@ -73,6 +79,19 @@ export function createWriteCommandService(db: Db) {
         if (existing.argumentHash !== argumentHash) {
           throw new WriteCommandError("idempotency_conflict", "begin-run key has different arguments");
         }
+        const [existingRun] = await tx.select({ actorId: schema.agentRuns.actorId })
+          .from(schema.agentRuns)
+          .where(and(
+            eq(schema.agentRuns.id, existing.runId),
+            eq(schema.agentRuns.userId, input.userId),
+          ))
+          .limit(1);
+        if (
+          existing.verifiedActor !== input.verifiedActor
+          || existingRun?.actorId !== actor.id
+        ) {
+          throw new WriteCommandError("actor_mismatch", "begin-run receipt belongs to another verified actor");
+        }
         return {
           response: { ...existing.responseJson, replayed: true },
           replayed: true,
@@ -83,6 +102,7 @@ export function createWriteCommandService(db: Db) {
       const journeyId = `journey_${crypto.randomUUID()}`;
       const [run] = await tx.insert(schema.agentRuns).values({
         userId: input.userId,
+        actorId: actor.id,
         journeyId,
         objective: input.objective.slice(0, 500),
         inputChannel: input.inputChannel,
@@ -90,14 +110,16 @@ export function createWriteCommandService(db: Db) {
         outcome: "running",
       }).returning();
       if (!run) throw new Error("agent run insert returned no row");
-      const [outbox] = await tx.insert(schema.outboxEvents).values({
+      const [audit] = await tx.insert(schema.interactionEvents).values({
         userId: input.userId,
-        aggregateType: "user_decision",
-        aggregateId: run.id,
-        eventType: "agent.run_started",
-        payloadJson: { journeyId },
-      }).returning({ id: schema.outboxEvents.id });
-      if (!outbox) throw new Error("run outbox insert returned no row");
+        requestId: run.id,
+        journeyId,
+        actor: `mcp:${input.verifiedActor}`,
+        stage: "agent_run",
+        stageCode: "started",
+        detailJson: { runId: run.id, inputChannel: input.inputChannel },
+      }).returning({ id: schema.interactionEvents.id });
+      if (!audit) throw new Error("run start audit insert returned no row");
       const [revision] = await tx.select({
         value: sql<number>`coalesce(max(${schema.dailyHealthStateProjection.revision}), 0)::int`,
       }).from(schema.dailyHealthStateProjection)
@@ -121,7 +143,7 @@ export function createWriteCommandService(db: Db) {
         idempotencyKey: input.idempotencyKey,
         argumentHash,
         factRefsJson: [{ type: "agent_run", id: run.id }],
-        outboxEventIdsJson: [outbox.id],
+        outboxEventIdsJson: [],
         responseJson: response,
       });
       const [storedReceipt] = await tx.select().from(schema.mcpWriteReceipts).where(and(
@@ -130,16 +152,26 @@ export function createWriteCommandService(db: Db) {
         eq(schema.mcpWriteReceipts.runId, run.id),
       )).limit(1);
       if (!storedReceipt) throw new WriteCommandError("write_contract_failed", "begin-run receipt read-back failed");
-      await tx.insert(schema.agentRunSteps).values({
-        runId: run.id,
-        sequence: 0,
-        stage: "tool_call",
-        mcpMethod: "tools/call",
-        mcpName: "health_begin_run",
-        status: "ok",
-        argumentsRedactedJson: redactArguments(input.arguments),
-        resultSummaryJson: { receiptId, outboxEventId: outbox.id },
-      });
+      await tx.insert(schema.agentRunSteps).values([
+        {
+          runId: run.id,
+          sequence: 0,
+          stage: "tool_attempt",
+          mcpMethod: "tools/call",
+          mcpName: "health_begin_run",
+          status: "ok",
+          argumentsRedactedJson: redactArguments(input.arguments),
+        },
+        {
+          runId: run.id,
+          sequence: 1,
+          stage: "tool_result",
+          mcpMethod: "tools/call",
+          mcpName: "health_begin_run",
+          status: "ok",
+          resultSummaryJson: { resultType: "complete", receiptId, auditEventId: audit.id },
+        },
+      ]);
       return { response: storedReceipt.responseJson, replayed: false, receiptId };
     });
   }
@@ -163,41 +195,48 @@ export function createWriteCommandService(db: Db) {
       throw new WriteCommandError("write_contract_failed", "idempotencyKey is required");
     }
     const argumentHash = hashArguments(input.arguments);
+    const actor = await resolveCommandActor(tx as unknown as Db, input);
     const [run] = await tx.select().from(schema.agentRuns)
-        .where(and(
-          eq(schema.agentRuns.id, input.runHandle),
-          eq(schema.agentRuns.userId, input.userId),
-        ))
-        .limit(1)
-        .for("update");
-      if (!run) {
-        throw new WriteCommandError("run_handle_invalid", "run is missing or foreign");
-      }
+      .where(and(
+        eq(schema.agentRuns.id, input.runHandle),
+        eq(schema.agentRuns.userId, input.userId),
+      ))
+      .limit(1)
+      .for("update");
+    if (!run) {
+      throw new WriteCommandError("run_handle_invalid", "run is missing or foreign");
+    }
+    if (run.actorId !== actor.id) {
+      throw new WriteCommandError("actor_mismatch", "run belongs to another verified actor");
+    }
 
-      const [existing] = await tx.select().from(schema.mcpWriteReceipts)
-        .where(and(
-          eq(schema.mcpWriteReceipts.userId, input.userId),
-          eq(schema.mcpWriteReceipts.toolName, input.toolName),
-          eq(schema.mcpWriteReceipts.scopeKey, input.scopeKey),
-          eq(schema.mcpWriteReceipts.idempotencyKey, input.idempotencyKey),
-        ))
-        .limit(1);
-      if (existing) {
-        if (existing.argumentHash !== argumentHash || existing.runId !== input.runHandle) {
-          throw new WriteCommandError(
-            "idempotency_conflict",
-            "idempotency key was already used for different arguments or run",
-          );
-        }
-        return {
-          response: { ...existing.responseJson, replayed: true },
-          replayed: true,
-          receiptId: existing.id,
-        };
+    const [existing] = await tx.select().from(schema.mcpWriteReceipts)
+      .where(and(
+        eq(schema.mcpWriteReceipts.userId, input.userId),
+        eq(schema.mcpWriteReceipts.toolName, input.toolName),
+        eq(schema.mcpWriteReceipts.scopeKey, input.scopeKey),
+        eq(schema.mcpWriteReceipts.idempotencyKey, input.idempotencyKey),
+      ))
+      .limit(1);
+    if (existing) {
+      if (existing.argumentHash !== argumentHash || existing.runId !== input.runHandle) {
+        throw new WriteCommandError(
+          "idempotency_conflict",
+          "idempotency key was already used for different arguments or run",
+        );
       }
-      if (run.outcome !== "running") {
-        throw new WriteCommandError("run_handle_invalid", "run is already closed");
+      if (existing.verifiedActor !== input.verifiedActor) {
+        throw new WriteCommandError("actor_mismatch", "receipt belongs to another verified actor");
       }
+      return {
+        response: { ...existing.responseJson, replayed: true },
+        replayed: true,
+        receiptId: existing.id,
+      };
+    }
+    if (run.outcome !== "running") {
+      throw new WriteCommandError("run_handle_invalid", "run is already closed");
+    }
 
       const mutation = await mutate(tx);
       const auditEventIds = mutation.auditEventIds ?? [];
@@ -258,7 +297,7 @@ export function createWriteCommandService(db: Db) {
       await tx.insert(schema.agentRunSteps).values({
         runId: input.runHandle,
         sequence: (sequenceRow?.max ?? -1) + 1,
-        stage: "tool_call",
+        stage: "tool_commit",
         mcpMethod: "tools/call",
         mcpName: input.toolName,
         status: "ok",
@@ -275,6 +314,20 @@ export function createWriteCommandService(db: Db) {
   }
 
   return { beginRun, execute, executeInTransaction };
+}
+
+async function resolveCommandActor(
+  db: Db,
+  input: { verifiedActor: string; actorId?: string; actorProfile?: ActorProfileInput },
+) {
+  const actor = await resolveActor(db, {
+    actor: input.verifiedActor,
+    ...(input.actorProfile ? { actorProfile: input.actorProfile } : {}),
+  });
+  if (input.actorId !== undefined && input.actorId !== actor.id) {
+    throw new WriteCommandError("actor_mismatch", "verified actor profile does not match actor id");
+  }
+  return actor;
 }
 
 export type WriteCommandService = ReturnType<typeof createWriteCommandService>;

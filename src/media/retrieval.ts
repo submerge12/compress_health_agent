@@ -16,6 +16,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
 import type { SrtCue } from "./importer.js";
+import type { MediaStreamUrlIssuer } from "./signed-stream-url.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -163,7 +164,9 @@ function effectiveUsableUntil(
   return minimumPositive(pairing.usableUntilMs, pairing.subtitleEndMs, assetLimit);
 }
 
-export function createMediaRetrieval(db: Db) {
+export function createMediaRetrieval(db: Db, options: {
+  issueStreamUrl?: MediaStreamUrlIssuer;
+} = {}) {
   /**
    * P0-7: ONE SQL statement — filters, text matching, ordering and limit all
    * happen in the database. The previous two-step (fetch N, then filter by
@@ -178,8 +181,10 @@ export function createMediaRetrieval(db: Db) {
     category: string;
     startMs: number;
     endMs: number;
-    /** Authenticated stream URL path; localPath is NEVER exposed (P0-7). */
+    /** Signed absolute URL in MCP mode; localPath is NEVER exposed. */
     streamUrl: string;
+    expiresAt: string | null;
+    contentType: string;
     completeness: string;
     usableUntilMs: number | null;
     snippet: string;
@@ -265,6 +270,7 @@ export function createMediaRetrieval(db: Db) {
       usableUntilMs: effectiveLimit,
       decodeErrorAtMs: schema.mediaAssets.decodeErrorAtMs,
       fullDecodeStatus: schema.mediaAssets.fullDecodeStatus,
+      contentType: schema.mediaAssets.contentType,
     })
       .from(schema.videoSegments)
       .innerJoin(schema.mediaPairings, eq(schema.videoSegments.pairingId, schema.mediaPairings.id))
@@ -280,7 +286,12 @@ export function createMediaRetrieval(db: Db) {
       )
       .limit(query.limit ?? 10);
 
-    return rows.map((r) => ({
+    return rows.map((r) => {
+      const stream = options.issueStreamUrl?.(r.id) ?? {
+        streamUrl: `/api/v1/media/segments/${r.id}/stream`,
+        expiresAt: null,
+      };
+      return {
       segmentId: r.id,
       title: r.title,
       trainer: r.trainer,
@@ -288,7 +299,9 @@ export function createMediaRetrieval(db: Db) {
       category: r.category,
       startMs: r.startMs,
       endMs: r.endMs,
-      streamUrl: `/api/v1/media/segments/${r.id}/stream`,
+      streamUrl: stream.streamUrl,
+      expiresAt: stream.expiresAt,
+      contentType: r.contentType,
       completeness: r.completeness,
       usableUntilMs: r.usableUntilMs,
       snippet: r.cuesText.slice(0, 400),
@@ -297,7 +310,8 @@ export function createMediaRetrieval(db: Db) {
       reviewStatus: r.reviewStatus,
       helpfulCount: r.helpfulCount,
       notHelpfulCount: r.notHelpfulCount,
-    }));
+      };
+    });
   }
 
   async function recordFeedback(userId: string, segmentId: string, helpful: boolean, note?: string): Promise<{ feedbackId: string }> {

@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { unlink, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 import postgres from "postgres";
@@ -13,6 +15,7 @@ const PROTOCOL_VERSION = "2026-07-28";
 const externalUserId = `mcp-wire-${process.pid}-${Date.now()}`;
 const testExternalUserIds = new Set([externalUserId]);
 const testMediaAssetIds = new Set<string>();
+let testMediaPath: string | undefined;
 const codexFixture = JSON.parse(readFileSync(
   new URL("./fixtures/codex-2026-conformance.json", import.meta.url),
   "utf8",
@@ -44,6 +47,7 @@ class WireClient {
   constructor(options: {
     externalUserId?: string;
     actor?: string;
+    runtimeVersion?: string;
     allowUserProvisioning?: boolean;
     testNow?: string;
   } = {}) {
@@ -57,6 +61,8 @@ class WireClient {
         DATABASE_URL,
         COMPASS_HEALTH_USER_BINDING: binding,
         COMPASS_HEALTH_ACTOR: options.actor ?? "codex-primary",
+        ...(options.runtimeVersion
+          ? { COMPASS_HEALTH_RUNTIME_VERSION: options.runtimeVersion } : {}),
         COMPASS_HEALTH_ALLOW_USER_PROVISIONING:
           options.allowUserProvisioning === false ? "false" : "true",
         ...(options.testNow ? { COMPASS_HEALTH_TEST_NOW: options.testNow } : {}),
@@ -163,6 +169,9 @@ afterAll(async () => {
     for (const assetId of testMediaAssetIds) {
       await sql`DELETE FROM compass_health.media_assets WHERE id = ${assetId}::uuid`;
     }
+    if (testMediaPath !== undefined) {
+      await unlink(testMediaPath).catch(() => undefined);
+    }
   } finally {
     await sql.end({ timeout: 3 });
   }
@@ -210,6 +219,45 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(response.result?.resultType).toBe("complete");
     const tools = response.result?.tools as Array<{ name: string }>;
     expect(tools.map((tool) => tool.name)).toContain("health_begin_run");
+  }, 20_000);
+
+  it("advertises dynamic resources through resources/templates/list on the raw 2026 wire", async () => {
+    const client = new WireClient();
+    clients.push(client);
+
+    const resources = await client.request({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "resources/list",
+      params: { _meta: modernMeta() },
+    });
+    expect(resources.error).toBeUndefined();
+    expect(resources.result?.resultType).toBe("complete");
+    const staticUris = (resources.result?.resources as Array<{ uri: string }>).map((entry) => entry.uri);
+    expect(staticUris).toContain("health://daily-state/today");
+    expect(staticUris.every((uri) => !uri.includes("{"))).toBe(true);
+
+    const templates = await client.request({
+      jsonrpc: "2.0",
+      id: 2,
+      method: "resources/templates/list",
+      params: { _meta: modernMeta() },
+    });
+    expect(templates.error).toBeUndefined();
+    expect(templates.result).toMatchObject({
+      resultType: "complete",
+      ttlMs: expect.any(Number),
+      cacheScope: "public",
+    });
+    const templateUris = (
+      templates.result?.resourceTemplates as Array<{ uriTemplate: string }>
+    ).map((entry) => entry.uriTemplate);
+    expect(templateUris).toEqual([
+      "health://constraints/active/{date}",
+      "health://daily-state/{date}",
+      "health://diet/logs/{date}",
+      "health://training/sessions/{sessionId}",
+    ]);
   }, 20_000);
 
   it("rejects an unknown production user binding without provisioning a blank user", async () => {
@@ -435,6 +483,141 @@ describe("MCP 2026-07-28 stdio wire", () => {
       await sql.end({ timeout: 3 });
     }
   }, 20_000);
+
+  it("binds a formal Actor Profile to the run and refuses cross-actor receipt replay", async () => {
+    const binding = `mcp-wire-formal-actor-${process.pid}-${Date.now()}`;
+    const actorA = new WireClient({
+      externalUserId: binding,
+      actor: "codex-primary",
+      runtimeVersion: "runtime-build-a",
+    });
+    clients.push(actorA);
+    const begun = await actorA.request(toolCall(1, "health_begin_run", {
+      objective: "formal actor receipt boundary",
+      idempotencyKey: "wire-formal-actor-run",
+    }));
+    const run = begun.result?.structuredContent as {
+      runHandle: string;
+      receiptId: string;
+    };
+    const waterArgs = {
+      runHandle: run.runHandle,
+      amountMl: 275,
+      idempotencyKey: "wire-formal-actor-water",
+    };
+    const written = await actorA.request(toolCall(2, "health_record_water", waterArgs));
+    const originalReceiptId = (written.result?.structuredContent as { receiptId: string }).receiptId;
+
+    const actorB = new WireClient({
+      externalUserId: binding,
+      actor: "codex-primary",
+      runtimeVersion: "runtime-build-b",
+    });
+    clients.push(actorB);
+    const refused = await actorB.request(toolCall(1, "health_record_water", waterArgs));
+    expect(refused.result?.structuredContent).toMatchObject({ error: "actor_mismatch" });
+
+    const bootstrapReplay = await actorB.request(toolCall(2, "health_begin_run", {
+      objective: "formal actor receipt boundary",
+      idempotencyKey: "wire-formal-actor-run",
+    }));
+    expect(bootstrapReplay.result?.structuredContent).toMatchObject({ error: "actor_mismatch" });
+
+    const evidence = await actorA.request(toolCall(3, "health_get_run_evidence", {
+      runHandle: run.runHandle,
+    }));
+    expect(evidence.result?.structuredContent).toMatchObject({
+      actor: {
+        actorType: "codex",
+        runtimeName: "codex",
+        agentProfile: "codex-primary",
+        runtimeVersion: "runtime-build-a",
+        status: "active",
+      },
+    });
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [formal] = await sql`
+        SELECT run.actor_id, actor.actor_type, actor.runtime_name,
+               actor.runtime_version, actor.agent_profile
+        FROM compass_health.agent_runs run
+        JOIN compass_health.agent_actors actor ON actor.id = run.actor_id
+        WHERE run.id = ${run.runHandle}::uuid`;
+      expect(formal).toMatchObject({
+        actor_type: "codex",
+        runtime_name: "codex",
+        runtime_version: "runtime-build-a",
+        agent_profile: "codex-primary",
+      });
+      const receipts = await sql`
+        SELECT id FROM compass_health.mcp_write_receipts
+        WHERE id = ${originalReceiptId}::uuid`;
+      expect(receipts).toHaveLength(1);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 30_000);
+
+  it("stores userAccepted as a user decision while run lifecycle stays operational", async () => {
+    const binding = `mcp-wire-run-decision-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "run outcome decision evidence",
+      idempotencyKey: "wire-run-decision-begin",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const ended = await client.request(toolCall(2, "health_end_run", {
+      runHandle,
+      outcome: "completed",
+      userAccepted: false,
+      idempotencyKey: "wire-run-decision-end",
+    }));
+    expect(ended.result?.structuredContent).toMatchObject({
+      runHandle,
+      outcome: "completed",
+      userAccepted: false,
+    });
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [user] = await sql`SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      const decisions = await sql`
+        SELECT decision_type, subject_json
+        FROM compass_health.user_decision_events
+        WHERE user_id = ${user!.id}::uuid
+          AND subject_json->>'type' = 'agent_run_outcome'`;
+      expect(decisions).toHaveLength(1);
+      expect(decisions[0]).toMatchObject({
+        decision_type: "rejected",
+        subject_json: {
+          type: "agent_run_outcome",
+          runId: runHandle,
+          accepted: false,
+          outcome: "completed",
+        },
+      });
+      const [counts] = await sql`
+        SELECT
+          (SELECT count(*)::int FROM compass_health.interaction_events
+           WHERE user_id = ${user!.id}::uuid AND stage = 'agent_run') AS lifecycle_audits,
+          (SELECT count(*)::int FROM compass_health.outbox_events
+           WHERE user_id = ${user!.id}::uuid
+             AND type IN ('agent.run_started', 'agent.run_ended')) AS lifecycle_outbox,
+          (SELECT count(*)::int FROM compass_health.outbox_events
+           WHERE user_id = ${user!.id}::uuid
+             AND type = 'user.decision_recorded'
+             AND payload_json ? 'observedOn') AS decision_outbox`;
+      expect(counts).toMatchObject({
+        lifecycle_audits: 2,
+        lifecycle_outbox: 0,
+        decision_outbox: 1,
+      });
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 25_000);
 
   it("rejects confirming plan version A and activating plan version B", async () => {
     const client = new WireClient();
@@ -1763,47 +1946,257 @@ describe("MCP 2026-07-28 stdio wire", () => {
     expect(originalReadBack.sets).toHaveLength(1);
   }, 35_000);
 
-  it("executes J03 REST acknowledgement through the explicit cycle", async () => {
+  it("executes J03 low sleep -> REST -> acknowledgement without changing the active plan", async () => {
     const binding = `mcp-wire-j03-${process.pid}-${Date.now()}`;
-    const client = new WireClient({ externalUserId: binding });
+    const date = "2026-08-18";
+    const client = new WireClient({
+      externalUserId: binding,
+      testNow: `${date}T04:00:00.000Z`,
+    });
     clients.push(client);
     const begun = await client.request(toolCall(1, "health_begin_run", {
       objective: "wire J03 rest acknowledgement",
       idempotencyKey: "wire-j03-run",
     }));
     const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
-    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
-    try {
-      const [user] = await sql`SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
-      const [cycle] = await sql`
-        INSERT INTO compass_health.training_cycle_instances (user_id, status)
-        VALUES (${user!.id}::uuid, 'active') RETURNING id`;
-      await sql`
-        INSERT INTO compass_health.training_cycle_positions
-          (cycle_instance_id, user_id, position_index, position_role, status, position_date)
-        VALUES
-          (${cycle!.id}::uuid, ${user!.id}::uuid, 0, 'A', 'completed', '2026-08-16'),
-          (${cycle!.id}::uuid, ${user!.id}::uuid, 1, 'B', 'completed', '2026-08-17')`;
-    } finally {
-      await sql.end({ timeout: 3 });
-    }
-    const acknowledged = await client.request(toolCall(2, "health_acknowledge_rest", {
+
+    // Establish an active plan through the public tool path, then snapshot it.
+    const prepared = await client.request(toolCall(2, "health_prepare_training", {
       runHandle,
-      date: "2026-08-18",
+      date,
+      day: "A",
+      idempotencyKey: "wire-j03-plan-setup",
+    }));
+    expect(prepared.result?.resultType).toBe("complete");
+    const planBeforeResponse = await client.request(toolCall(3, "health_get_active_plan", { runHandle }));
+    const planBefore = planBeforeResponse.result?.structuredContent as {
+      active: boolean;
+      version: { id: string; contentJson: unknown };
+    };
+    expect(planBefore.active).toBe(true);
+
+    const sleep = await client.request(toolCall(4, "health_record_sleep", {
+      runHandle,
+      date,
+      hours: 4.5,
+      idempotencyKey: "wire-j03-low-sleep",
+    }));
+    expect(sleep.result?.structuredContent).toMatchObject({ hours: 4.5 });
+
+    const cycleBefore = await client.request(toolCall(5, "health_get_training_cycle", { runHandle }));
+    const cycleDecision = (cycleBefore.result?.structuredContent as {
+      decision: { decision: string; reasonCodes: string[]; positionIndex: number };
+    }).decision;
+    expect(cycleDecision).toMatchObject({ decision: "REST", positionIndex: 0 });
+    expect(cycleDecision.reasonCodes).toContain("sleep_low");
+
+    const acknowledged = await client.request(toolCall(6, "health_acknowledge_rest", {
+      runHandle,
+      date,
       idempotencyKey: "wire-j03-rest",
     }));
     expect(acknowledged.result?.structuredContent).toMatchObject({
       acknowledged: true,
-      positionIndex: 2,
-      status: "skipped_rest",
+      positionIndex: 0,
+      status: "skipped_readiness",
     });
+
+    const planAfterResponse = await client.request(toolCall(7, "health_get_active_plan", { runHandle }));
+    const planAfter = planAfterResponse.result?.structuredContent as {
+      active: boolean;
+      version: { id: string; contentJson: unknown };
+    };
+    expect(planAfter.version.id).toBe(planBefore.version.id);
+    expect(planAfter.version.contentJson).toEqual(planBefore.version.contentJson);
+
+    const cycleAfter = await client.request(toolCall(8, "health_get_training_cycle", { runHandle }));
+    const positions = (cycleAfter.result?.structuredContent as {
+      positions: Array<{ positionIndex: number; positionRole: string; status: string }>;
+    }).positions;
+    expect(positions).toContainEqual(expect.objectContaining({
+      positionIndex: 0,
+      positionRole: "A",
+      status: "skipped_readiness",
+    }));
   }, 20_000);
+
+  it("records terminal evidence for validation, stale, ownership, conflict, safety, and projection failures", async () => {
+    const binding = `mcp-wire-failure-evidence-${process.pid}-${Date.now()}`;
+    const otherBinding = `${binding}-other`;
+    testExternalUserIds.add(otherBinding);
+    const date = "2026-08-21";
+    const client = new WireClient({
+      externalUserId: binding,
+      testNow: `${date}T04:00:00.000Z`,
+    });
+    clients.push(client);
+
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire terminal failure evidence matrix",
+      idempotencyKey: "wire-failure-evidence-run",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const prepared = await client.request(toolCall(2, "health_prepare_training", {
+      runHandle,
+      date,
+      day: "A",
+      idempotencyKey: "wire-failure-prepare-expired",
+    }));
+    const proposalId = (
+      prepared.result?.structuredContent as { trainingProposalId: string }
+    ).trainingProposalId;
+
+    const setup = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let otherConstraintId = "";
+    let supersededDietLogId = "";
+    try {
+      const [user] = await setup`
+        SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      const [other] = await setup`
+        INSERT INTO compass_health.users (external_id, locale, timezone)
+        VALUES (${otherBinding}, 'zh', 'Asia/Shanghai')
+        RETURNING id`;
+      const [otherConstraint] = await setup`
+        INSERT INTO compass_health.health_constraints
+          (user_id, constraint_type, severity, target_json, reason, active_from)
+        VALUES
+          (${other!.id}::uuid, 'pain', 'block', '{"bodyPart":"shoulder"}'::jsonb,
+           'cross-user fixture', ${date})
+        RETURNING id`;
+      otherConstraintId = String(otherConstraint!.id);
+      const [originalDietLog] = await setup`
+        INSERT INTO compass_health.diet_logs
+          (user_id, log_date, meal_type, description)
+        VALUES (${user!.id}::uuid, ${date}, 'snack', 'original conflict fixture')
+        RETURNING id`;
+      const [revisedDietLog] = await setup`
+        INSERT INTO compass_health.diet_logs
+          (user_id, log_date, meal_type, description, correction_of_id)
+        VALUES (${user!.id}::uuid, ${date}, 'snack', 'revised conflict fixture', ${originalDietLog!.id}::uuid)
+        RETURNING id`;
+      await setup`
+        UPDATE compass_health.diet_logs
+        SET superseded_by_id = ${revisedDietLog!.id}::uuid
+        WHERE id = ${originalDietLog!.id}::uuid`;
+      supersededDietLogId = String(originalDietLog!.id);
+      await setup`
+        UPDATE compass_health.prepared_training_proposals
+        SET expires_at = ${new Date("2026-08-20T00:00:00.000Z")}
+        WHERE id = ${proposalId}::uuid AND user_id = ${user!.id}::uuid`;
+    } finally {
+      await setup.end({ timeout: 3 });
+    }
+
+    const invalidSet = await client.request(toolCall(3, "health_record_set", {
+      runHandle,
+      trainingSessionId: "00000000-0000-4000-8000-000000000001",
+      sessionExerciseId: "00000000-0000-4000-8000-000000000002",
+      setNumber: 0,
+      reps: -1,
+      idempotencyKey: "wire-failure-invalid-set",
+    }));
+    expect(invalidSet.result?.structuredContent).toMatchObject({ error: "validation_failed" });
+
+    const stale = await client.request(toolCall(4, "health_start_training", {
+      runHandle,
+      trainingProposalId: proposalId,
+      date,
+      dayRole: "A",
+      idempotencyKey: "wire-failure-expired-proposal",
+    }));
+    expect(stale.result?.structuredContent).toMatchObject({ error: "proposal_stale" });
+
+    const crossUser = await client.request(toolCall(5, "health_lift_constraint", {
+      runHandle,
+      constraintId: otherConstraintId,
+      idempotencyKey: "wire-failure-cross-user",
+    }));
+    expect(crossUser.result?.structuredContent).toMatchObject({ error: "not_found" });
+
+    const conflict = await client.request(toolCall(6, "health_correct_meal", {
+      runHandle,
+      dietLogId: supersededDietLogId,
+      description: "牛肉150克",
+      idempotencyKey: "wire-failure-state-conflict",
+    }));
+    expect(conflict.result?.structuredContent).toMatchObject({ error: "state_conflict" });
+
+    const poison = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [user] = await poison`
+        SELECT id FROM compass_health.users WHERE external_id = ${binding}`;
+      await poison`
+        INSERT INTO compass_health.health_constraints
+          (user_id, constraint_type, severity, target_json, reason, active_from, active_to)
+        VALUES
+          (${user!.id}::uuid, 'medical', 'block', '{"movementPattern":"horizontal_push"}'::jsonb, 'block A horizontal', ${date}, ${date}),
+          (${user!.id}::uuid, 'medical', 'block', '{"movementPattern":"vertical_push"}'::jsonb, 'block A vertical', ${date}, ${date}),
+          (${user!.id}::uuid, 'medical', 'block', '{"movementPattern":"elbow_extension"}'::jsonb, 'block A elbow', ${date}, ${date}),
+          (${user!.id}::uuid, 'medical', 'block', '{"movementPattern":"lateral_raise"}'::jsonb, 'block A lateral', ${date}, ${date})`;
+      await poison`
+        INSERT INTO compass_health.outbox_events
+          (user_id, aggregate_type, aggregate_id, type, payload_json)
+        VALUES
+          (${user!.id}::uuid, 'unsupported_failure_fixture', 'wire-projection-poison',
+           'fixture.unsupported', ${poison.json({ observedOn: date })})`;
+    } finally {
+      await poison.end({ timeout: 3 });
+    }
+
+    const safety = await client.request(toolCall(7, "health_prepare_training", {
+      runHandle,
+      date,
+      day: "A",
+      idempotencyKey: "wire-failure-safety-block",
+    }));
+    expect(safety.result?.structuredContent).toMatchObject({ error: "health_safety_block" });
+
+    const projection = await client.request(toolCall(8, "health_replay_projection", {
+      runHandle,
+      date,
+      idempotencyKey: "wire-failure-projection",
+    }));
+    expect(projection.result?.structuredContent).toMatchObject({ error: "domain_unavailable" });
+
+    const evidence = await client.request(toolCall(9, "health_get_run_evidence", { runHandle }));
+    const terminalFailures = (evidence.result?.structuredContent as {
+      steps: Array<{
+        stage: string;
+        mcpName: string | null;
+        status: string | null;
+        errorCode: string | null;
+        failureStage: string | null;
+      }>;
+    }).steps.filter((step) => step.stage === "tool_result" && step.errorCode !== null);
+    const byTool = new Map(terminalFailures.map((step) => [step.mcpName, step]));
+    expect(byTool.get("health_record_set")).toMatchObject({
+      status: "failed", errorCode: "validation_failed", failureStage: "validation",
+    });
+    expect(byTool.get("health_start_training")).toMatchObject({
+      status: "refused", errorCode: "proposal_stale", failureStage: "precondition",
+    });
+    expect(byTool.get("health_lift_constraint")).toMatchObject({
+      status: "refused", errorCode: "not_found", failureStage: "target_lookup",
+    });
+    expect(byTool.get("health_correct_meal")).toMatchObject({
+      status: "refused", errorCode: "state_conflict", failureStage: "precondition",
+    });
+    expect(byTool.get("health_prepare_training")).toMatchObject({
+      status: "refused", errorCode: "health_safety_block", failureStage: "safety",
+    });
+    expect(byTool.get("health_replay_projection")).toMatchObject({
+      status: "failed", errorCode: "domain_unavailable", failureStage: "projection",
+    });
+  }, 40_000);
 
   it("executes J06 safe media ranking and feedback without exposing local paths", async () => {
     const binding = `mcp-wire-j06-${process.pid}-${Date.now()}`;
     const marker = `wire-j06-${process.pid}-${Date.now()}`;
     const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
     const segmentIds = new Map<string, string>();
+    testMediaPath = join(tmpdir(), `compass-health-wire-media-${process.pid}-${Date.now()}.mp4`);
+    const mediaBytes = Buffer.from(Array.from({ length: 8192 }, (_, index) => index % 251));
+    await writeFile(testMediaPath, mediaBytes);
     const fixtures = [
       {
         key: "curun-confirmed",
@@ -1893,9 +2286,9 @@ describe("MCP 2026-07-28 stdio wire", () => {
              usable_video_until_ms, content_type, bytes)
           VALUES
             ('video', ${fixture.trainer}, ${fixture.sourceRole}, ${`${marker}-${fixture.key}`},
-             ${`C:\\private\\${fixture.key}.mp4`}, ${`${marker}-${fixture.key}`}, 60000,
+             ${testMediaPath}, ${`${marker}-${fixture.key}`}, 60000,
              ${fixture.probeStatus}, ${fixture.fullDecodeStatus}, ${fixture.decodeErrorAtMs},
-             ${fixture.usableVideoUntilMs}, 'video/mp4', 1)
+             ${fixture.usableVideoUntilMs}, 'video/mp4', ${mediaBytes.length})
           RETURNING id`;
         testMediaAssetIds.add(String(asset!.id));
         const [pairing] = await sql`
@@ -1944,6 +2337,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
         sourceRole: string;
         reviewStatus: string;
         streamUrl: string;
+        expiresAt: string;
+        contentType: string;
         localPath?: string;
       }>;
     }).segments;
@@ -1960,9 +2355,24 @@ describe("MCP 2026-07-28 stdio wire", () => {
       trainer: "curun",
       sourceRole: "chest_specialist",
       reviewStatus: "confirmed",
-      streamUrl: `/api/v1/media/segments/${segmentIds.get("curun-confirmed")}/stream`,
+      contentType: "video/mp4",
     });
+    const streamUrl = new URL(segments[0]!.streamUrl);
+    expect(streamUrl.hostname).toBe("127.0.0.1");
+    expect(streamUrl.pathname).toBe(`/api/v1/media/segments/${segmentIds.get("curun-confirmed")}/stream`);
+    expect(streamUrl.searchParams.get("expires")).toEqual(expect.any(String));
+    expect(streamUrl.searchParams.get("signature")).toEqual(expect.any(String));
+    expect(new Date(segments[0]!.expiresAt).getTime()).toBeGreaterThan(Date.now());
     expect(segments.every((segment) => segment.localPath === undefined)).toBe(true);
+
+    const streamed = await fetch(segments[0]!.streamUrl, {
+      headers: { Range: "bytes=0-31" },
+    });
+    expect(streamed.status).toBe(206);
+    expect(streamed.headers.get("content-type")).toBe("video/mp4");
+    expect(streamed.headers.get("accept-ranges")).toBe("bytes");
+    expect(streamed.headers.get("content-range")).toMatch(/^bytes 0-31\/\d+$/);
+    expect(Buffer.from(await streamed.arrayBuffer())).toEqual(mediaBytes.subarray(136, 168));
 
     for (let index = 0; index < 3; index += 1) {
       const feedback = await client.request(toolCall(3 + index, "health_record_media_feedback", {
@@ -2043,20 +2453,46 @@ describe("MCP 2026-07-28 stdio wire", () => {
     const proposed = await client.request(toolCall(6, "health_propose_plan_change", {
       runHandle,
       reflectionId,
-      changes: [{
-        kind: "reorder",
-        dayRole: "A",
-        order: ["incline_dumbbell_press", "barbell_bench_press"],
-      }],
+       changes: [
+         {
+           kind: "reorder_exercises",
+           dayRole: "A",
+           order: ["incline_dumbbell_press", "barbell_bench_press"],
+         },
+         { kind: "update_sets", dayRole: "A", exerciseSlug: "incline_dumbbell_press", sets: 4 },
+         {
+           kind: "update_rep_range",
+           dayRole: "A",
+           exerciseSlug: "incline_dumbbell_press",
+           repRangeLow: 6,
+           repRangeHigh: 8,
+         },
+         {
+           kind: "update_rir",
+           dayRole: "A",
+           exerciseSlug: "incline_dumbbell_press",
+           rirLow: 1,
+           rirHigh: 2,
+         },
+         {
+           kind: "update_cue_refs",
+           dayRole: "A",
+           exerciseSlug: "incline_dumbbell_press",
+           cueRefs: ["segment-j07-technique"],
+         },
+         { kind: "update_cycle_pattern", cyclePattern: ["A", "REST", "B", "C", "REST"] },
+       ],
       reason: "wire J07 validation",
       idempotencyKey: "wire-j07-propose-plan",
     }));
     const proposedBody = proposed.result?.structuredContent as {
       childVersionId: string;
       parentVersionId: string;
-      diff: {
-        changedDays: Array<{ dayRole: string; beforeOrder: string[]; afterOrder: string[] }>;
-      };
+       diff: {
+         changes: Array<{ kind: string; before: unknown; after: unknown }>;
+         changedDays: Array<{ dayRole: string; beforeOrder: string[]; afterOrder: string[] }>;
+         cyclePattern: { before: string[]; after: string[] };
+       };
     };
     const childVersionId = proposedBody.childVersionId;
     const parentVersionId = proposedBody.parentVersionId;
@@ -2067,6 +2503,14 @@ describe("MCP 2026-07-28 stdio wire", () => {
         afterOrder: expect.arrayContaining(["incline_dumbbell_press", "barbell_bench_press"]),
       }),
     ]));
+    expect(proposedBody.diff.changes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "update_sets", before: { sets: 3 }, after: { sets: 4 } }),
+      expect.objectContaining({ kind: "update_rep_range" }),
+      expect.objectContaining({ kind: "update_rir" }),
+      expect.objectContaining({ kind: "update_cue_refs" }),
+      expect.objectContaining({ kind: "update_cycle_pattern" }),
+    ]));
+    expect(proposedBody.diff.cyclePattern.after).toEqual(["A", "REST", "B", "C", "REST"]);
     const verify = postgres(DATABASE_URL, { max: 1, prepare: false });
     let parentContentBefore: unknown;
     try {
@@ -2112,13 +2556,29 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }));
     const nextBody = nextPrepared.result?.structuredContent as {
       planVersionId: string;
-      proposedExercises: Array<{ exerciseSlug: string }>;
+       proposedExercises: Array<{
+         exerciseSlug: string;
+         sets: number;
+         repRangeLow?: number;
+         repRangeHigh?: number;
+         rirLow?: number;
+         rirHigh?: number;
+         cueRefs?: string[];
+       }>;
     };
     expect(nextBody.planVersionId).toBe(childVersionId);
     expect(nextBody.proposedExercises.slice(0, 2).map((exercise) => exercise.exerciseSlug)).toEqual([
       "incline_dumbbell_press",
       "barbell_bench_press",
     ]);
+    expect(nextBody.proposedExercises[0]).toMatchObject({
+      sets: 4,
+      repRangeLow: 6,
+      repRangeHigh: 8,
+      rirLow: 1,
+      rirHigh: 2,
+      cueRefs: ["segment-j07-technique"],
+    });
 
     const postActivation = postgres(DATABASE_URL, { max: 1, prepare: false });
     try {

@@ -8,6 +8,8 @@
  * - completing a training session produces a training_session event whose
  *   consumption lands completedSets in DailyState.training
  * - two workers can run concurrently without double-processing (SKIP LOCKED)
+ * - heartbeat failure or lease takeover can never produce a false success or
+ *   let the stale worker overwrite the new owner
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { and, eq, sql } from "drizzle-orm";
@@ -258,6 +260,145 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
         .where(eq(schema.outboxEvents.id, event.id));
       expect(row?.status).toBe("done");
       expect(row?.attempts).toBe(1);
+    } finally {
+      releaseLock();
+      await lockTask.catch(() => undefined);
+      await lockPool.end({ timeout: 3 });
+    }
+  }, 20_000);
+
+  it("does not report success after a heartbeat database failure", async () => {
+    const [event] = await db.insert(schema.outboxEvents).values({
+      userId: ctx.userId,
+      aggregateType: "observation",
+      aggregateId: `heartbeat-failure-${Date.now()}`,
+      eventType: "observation.recorded",
+      payloadJson: { observedOn: today },
+    }).returning();
+    if (!event) throw new Error("heartbeat failure setup failed");
+
+    const lockPool = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let releaseLock!: () => void;
+    let reportLocked!: () => void;
+    let reportHeartbeat!: () => void;
+    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const heartbeatAttempted = new Promise<void>((resolve) => { reportHeartbeat = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockTask = lockPool.begin(async (tx) => {
+      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
+      reportLocked();
+      await release;
+    });
+
+    try {
+      await locked;
+      const failedWorker = createProjectionWorker(ctx.db!, ctx.repo, {
+        workerId: "heartbeat-db-failure-worker",
+        leaseMs: 90,
+        batchSize: 1,
+        renewLease: async () => {
+          reportHeartbeat();
+          throw new Error("injected heartbeat database failure");
+        },
+      });
+      const firstRun = failedWorker.runOnce(undefined, ctx.userId);
+      await waitForAttempts(event.id, 1);
+      await heartbeatAttempted;
+      releaseLock();
+
+      const firstResult = await firstRun;
+      await lockTask;
+      expect(firstResult).toMatchObject({ succeeded: 0, leaseLost: 1 });
+
+      const [abandoned] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(abandoned?.status).toBe("processing");
+      expect(abandoned?.lockedBy).toBe("heartbeat-db-failure-worker");
+
+      const recovery = createProjectionWorker(ctx.db!, ctx.repo, {
+        workerId: "heartbeat-recovery-worker",
+        batchSize: 1,
+      });
+      const recovered = await recovery.runOnce(new Date(Date.now() + 1_000), ctx.userId);
+      expect(recovered.succeeded).toBe(1);
+      const [done] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(done).toMatchObject({ status: "done", attempts: 2 });
+
+      const evidence = await db.select().from(schema.interactionEvents).where(and(
+        eq(schema.interactionEvents.stage, "projection"),
+        eq(schema.interactionEvents.stageCode, "lease_lost"),
+        sql`${schema.interactionEvents.detailJson} ->> 'outboxId' = ${event.id}`,
+      ));
+      expect(evidence).toHaveLength(1);
+      expect(evidence[0]?.detailJson).toMatchObject({
+        workerId: "heartbeat-db-failure-worker",
+        heartbeatError: "injected heartbeat database failure",
+      });
+    } finally {
+      releaseLock();
+      await lockTask.catch(() => undefined);
+      await lockPool.end({ timeout: 3 });
+    }
+  }, 20_000);
+
+  it("a stale worker cannot finalize after another worker takes over its expired lease", async () => {
+    const [event] = await db.insert(schema.outboxEvents).values({
+      userId: ctx.userId,
+      aggregateType: "observation",
+      aggregateId: `lease-takeover-${Date.now()}`,
+      eventType: "observation.recorded",
+      payloadJson: { observedOn: today },
+    }).returning();
+    if (!event) throw new Error("lease takeover setup failed");
+
+    const lockPool = postgres(DATABASE_URL, { max: 1, prepare: false });
+    let releaseLock!: () => void;
+    let reportLocked!: () => void;
+    let reportLost!: () => void;
+    const locked = new Promise<void>((resolve) => { reportLocked = resolve; });
+    const leaseReportedLost = new Promise<void>((resolve) => { reportLost = resolve; });
+    const release = new Promise<void>((resolve) => { releaseLock = resolve; });
+    const lockTask = lockPool.begin(async (tx) => {
+      await tx.unsafe("LOCK TABLE compass_health.daily_health_state_projection IN ACCESS EXCLUSIVE MODE");
+      reportLocked();
+      await release;
+    });
+
+    try {
+      await locked;
+      const staleWorker = createProjectionWorker(ctx.db!, ctx.repo, {
+        workerId: "lease-worker-a",
+        leaseMs: 90,
+        batchSize: 1,
+        renewLease: async () => {
+          reportLost();
+          return false;
+        },
+      });
+      const successor = createProjectionWorker(ctx.db!, ctx.repo, {
+        workerId: "lease-worker-b",
+        batchSize: 1,
+      });
+      const staleRun = staleWorker.runOnce(undefined, ctx.userId);
+      await waitForAttempts(event.id, 1);
+      await leaseReportedLost;
+
+      const successorRun = successor.runOnce(new Date(Date.now() + 1_000), ctx.userId);
+      await waitForAttempts(event.id, 2);
+      const [takenOver] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(takenOver).toMatchObject({ status: "processing", lockedBy: "lease-worker-b", attempts: 2 });
+
+      releaseLock();
+      const [staleResult, successorResult] = await Promise.all([staleRun, successorRun]);
+      await lockTask;
+      expect(staleResult).toMatchObject({ succeeded: 0, leaseLost: 1 });
+      expect(successorResult).toMatchObject({ succeeded: 1, leaseLost: 0 });
+
+      const [done] = await db.select().from(schema.outboxEvents)
+        .where(eq(schema.outboxEvents.id, event.id));
+      expect(done).toMatchObject({ status: "done", attempts: 2, lockedBy: null });
     } finally {
       releaseLock();
       await lockTask.catch(() => undefined);

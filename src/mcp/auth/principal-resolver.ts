@@ -16,6 +16,13 @@ import { eq } from "drizzle-orm";
 
 import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import {
+  normalizeActorProfile,
+  resolveActor,
+  type ActorConfiguration,
+  type ActorProfileInput,
+  type VerifiedActorProfile,
+} from "./actor-registry.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 import { McpProtocolError } from "../errors.js";
@@ -27,9 +34,12 @@ export interface Principal {
   externalUserId: string;
   /** Declared actor label (evidence only, not authorization). */
   actor: string;
+  /** Durable formal actor row bound to every run and receipt. */
+  actorId: string;
+  actorProfile: VerifiedActorProfile;
 }
 
-export interface ActorBindingOptions {
+export interface ActorBindingOptions extends ActorConfiguration {
   /**
    * STDIO local mode: the single bound user's external id. Required — the
    * server refuses to start tools without an explicit binding.
@@ -37,6 +47,8 @@ export interface ActorBindingOptions {
   externalUserId?: string;
   /** Actor label recorded on runs/steps (default codex-primary). */
   actor?: string;
+  /** Full server-verified runtime/model attribution. */
+  actorProfile?: ActorProfileInput;
   /** Internal invariant: startup ToolContext must resolve to this same user. */
   expectedUserId?: string;
 }
@@ -60,16 +72,22 @@ export function createPrincipalResolver(db: Db, options: ActorBindingOptions) {
       );
     }
     assertExpectedUser(user.id, options.expectedUserId);
-    return { userId: user.id, externalUserId: binding, actor: verifiedActor(options) };
+    const actor = await resolveActor(db, options);
+    return {
+      userId: user.id,
+      externalUserId: binding,
+      actor: actor.verifiedActor,
+      actorId: actor.id,
+      actorProfile: actor,
+    };
   }
 
   return { resolvePrincipal };
 }
 
 /** Actor identity comes from server startup configuration, never request metadata. */
-function verifiedActor(options: ActorBindingOptions): string {
-  const actor = options.actor?.trim();
-  return actor ? actor : "codex-primary";
+export function verifiedActor(options: ActorBindingOptions): string {
+  return normalizeActorProfile(options).verifiedActor;
 }
 
 function assertExpectedUser(actualUserId: string, expectedUserId: string | undefined): void {

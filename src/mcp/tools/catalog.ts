@@ -34,8 +34,12 @@ import {
 import { createUserLocalDateResolver } from "../../domain/timezone.js";
 import { createHealthRecordingService } from "../../domain/health-recording-service.js";
 import { createMediaRetrieval } from "../../media/retrieval.js";
+import type { MediaStreamUrlIssuer } from "../../media/signed-stream-url.js";
 import { createPainCommand } from "../../training/prepared-session.js";
-import { createTrainingService } from "../../training/training-service.js";
+import {
+  createTrainingService,
+  TrainingSafetyBlockError,
+} from "../../training/training-service.js";
 import type { TrainingSetPainInput } from "../../training/training-service.js";
 import {
   createSubstitutionEngine,
@@ -46,6 +50,7 @@ import {
   createReflectionEngine,
   diffPlanContents,
   type PlanActivationResult,
+  type PlanVersionDiff,
 } from "../../training/reflection-engine.js";
 import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
@@ -59,14 +64,83 @@ import {
   type PendingInputBinding,
 } from "../input/request-state.js";
 import { createWriteCommandService, WriteCommandError } from "../writes/command.js";
+import type { ActorProfileInput } from "../auth/actor-registry.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
 const ISO_DATE = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
+const PLAN_TARGET_PROPERTIES = {
+  dayRole: { type: "string", enum: ["A", "B", "C"] },
+  exerciseSlug: { type: "string", minLength: 1 },
+} as const;
+const PLAN_CHANGE_SCHEMA = {
+  oneOf: [
+    planChangeObject("reorder_exercises", {
+      dayRole: PLAN_TARGET_PROPERTIES.dayRole,
+      order: { type: "array", minItems: 1, uniqueItems: true, items: { type: "string", minLength: 1 } },
+    }, ["dayRole", "order"]),
+    planChangeObject("replace_exercise", {
+      ...PLAN_TARGET_PROPERTIES,
+      replacementExerciseSlug: { type: "string", minLength: 1 },
+    }, ["dayRole", "exerciseSlug", "replacementExerciseSlug"]),
+    planChangeObject("update_sets", {
+      ...PLAN_TARGET_PROPERTIES,
+      sets: { type: "integer", minimum: 1, maximum: 10 },
+    }, ["dayRole", "exerciseSlug", "sets"]),
+    planChangeObject("update_rep_range", {
+      ...PLAN_TARGET_PROPERTIES,
+      repRangeLow: { type: "integer", minimum: 1, maximum: 100 },
+      repRangeHigh: { type: "integer", minimum: 1, maximum: 100 },
+    }, ["dayRole", "exerciseSlug", "repRangeLow", "repRangeHigh"]),
+    planChangeObject("update_rir", {
+      ...PLAN_TARGET_PROPERTIES,
+      rirLow: { type: "integer", minimum: 0, maximum: 10 },
+      rirHigh: { type: "integer", minimum: 0, maximum: 10 },
+    }, ["dayRole", "exerciseSlug", "rirLow", "rirHigh"]),
+    planChangeObject("update_alternatives", {
+      ...PLAN_TARGET_PROPERTIES,
+      alternatives: { type: "array", minItems: 1, maxItems: 20, uniqueItems: true, items: { type: "string", minLength: 1 } },
+    }, ["dayRole", "exerciseSlug", "alternatives"]),
+    planChangeObject("update_cycle_pattern", {
+      cyclePattern: { type: "array", minItems: 2, maxItems: 14, items: { type: "string", enum: ["A", "B", "C", "REST"] } },
+    }, ["cyclePattern"]),
+    planChangeObject("update_cue_refs", {
+      ...PLAN_TARGET_PROPERTIES,
+      cueRefs: { type: "array", minItems: 1, maxItems: 20, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 } },
+    }, ["dayRole", "exerciseSlug", "cueRefs"]),
+    planChangeObject("remove_exercise", PLAN_TARGET_PROPERTIES, ["dayRole", "exerciseSlug"]),
+    planChangeObject("add_exercise", {
+      ...PLAN_TARGET_PROPERTIES,
+      sets: { type: "integer", minimum: 1, maximum: 10 },
+      repRangeLow: { type: "integer", minimum: 1, maximum: 100 },
+      repRangeHigh: { type: "integer", minimum: 1, maximum: 100 },
+      rirLow: { type: "integer", minimum: 0, maximum: 10 },
+      rirHigh: { type: "integer", minimum: 0, maximum: 10 },
+      alternatives: { type: "array", maxItems: 20, uniqueItems: true, items: { type: "string", minLength: 1 } },
+      cueRefs: { type: "array", maxItems: 20, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 } },
+      note: { type: "string", maxLength: 500 },
+    }, ["dayRole", "exerciseSlug", "sets"]),
+  ],
+} as const;
+
+function planChangeObject(
+  kind: string,
+  properties: Record<string, unknown>,
+  required: string[],
+) {
+  return {
+    type: "object",
+    properties: { kind: { const: kind }, ...properties },
+    required: ["kind", ...required],
+    additionalProperties: false,
+  };
+}
 
 export interface ToolInvocation {
   principalUserId: string;
   actor: string;
+  actorId?: string;
+  actorProfile?: ActorProfileInput;
   args: Record<string, unknown>;
   requestState?: string;
   confirmationChoice?: string;
@@ -182,6 +256,8 @@ export function createHealthToolCatalog(
     toolContext?: ToolContext;
     conformanceProfile?: boolean;
     now?: () => Date;
+    /** null means explicitly disabled; undefined preserves legacy BFF paths. */
+    mediaStreamUrlIssuer?: MediaStreamUrlIssuer | null;
   } = {},
 ) {
   const runs = createRunHandleService(db);
@@ -219,6 +295,7 @@ export function createHealthToolCatalog(
     await runs.recordStep({
       userId: invocation.principalUserId,
       runHandle: str(invocation.args, "runHandle"),
+      ...(invocation.actorId ? { actorId: invocation.actorId } : {}),
       stage: "confirmation",
       mcpMethod: "tools/call",
       mcpName: toolName,
@@ -258,6 +335,8 @@ export function createHealthToolCatalog(
     return {
       userId: invocation.principalUserId,
       verifiedActor: invocation.actor,
+      ...(invocation.actorId ? { actorId: invocation.actorId } : {}),
+      ...(invocation.actorProfile ? { actorProfile: invocation.actorProfile } : {}),
       runHandle: runHandle.trim(),
       toolName,
       scopeKey,
@@ -266,23 +345,14 @@ export function createHealthToolCatalog(
     };
   }
 
-  /** Require a valid run handle for write tools; records the step. */
-  async function requireRun(userId: string, args: Record<string, unknown>, mcpName: string) {
-    const runHandle = String(args["runHandle"] ?? "");
+  /** Require a valid, actor-bound run handle for confirmation/proposal tools. */
+  async function requireRun(invocation: ToolInvocation) {
+    const runHandle = String(invocation.args["runHandle"] ?? "");
     if (!runHandle) {
       throw new Error("run_handle_required: call health_begin_run first; writes without a run are not accepted");
     }
     // Ownership check (throws RunHandleError when foreign/unknown).
-    const run = await runs.getRun(userId, runHandle);
-    await runs.recordStep({
-      userId,
-      runHandle,
-      stage: "tool_call",
-      mcpMethod: "tools/call",
-      mcpName,
-      arguments: args,
-    });
-    return run;
+    return runs.getRun(invocation.principalUserId, runHandle, invocation.actorId);
   }
 
   function str(args: Record<string, unknown>, key: string): string {
@@ -368,10 +438,22 @@ export function createHealthToolCatalog(
       userId: invocation.principalUserId,
       externalUserId: "transport-verified",
       actor: invocation.actor,
+      actorId: invocation.actorId ?? "direct-catalog",
+      actorProfile: {
+        verifiedActor: invocation.actor,
+        actorType: invocation.actorProfile?.actorType ?? "other",
+        runtimeName: invocation.actorProfile?.runtimeName ?? invocation.actor,
+        runtimeVersion: invocation.actorProfile?.runtimeVersion ?? null,
+        agentProfile: invocation.actorProfile?.agentProfile ?? invocation.actor,
+        agentProfileVersion: invocation.actorProfile?.agentProfileVersion ?? null,
+        modelProvider: invocation.actorProfile?.modelProvider ?? null,
+        modelName: invocation.actorProfile?.modelName ?? null,
+      },
     }, uri);
     await runs.recordStep({
       userId: invocation.principalUserId,
       runHandle,
+      ...(invocation.actorId ? { actorId: invocation.actorId } : {}),
       stage: "tool_call",
       mcpMethod: "tools/call",
       mcpName: toolName,
@@ -465,6 +547,8 @@ export function createHealthToolCatalog(
           objective: str(inv.args, "objective"),
           inputChannel: optStr(inv.args, "inputChannel") ?? "mcp",
           verifiedActor: inv.actor,
+          ...(inv.actorId ? { actorId: inv.actorId } : {}),
+          ...(inv.actorProfile ? { actorProfile: inv.actorProfile } : {}),
           idempotencyKey: str(inv.args, "idempotencyKey"),
           arguments: inv.args,
         });
@@ -492,6 +576,10 @@ export function createHealthToolCatalog(
           return toolError("validation_failed", "outcome must be completed|failed|abandoned");
         }
         const runHandle = str(inv.args, "runHandle");
+        const userAccepted = typeof inv.args["userAccepted"] === "boolean"
+          ? inv.args["userAccepted"]
+          : undefined;
+        const observedOn = await today(inv.principalUserId);
         const result = await writes.execute(
           writeInput(inv, "health_end_run", runHandle),
           async (tx) => {
@@ -508,21 +596,57 @@ export function createHealthToolCatalog(
               eq(schema.agentRuns.outcome, "running"),
             )).returning();
             if (!updated) throw new WriteCommandError("run_handle_invalid", "run is already closed");
-            const [outbox] = await tx.insert(schema.outboxEvents).values({
+            const [audit] = await tx.insert(schema.interactionEvents).values({
               userId: inv.principalUserId,
-              aggregateType: "user_decision",
-              aggregateId: runHandle,
-              eventType: "agent.run_ended",
-              payloadJson: { outcome, journeyId: updated.journeyId },
-            }).returning({ id: schema.outboxEvents.id });
+              requestId: runHandle,
+              journeyId: updated.journeyId,
+              actor: `mcp:${inv.actor}`,
+              stage: "agent_run",
+              stageCode: "ended",
+              detailJson: { runId: runHandle, outcome },
+            }).returning({ id: schema.interactionEvents.id });
+            if (!audit) throw new Error("run end audit insert failed");
+            const outboxEventIds: string[] = [];
+            const factRefs: Array<{ type: string; id: string }> = [
+              { type: "agent_run", id: runHandle },
+            ];
+            if (userAccepted !== undefined) {
+              const [decision] = await tx.insert(schema.userDecisionEvents).values({
+                userId: inv.principalUserId,
+                decisionType: userAccepted ? "accepted" : "rejected",
+                subjectJson: {
+                  type: "agent_run_outcome",
+                  runId: runHandle,
+                  accepted: userAccepted,
+                  outcome,
+                },
+                journeyId: updated.journeyId,
+              }).returning({ id: schema.userDecisionEvents.id });
+              if (!decision) throw new Error("run outcome decision insert failed");
+              const [decisionOutbox] = await tx.insert(schema.outboxEvents).values({
+                userId: inv.principalUserId,
+                aggregateType: "user_decision",
+                aggregateId: decision.id,
+                eventType: "user.decision_recorded",
+                payloadJson: { observedOn, type: "agent_run_outcome", runId: runHandle },
+              }).returning({ id: schema.outboxEvents.id });
+              if (!decisionOutbox) throw new Error("run outcome decision outbox insert failed");
+              outboxEventIds.push(decisionOutbox.id);
+              factRefs.push({ type: "user_decision", id: decision.id });
+            }
             const [count] = await tx.select({ n: sql<number>`count(*)::int` })
               .from(schema.agentRunSteps)
               .where(eq(schema.agentRunSteps.runId, runHandle));
-            if (!outbox) throw new Error("run end outbox insert failed");
             return {
-              response: { runHandle, outcome: updated.outcome, stepCount: (count?.n ?? 0) + 1 },
-              factRefs: [{ type: "agent_run", id: runHandle }],
-              outboxEventIds: [outbox.id],
+              response: {
+                runHandle,
+                outcome: updated.outcome,
+                userAccepted: userAccepted ?? null,
+                stepCount: (count?.n ?? 0) + 1,
+              },
+              factRefs,
+              outboxEventIds,
+              auditEventIds: [audit.id],
             };
           },
         );
@@ -719,7 +843,14 @@ export function createHealthToolCatalog(
         required: ["runHandle"],
       },
       execute: async (inv) => {
-        const segments = await createMediaRetrieval(db).search({
+        if (options.mediaStreamUrlIssuer === null) {
+          return toolError("domain_unavailable", "training media runtime is disabled");
+        }
+        const segments = await createMediaRetrieval(db, {
+          ...(options.mediaStreamUrlIssuer
+            ? { issueStreamUrl: options.mediaStreamUrlIssuer }
+            : {}),
+        }).search({
           ...(optStr(inv.args, "movementPattern") ? { movementPattern: optStr(inv.args, "movementPattern") } : {}),
           ...(optStr(inv.args, "bodyPart") ? { bodyPart: optStr(inv.args, "bodyPart") } : {}),
           ...(optStr(inv.args, "category") ? { category: optStr(inv.args, "category") } : {}),
@@ -729,6 +860,7 @@ export function createHealthToolCatalog(
         await runs.recordStep({
           userId: inv.principalUserId,
           runHandle: str(inv.args, "runHandle"),
+          ...(inv.actorId ? { actorId: inv.actorId } : {}),
           stage: "tool_call",
           mcpMethod: "tools/call",
           mcpName: "health_search_training_media",
@@ -912,6 +1044,7 @@ export function createHealthToolCatalog(
       execute: async (inv) => complete(await runs.getRun(
         inv.principalUserId,
         str(inv.args, "runHandle"),
+        inv.actorId,
       )),
     },
     {
@@ -995,7 +1128,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "mealType", "description", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_log_meal");
+        await requireRun(inv);
         const ctx = await buildToolContext(inv.principalUserId);
         try {
           const idempotencyKey = str(inv.args, "idempotencyKey");
@@ -1153,7 +1286,7 @@ export function createHealthToolCatalog(
       },
       execute: async (inv) => {
         try {
-          await requireRun(inv.principalUserId, inv.args, "health_correct_meal");
+          await requireRun(inv);
           const ctx = await buildToolContext(inv.principalUserId);
           const originalLogId = str(inv.args, "dietLogId");
 
@@ -1447,7 +1580,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "constraintId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_lift_constraint");
+        await requireRun(inv);
         const constraintId = str(inv.args, "constraintId");
         if (inv.requestState === undefined) {
           const [constraint] = await db.select().from(schema.healthConstraints)
@@ -1635,23 +1768,24 @@ export function createHealthToolCatalog(
           runHandle: { type: "string" },
           trainingSessionId: { type: "string" },
           sessionExerciseId: { type: "string" },
-          setNumber: { type: "number" },
-          loadValue: { type: "number" },
+          setNumber: { type: "integer", minimum: 1 },
+          loadValue: { type: "number", minimum: 0 },
           loadUnit: { type: "string", enum: ["kg", "lb", "bodyweight"] },
-          reps: { type: "number" },
-          rir: { type: "number" },
+          reps: { type: "integer", minimum: 0 },
+          rir: { type: "integer", minimum: 0, maximum: 10 },
           targetMuscleFeel: { type: "integer", minimum: 1, maximum: 5 },
           pain: {
             type: "array",
+            maxItems: 8,
             items: {
               type: "object",
               properties: {
-                bodyPart: { type: "string", minLength: 1 },
+                bodyPart: { type: "string", minLength: 1, maxLength: 100 },
                 severity: {
                   type: "string",
                   enum: ["mild", "sharp", "worsening", "unstable", "unknown"],
                 },
-                description: { type: "string" },
+                description: { type: "string", maxLength: 500 },
               },
               required: ["bodyPart", "severity"],
               additionalProperties: false,
@@ -1884,7 +2018,7 @@ export function createHealthToolCatalog(
       },
       execute: async (inv) => {
         try {
-          await requireRun(inv.principalUserId, inv.args, "health_apply_substitution");
+          await requireRun(inv);
           const proposalId = str(inv.args, "substitutionProposalId");
           if (inv.requestState === undefined) {
             const pending = await createSubstitutionEngine(db)
@@ -2055,7 +2189,7 @@ export function createHealthToolCatalog(
         properties: {
           runHandle: { type: "string" },
           reflectionId: { type: "string" },
-          changes: { type: "array", items: { type: "object" } },
+          changes: { type: "array", minItems: 1, items: PLAN_CHANGE_SCHEMA },
           reason: { type: "string" },
           idempotencyKey: { type: "string" },
         },
@@ -2117,7 +2251,7 @@ export function createHealthToolCatalog(
         required: ["runHandle", "planVersionId", "idempotencyKey"],
       },
       execute: async (inv) => {
-        await requireRun(inv.principalUserId, inv.args, "health_activate_plan_version");
+        await requireRun(inv);
         const planVersionId = str(inv.args, "planVersionId");
         if (inv.requestState === undefined) {
           const [version] = await db.select().from(schema.planVersions)
@@ -2152,13 +2286,16 @@ export function createHealthToolCatalog(
           const storedChanges = Array.isArray(targetContent["changeSet"])
             ? targetContent["changeSet"] as Array<Record<string, unknown>>
             : [];
-          const diff = diffPlanContents(
-            current.contentJson,
-            version.contentJson,
-            direction === "forward"
-              ? storedChanges
-              : [{ kind: "rollback", targetVersionId: version.id }],
-          );
+          const storedDiff = targetContent["planDiff"] as PlanVersionDiff | undefined;
+          const diff = direction === "forward" && storedDiff?.changes.length
+            ? storedDiff
+            : diffPlanContents(
+                current.contentJson,
+                version.contentJson,
+                direction === "forward"
+                  ? storedChanges
+                  : [{ kind: "rollback", targetVersionId: version.id }],
+              );
           return await makeConfirmation(
             "health_activate_plan_version", planVersionId, inv,
             `训练计划切换 ${direction === "forward" ? "forward" : "rollback"}: `
@@ -2326,6 +2463,9 @@ export function createHealthToolCatalog(
         }
         if ((error as { code?: string }).code === "run_handle_invalid") {
           return toolError("run_handle_invalid", message);
+        }
+        if (error instanceof TrainingSafetyBlockError) {
+          return toolError(error.code, error.message);
         }
         if (error instanceof RangeError) {
           return toolError("validation_failed", error.message);

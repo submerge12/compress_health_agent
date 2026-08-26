@@ -9,19 +9,16 @@ import { NotOwnedError } from "./ownership.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
+import {
+  compilePlanChanges,
+  diffPlanContents,
+  type PlanVersionDiff,
+} from "./plan-change-compiler.js";
+
+export { diffPlanContents } from "./plan-change-compiler.js";
+export type { PlanChange, PlanVersionDiff } from "./plan-change-compiler.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
-
-type PlanDayItem = Record<string, unknown>;
-
-export interface PlanVersionDiff {
-  changes: Array<Record<string, unknown>>;
-  changedDays: Array<{
-    dayRole: string;
-    beforeOrder: string[];
-    afterOrder: string[];
-  }>;
-}
 
 export interface PlanActivationResult {
   activatedVersionId: string;
@@ -166,97 +163,18 @@ export function createReflectionEngine(db: Db) {
       .from(schema.planVersions)
       .where(eq(schema.planVersions.parentVersionId, parent.id));
 
-    // WO-HS-07: content_json must be a complete executable plan. Compile:
-    // parent days + change-set applied.
-    const parentContent = parent.contentJson as {
-      days?: Record<string, PlanDayItem[]> | Array<{
-        dayRole?: string;
-        name?: string;
-        items?: PlanDayItem[];
-      }>;
-      cyclePattern?: string[];
-    };
-    const compiledDays = normalizePlanDays(parentContent);
-    let materialChanges = 0;
-    for (const change of input.changes as Array<Record<string, unknown>>) {
-      const kind = String(change.kind ?? "");
-      if (kind === "remove_exercise") {
-        const slug = requiredChangeString(change, "exerciseSlug");
-        let removed = 0;
-        for (const role of Object.keys(compiledDays)) {
-          const list = compiledDays[role];
-          if (list !== undefined) {
-            const next = list.filter(
-              (item) => String(item.exerciseSlug ?? "") !== slug);
-            removed += list.length - next.length;
-            compiledDays[role] = next;
-          }
-        }
-        if (removed === 0) throw new RangeError(`exercise ${slug} is not in the active plan`);
-        materialChanges += removed;
-      } else if (kind === "reorder") {
-        const role = requiredChangeString(change, "dayRole").toUpperCase();
-        const current = compiledDays[role];
-        if (!current) throw new RangeError(`day ${role} is not in the active plan`);
-        if (!Array.isArray(change.order) || change.order.length === 0) {
-          throw new RangeError("reorder requires a non-empty order array");
-        }
-        const order = change.order.map((slug) => String(slug).trim()).filter(Boolean);
-        if (new Set(order).size !== order.length) throw new RangeError("reorder contains duplicate exercise slugs");
-        const available = new Set(current.map((item) => String(item.exerciseSlug ?? "")));
-        const missing = order.filter((slug) => !available.has(slug));
-        if (missing.length > 0) throw new RangeError(`reorder contains unknown exercises: ${missing.join(", ")}`);
-        const before = exerciseOrder(current);
-        const rank = new Map(order.map((slug, index) => [slug, index]));
-        compiledDays[role] = current
-          .map((item, originalIndex) => ({ item, originalIndex }))
-          .sort((left, right) => {
-            const leftRank = rank.get(String(left.item.exerciseSlug ?? ""));
-            const rightRank = rank.get(String(right.item.exerciseSlug ?? ""));
-            if (leftRank !== undefined && rightRank !== undefined) return leftRank - rightRank;
-            if (leftRank !== undefined) return -1;
-            if (rightRank !== undefined) return 1;
-            return left.originalIndex - right.originalIndex;
-          })
-          .map(({ item }) => item);
-        if (JSON.stringify(before) === JSON.stringify(exerciseOrder(compiledDays[role]!))) {
-          throw new RangeError(`reorder for day ${role} has no effect`);
-        }
-        materialChanges += 1;
-      } else if (kind === "add_exercise") {
-        const role = requiredChangeString(change, "dayRole").toUpperCase();
-        const slug = requiredChangeString(change, "exerciseSlug");
-        const current = compiledDays[role];
-        if (!current) throw new RangeError(`day ${role} is not in the active plan`);
-        if (current.some((item) => item.exerciseSlug === slug)) {
-          throw new RangeError(`exercise ${slug} already exists on day ${role}`);
-        }
-        const sets = Number(change.sets ?? 3);
-        if (!Number.isInteger(sets) || sets <= 0) throw new RangeError("added exercise sets must be a positive integer");
-        current.push({
-          exerciseSlug: slug,
-          sets,
-          note: String(change.note ?? "added by reflection"),
-        });
-        materialChanges += 1;
-      } else {
-        throw new RangeError(`unsupported plan change kind: ${kind || "missing"}`);
-      }
-    }
-    if (materialChanges === 0) throw new RangeError("plan changes have no effect");
-    for (const [role, items] of Object.entries(compiledDays)) {
-      if (items.length === 0) throw new RangeError(`plan change would leave day ${role} empty`);
-    }
-    const planDiff = diffPlanContents(parent.contentJson, {
-      ...parentContent,
-      days: compiledDays,
-    }, input.changes);
-    if (planDiff.changedDays.length === 0) throw new RangeError("plan changes have no compiled diff");
+    const exerciseRows = await db.select({
+      slug: schema.exerciseDefinitions.slug,
+      nameZh: schema.exerciseDefinitions.nameZh,
+      movementPattern: schema.exerciseDefinitions.movementPattern,
+    }).from(schema.exerciseDefinitions);
+    const compiled = compilePlanChanges(parent.contentJson, input.changes, {
+      exerciseCatalog: new Map(exerciseRows.map((exercise) => [exercise.slug, exercise])),
+    });
+    const planDiff = compiled.diff;
     const this_contentJson = {
-      ...parentContent,
-      days: compiledDays,
-      cyclePattern: parentContent.cyclePattern ?? ["A", "B", "REST", "C", "REST"],
-      changeSet: input.changes,
+      ...compiled.content,
+      changeSet: compiled.changes,
       planDiff,
     };
 
@@ -366,63 +284,4 @@ export function createReflectionEngine(db: Db) {
   }
 
   return { record, proposeChildVersion, activateChildVersion, activateVersion };
-}
-
-export function diffPlanContents(
-  beforeContent: Record<string, unknown>,
-  afterContent: Record<string, unknown>,
-  changes: Array<Record<string, unknown>>,
-): PlanVersionDiff {
-  const beforeDays = normalizePlanDays(beforeContent);
-  const afterDays = normalizePlanDays(afterContent);
-  const roles = [...new Set([...Object.keys(beforeDays), ...Object.keys(afterDays)])].sort();
-  return {
-    changes,
-    changedDays: roles.flatMap((dayRole) => {
-      const beforeOrder = exerciseOrder(beforeDays[dayRole] ?? []);
-      const afterOrder = exerciseOrder(afterDays[dayRole] ?? []);
-      return JSON.stringify(beforeOrder) === JSON.stringify(afterOrder)
-        ? []
-        : [{ dayRole, beforeOrder, afterOrder }];
-    }),
-  };
-}
-
-function normalizePlanDays(content: { days?: unknown }): Record<string, PlanDayItem[]> {
-  const normalized: Record<string, PlanDayItem[]> = {};
-  const rawDays = content.days;
-  if (Array.isArray(rawDays)) {
-    for (const value of rawDays) {
-      const day = value as { dayRole?: string; name?: string; items?: PlanDayItem[] };
-      const key = (day.dayRole
-        ?? (day.name?.startsWith("胸") ? "A"
-          : day.name?.includes("背") || day.name?.includes("肩后束") ? "B"
-          : day.name?.includes("腿") ? "C" : undefined)
-        ?? "").toUpperCase();
-      if (key && Array.isArray(day.items)) {
-        normalized[key] = day.items.map((item) => ({ ...item }));
-      }
-    }
-    return normalized;
-  }
-  if (rawDays !== null && typeof rawDays === "object") {
-    for (const [role, items] of Object.entries(rawDays as Record<string, unknown>)) {
-      if (Array.isArray(items)) {
-        normalized[role.toUpperCase()] = items.map((item) => ({ ...(item as PlanDayItem) }));
-      }
-    }
-  }
-  return normalized;
-}
-
-function exerciseOrder(items: PlanDayItem[]): string[] {
-  return items.map((item) => String(item.exerciseSlug ?? ""));
-}
-
-function requiredChangeString(change: Record<string, unknown>, key: string): string {
-  const value = change[key];
-  if (typeof value !== "string" || value.trim() === "") {
-    throw new RangeError(`${key} is required for plan change`);
-  }
-  return value.trim();
 }

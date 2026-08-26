@@ -61,6 +61,7 @@ export interface WorkerRunResult {
   succeeded: number;
   deadLettered: number;
   requeued: number;
+  leaseLost: number;
 }
 
 export interface ProjectionWorkerOptions {
@@ -68,7 +69,14 @@ export interface ProjectionWorkerOptions {
   leaseMs?: number;
   batchSize?: number;
   now?: () => Date;
+  /** Fault-injection/adapter seam. Return false when this worker no longer owns the row. */
+  renewLease?: (eventId: string, expiresAt: Date, workerId: string) => Promise<boolean>;
 }
+
+type ProcessOutcome =
+  | { kind: "success" }
+  | { kind: "unsupported"; lastError: string }
+  | { kind: "failed"; lastError: string };
 
 export class ProjectionReplayError extends Error {
   readonly code = "projection_replay_not_drained";
@@ -152,19 +160,53 @@ export function createProjectionWorker(
     );
   }
 
-  function startLeaseHeartbeat(eventId: string): () => void {
-    const intervalMs = Math.max(250, Math.floor(leaseMs / 3));
-    const timer = setInterval(() => {
-      const heartbeatAt = now();
-      void db.update(schema.outboxEvents)
-        .set({ lockExpiresAt: new Date(heartbeatAt.getTime() + leaseMs) })
-        .where(ownedEvent(eventId));
-    }, intervalMs);
-    timer.unref();
-    return () => clearInterval(timer);
+  async function renewLease(eventId: string, expiresAt: Date): Promise<boolean> {
+    if (options.renewLease) return options.renewLease(eventId, expiresAt, workerId);
+    const renewed = await db.update(schema.outboxEvents)
+      .set({ lockExpiresAt: expiresAt })
+      .where(ownedEvent(eventId))
+      .returning({ id: schema.outboxEvents.id });
+    return renewed.length === 1;
   }
 
-  async function processOne(event: typeof schema.outboxEvents.$inferSelect): Promise<boolean> {
+  function startLeaseHeartbeat(eventId: string): {
+    stop: () => Promise<void>;
+    leaseWasLost: () => boolean;
+    heartbeatError: () => string | undefined;
+  } {
+    const intervalMs = Math.max(25, Math.floor(leaseMs / 3));
+    let stopped = false;
+    let leaseLost = false;
+    let lastHeartbeatError: string | undefined;
+    let pending = Promise.resolve();
+    const beat = async () => {
+      if (stopped || leaseLost) return;
+      const heartbeatAt = now();
+      try {
+        if (!await renewLease(eventId, new Date(heartbeatAt.getTime() + leaseMs))) {
+          leaseLost = true;
+        }
+      } catch (error) {
+        leaseLost = true;
+        lastHeartbeatError = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
+      }
+    };
+    const timer = setInterval(() => {
+      pending = pending.then(beat);
+    }, intervalMs);
+    timer.unref();
+    return {
+      stop: async () => {
+        stopped = true;
+        clearInterval(timer);
+        await pending;
+      },
+      leaseWasLost: () => leaseLost,
+      heartbeatError: () => lastHeartbeatError,
+    };
+  }
+
+  async function processOne(event: typeof schema.outboxEvents.$inferSelect): Promise<ProcessOutcome> {
     try {
       if (!SUPPORTED_AGGREGATE_TYPES.has(event.aggregateType)) {
         throw new Error(`unsupported_event_type:${event.aggregateType}`);
@@ -172,46 +214,33 @@ export function createProjectionWorker(
       // Every known aggregate feeds the user/day projection of its event day.
       const tz = await resolveTimezone(event.userId);
       await dailyState.persistDailyProjection(event.userId, await extractEventDay(event), tz);
-      return true;
+      return { kind: "success" };
     } catch (error) {
       if (String(error instanceof Error ? error.message : error).startsWith("unsupported_event_type")) {
-        // Dead-letter immediately with an operational trace, no retries.
-        await db.update(schema.outboxEvents).set({
-          status: "dead_letter",
-          lastError: `unsupported_event_type:${event.aggregateType}`,
-          lockedBy: null,
-          lockExpiresAt: null,
-        }).where(ownedEvent(event.id));
-        await db.insert(schema.interactionEvents).values({
-          userId: event.userId,
-          actor: "projection-worker",
-          stage: "projection",
-          stageCode: "unsupported_event_type",
-          detailJson: { aggregateType: event.aggregateType, eventType: event.eventType, outboxId: event.id },
-        });
-        return false;
+        return { kind: "unsupported", lastError: `unsupported_event_type:${event.aggregateType}` };
       }
       const lastError = error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500);
-      const nextAttempt = event.attempts; // already incremented at claim time
-      if (nextAttempt >= MAX_ATTEMPTS) {
-        await db.update(schema.outboxEvents).set({
-          status: "dead_letter",
-          lastError,
-          lockedBy: null,
-          lockExpiresAt: null,
-        }).where(ownedEvent(event.id));
-      } else {
-        const delay = backoffMs(nextAttempt);
-        await db.update(schema.outboxEvents).set({
-          status: "pending",
-          lastError,
-          availableAt: new Date(now().getTime() + delay),
-          lockedBy: null,
-          lockExpiresAt: null,
-        }).where(ownedEvent(event.id));
-      }
-      return false;
+      return { kind: "failed", lastError };
     }
+  }
+
+  async function recordLeaseLoss(
+    event: typeof schema.outboxEvents.$inferSelect,
+    heartbeatError?: string,
+  ): Promise<void> {
+    await db.insert(schema.interactionEvents).values({
+      userId: event.userId,
+      actor: "projection-worker",
+      stage: "projection",
+      stageCode: "lease_lost",
+      detailJson: {
+        aggregateType: event.aggregateType,
+        eventType: event.eventType,
+        outboxId: event.id,
+        workerId,
+        ...(heartbeatError ? { heartbeatError } : {}),
+      },
+    });
   }
 
   async function runOnce(
@@ -219,26 +248,90 @@ export function createProjectionWorker(
     onlyUserId?: string,
     localDate?: string,
   ): Promise<WorkerRunResult> {
-    const result: WorkerRunResult = { processed: 0, succeeded: 0, deadLettered: 0, requeued: 0 };
+    const result: WorkerRunResult = {
+      processed: 0,
+      succeeded: 0,
+      deadLettered: 0,
+      requeued: 0,
+      leaseLost: 0,
+    };
     for (let i = 0; i < batchSize; i++) {
       const event = await claimNext(runAt, onlyUserId, localDate);
       if (!event) break;
       result.processed += 1;
-      const stopHeartbeat = startLeaseHeartbeat(event.id);
-      const ok = await processOne(event).finally(stopHeartbeat);
-      if (ok) {
-        await db.update(schema.outboxEvents).set({
+      const heartbeat = startLeaseHeartbeat(event.id);
+      const outcome = await processOne(event);
+      await heartbeat.stop();
+      if (heartbeat.leaseWasLost()) {
+        result.leaseLost += 1;
+        await recordLeaseLoss(event, heartbeat.heartbeatError());
+        continue;
+      }
+
+      if (outcome.kind === "success") {
+        const completed = await db.update(schema.outboxEvents).set({
           status: "done",
           processedAt: now(),
           lockedBy: null,
           lockExpiresAt: null,
-        }).where(ownedEvent(event.id));
-        result.succeeded += 1;
+        }).where(ownedEvent(event.id)).returning({ id: schema.outboxEvents.id });
+        if (completed.length === 1) {
+          result.succeeded += 1;
+        } else {
+          result.leaseLost += 1;
+          await recordLeaseLoss(event);
+        }
+        continue;
+      }
+
+      if (outcome.kind === "unsupported") {
+        const deadLettered = await db.update(schema.outboxEvents).set({
+          status: "dead_letter",
+          lastError: outcome.lastError,
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(ownedEvent(event.id)).returning({ id: schema.outboxEvents.id });
+        if (deadLettered.length === 1) {
+          await db.insert(schema.interactionEvents).values({
+            userId: event.userId,
+            actor: "projection-worker",
+            stage: "projection",
+            stageCode: "unsupported_event_type",
+            detailJson: { aggregateType: event.aggregateType, eventType: event.eventType, outboxId: event.id },
+          });
+          result.deadLettered += 1;
+        } else {
+          result.leaseLost += 1;
+          await recordLeaseLoss(event);
+        }
+        continue;
+      }
+
+      const nextAttempt = event.attempts; // already incremented at claim time
+      const finalAttempt = nextAttempt >= MAX_ATTEMPTS;
+      const failed = await db.update(schema.outboxEvents).set(finalAttempt
+        ? {
+            status: "dead_letter",
+            lastError: outcome.lastError,
+            lockedBy: null,
+            lockExpiresAt: null,
+          }
+        : {
+            status: "pending",
+            lastError: outcome.lastError,
+            availableAt: new Date(now().getTime() + backoffMs(nextAttempt)),
+            lockedBy: null,
+            lockExpiresAt: null,
+          })
+        .where(ownedEvent(event.id))
+        .returning({ id: schema.outboxEvents.id });
+      if (failed.length === 0) {
+        result.leaseLost += 1;
+        await recordLeaseLoss(event);
+      } else if (finalAttempt) {
+        result.deadLettered += 1;
       } else {
-        const [current] = await db.select({ status: schema.outboxEvents.status })
-          .from(schema.outboxEvents).where(eq(schema.outboxEvents.id, event.id)).limit(1);
-        if (current?.status === "dead_letter") result.deadLettered += 1;
-        else result.requeued += 1;
+        result.requeued += 1;
       }
     }
     return result;

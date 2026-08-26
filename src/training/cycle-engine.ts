@@ -10,7 +10,7 @@
  * no longer forces REST. In shadow mode the recommendation stays advisory:
  * it never silently changes the active plan (plan §十).
  */
-import { and, asc, desc, eq, gte, inArray, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -169,6 +169,7 @@ export function createCycleEngine(db: Db) {
             eq(schema.healthConstraints.severity, "block"),
             isNull(schema.healthConstraints.liftedAt),
             sql`${schema.healthConstraints.activeFrom} <= ${onDate}`,
+            or(isNull(schema.healthConstraints.activeTo), sql`${schema.healthConstraints.activeTo} >= ${onDate}`),
           ))
       : [];
     const { blockedPatternsForBodyPart } = await import("./prepared-session.js");

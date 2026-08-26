@@ -13,16 +13,21 @@
  * - COMPASS_HEALTH_USER_BINDING      (required) external id of the single
  *                                     local user; no binding, no tools
  * - COMPASS_HEALTH_ACTOR             (optional) actor label, default codex-primary
+ * - COMPASS_HEALTH_ACTOR_TYPE / RUNTIME_NAME / RUNTIME_VERSION
+ * - COMPASS_HEALTH_AGENT_PROFILE / AGENT_PROFILE_VERSION
+ * - COMPASS_HEALTH_MODEL_PROVIDER / MODEL_NAME
+ *                                     (optional) formal Actor Profile fields
  * - COMPASS_HEALTH_ALLOW_USER_PROVISIONING (optional) explicit opt-in; default false
  *
- * STDIO mode never listens on a port and never reads bearer tokens: the OS
- * user that launched the process IS the principal.
+ * MCP traffic remains STDIO-only. In embedded media mode a separate,
+ * signed-URL server listens on loopback solely for bounded video bytes.
  */
 import { serveStdio, type StdioServerHandle } from "@modelcontextprotocol/server/stdio";
 
 import { initToolContext } from "../tools/context.js";
 import { assertSchemaReady } from "../db/migrate.js";
 import { startEmbeddedProjectionWorker } from "../domain/projection-worker-main.js";
+import { startMediaRuntime, type MediaRuntimeMode } from "../media/runtime-server.js";
 import { createHealthMcpServer } from "./server-core.js";
 
 async function main(): Promise<void> {
@@ -66,6 +71,15 @@ async function main(): Promise<void> {
       })
     : undefined;
   const now = testClock();
+  const mediaMode = mediaRuntimeMode(process.env.COMPASS_HEALTH_MEDIA_RUNTIME);
+  const media = await startMediaRuntime({
+    db: ctx.db,
+    mode: mediaMode,
+    ...(process.env.COMPASS_HEALTH_MEDIA_BASE_URL
+      ? { baseUrl: process.env.COMPASS_HEALTH_MEDIA_BASE_URL } : {}),
+    ...(process.env.COMPASS_HEALTH_MEDIA_SIGNING_SECRET
+      ? { signingSecret: process.env.COMPASS_HEALTH_MEDIA_SIGNING_SECRET } : {}),
+  });
 
   let handle: StdioServerHandle | undefined;
   handle = serveStdio(() => createHealthMcpServer({
@@ -74,6 +88,16 @@ async function main(): Promise<void> {
       toolContext: ctx,
       externalUserId,
       actor: process.env.COMPASS_HEALTH_ACTOR,
+      actorProfile: {
+        actorType: process.env.COMPASS_HEALTH_ACTOR_TYPE,
+        runtimeName: process.env.COMPASS_HEALTH_RUNTIME_NAME,
+        runtimeVersion: process.env.COMPASS_HEALTH_RUNTIME_VERSION,
+        agentProfile: process.env.COMPASS_HEALTH_AGENT_PROFILE,
+        agentProfileVersion: process.env.COMPASS_HEALTH_AGENT_PROFILE_VERSION,
+        modelProvider: process.env.COMPASS_HEALTH_MODEL_PROVIDER,
+        modelName: process.env.COMPASS_HEALTH_MODEL_NAME,
+      },
+      mediaStreamUrlIssuer: media.issueStreamUrl,
       ...(now ? { now } : {}),
     }), {
       legacy: "reject",
@@ -82,7 +106,7 @@ async function main(): Promise<void> {
       },
     });
   process.stderr.write(
-    `compass-health MCP: ready on stdio (binding=${externalUserId}, projection=${projectionMode})\n`,
+    `compass-health MCP: ready on stdio (binding=${externalUserId}, projection=${projectionMode}, media=${media.mode}${media.baseUrl ? `:${media.baseUrl}` : ""})\n`,
   );
 
   let shuttingDown = false;
@@ -91,12 +115,19 @@ async function main(): Promise<void> {
     shuttingDown = true;
     await handle?.close();
     await projection?.stop();
+    await media.stop();
     await ctx.close();
     process.exit(0);
   };
   process.stdin.once("end", () => void shutdown());
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+}
+
+function mediaRuntimeMode(value: string | undefined): MediaRuntimeMode {
+  const mode = value?.trim().toLowerCase() || "embedded";
+  if (mode === "embedded" || mode === "external" || mode === "off") return mode;
+  throw new RangeError("COMPASS_HEALTH_MEDIA_RUNTIME must be embedded|external|off");
 }
 
 function testClock(): (() => Date) | undefined {

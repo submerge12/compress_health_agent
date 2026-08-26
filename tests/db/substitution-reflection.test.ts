@@ -165,7 +165,7 @@ describe.skipIf(!isDbAvailable)("substitution & reflection invariants", () => {
       userId: ctx.userId,
       reflectionId,
       changes: [{
-        kind: "reorder",
+        kind: "reorder_exercises",
         dayRole: "B",
         order: ["chest_supported_row", "single_machine_row"],
       }],

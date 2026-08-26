@@ -18,6 +18,7 @@ import {
   Server,
   type InputRequests,
   type Resource,
+  type ResourceTemplateType,
   type Tool,
 } from "@modelcontextprotocol/server";
 
@@ -26,12 +27,18 @@ import { sql } from "drizzle-orm";
 import * as schema from "../db/schema.js";
 import type { Repository } from "../db/repository.js";
 import type { ToolContext } from "../tools/context.js";
+import type { MediaStreamUrlIssuer } from "../media/signed-stream-url.js";
 
 import { CACHE_TTL_MS, MCP_SERVER_NAME, MCP_SERVER_VERSION } from "./server-info.js";
 import { McpProtocolError } from "./errors.js";
-import { createPrincipalResolver, type ActorBindingOptions, type Principal } from "./auth/principal-resolver.js";
+import {
+  createPrincipalResolver,
+  verifiedActor,
+  type ActorBindingOptions,
+  type Principal,
+} from "./auth/principal-resolver.js";
 import { createResourceCatalog } from "./resources/catalog.js";
-import { createHealthToolCatalog } from "./tools/catalog.js";
+import { createHealthToolCatalog, type ToolOutcome } from "./tools/catalog.js";
 import { createRunHandleService, RunHandleError } from "./evidence/run-handles.js";
 import { createRequestStateService } from "./input/request-state.js";
 
@@ -45,6 +52,8 @@ export interface CreateHealthMcpServerOptions extends ActorBindingOptions {
   now?: () => Date;
   /** Test-only official conformance diagnostics; never enabled by stdio. */
   conformanceProfile?: boolean;
+  /** Signed stream URL issuer supplied by the headless media runtime. */
+  mediaStreamUrlIssuer?: MediaStreamUrlIssuer | null;
 }
 
 export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Server {
@@ -56,7 +65,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
   const resources = createResourceCatalog(db, repo, { now: options.now });
   const runs = createRunHandleService(db);
   const requestStates = createRequestStateService(db);
-  const verifiedActor = options.actor?.trim() || "codex-primary";
+  const configuredActor = verifiedActor(options);
 
   const server = new Server(
     { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
@@ -74,6 +83,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         "server/discover": { ttlMs: CACHE_TTL_MS.systemCapabilities, cacheScope: "public" },
         "tools/list": { ttlMs: CACHE_TTL_MS.toolCatalog, cacheScope: "public" },
         "resources/list": { ttlMs: CACHE_TTL_MS.resourceCatalog, cacheScope: "public" },
+        "resources/templates/list": { ttlMs: CACHE_TTL_MS.resourceCatalog, cacheScope: "public" },
         "resources/read": { ttlMs: 0, cacheScope: "private" },
       },
       requestState: {
@@ -81,7 +91,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
           ? state
           : requestStates.verify(state, {
               userId: options.toolContext.userId,
-              verifiedActor,
+              verifiedActor: configuredActor,
             }),
       },
     },
@@ -108,6 +118,8 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         objective: `resource read ${uri}`,
         inputChannel: "mcp-resource",
         actor: principal.actor,
+        actorId: principal.actorId,
+        actorProfile: principal.actorProfile,
       });
       runHandle = begun.runHandle;
       implicitRun = true;
@@ -129,6 +141,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
       await runs.recordStep({
         userId: principal.userId,
         runHandle,
+        actorId: principal.actorId,
         stage: "resource_read",
         mcpMethod: "resources/read",
         resourceUri: uri,
@@ -189,11 +202,23 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     }
   });
 
+  // Dynamic resources are advertised through the protocol's formal template
+  // operation. Curly-braced URIs must never appear as directly readable
+  // entries in resources/list.
+  server.setRequestHandler("resources/templates/list", async (request) => {
+    const principal = await resolveFromRequest(principalResolver, request);
+    const list = await resources.listResourceTemplates(principal);
+    return { resourceTemplates: list as ResourceTemplateType[] };
+  });
+
   // ── tools/list: P1 read tool + P2 canonical write tools ──
   const tools = createHealthToolCatalog(db, repo, {
     toolContext: options.toolContext,
     conformanceProfile: options.conformanceProfile,
     now: options.now,
+    ...(options.mediaStreamUrlIssuer !== undefined
+      ? { mediaStreamUrlIssuer: options.mediaStreamUrlIssuer }
+      : {}),
   });
   server.setRequestHandler("tools/list", async () => {
     return {
@@ -227,20 +252,67 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
         };
       }
       const requestState = ctx.mcpReq.requestState<string>();
+      const args = params.arguments ?? {};
+      const runHandle = stringArgument(args, "runHandle");
+      const attemptTracked = runHandle === undefined
+        ? false
+        : await recordToolAttempt(runs, principal, runHandle, params.name, args);
       const confirmation = acceptedContent<{ choice?: string }>(
         ctx.mcpReq.inputResponses,
         "confirmation",
       );
-      const outcome = await tools.call(params.name, {
-        principalUserId: principal.userId,
-        actor: principal.actor,
-        args: params.arguments ?? {},
-        ...(typeof requestState === "string" ? { requestState } : {}),
-        ...(confirmation?.choice ? { confirmationChoice: confirmation.choice } : {}),
-        ...(ctx.mcpReq.inputResponses ? {
-          inputResponses: ctx.mcpReq.inputResponses as Record<string, unknown>,
-        } : {}),
-      });
+      let outcome: ToolOutcome;
+      try {
+        outcome = await tools.call(params.name, {
+          principalUserId: principal.userId,
+          actor: principal.actor,
+          actorId: principal.actorId,
+          actorProfile: principal.actorProfile,
+          args,
+          ...(typeof requestState === "string" ? { requestState } : {}),
+          ...(confirmation?.choice ? { confirmationChoice: confirmation.choice } : {}),
+          ...(ctx.mcpReq.inputResponses ? {
+            inputResponses: ctx.mcpReq.inputResponses as Record<string, unknown>,
+          } : {}),
+        });
+      } catch (error) {
+        if (attemptTracked && runHandle !== undefined) {
+          await runs.recordStep({
+            userId: principal.userId,
+            runHandle,
+            actorId: principal.actorId,
+            stage: "tool_result",
+            mcpMethod: "tools/call",
+            mcpName: params.name,
+            status: "failed",
+            errorCode: "internal",
+            failureStage: "dispatch",
+            resultSummary: { resultType: "complete", errorCode: "internal" },
+          });
+        }
+        throw error;
+      }
+      if (attemptTracked && runHandle !== undefined) {
+        const terminal = terminalEvidence(params.name, outcome);
+        await runs.recordStep({
+          userId: principal.userId,
+          runHandle,
+          actorId: principal.actorId,
+          stage: "tool_result",
+          mcpMethod: "tools/call",
+          mcpName: params.name,
+          status: terminal.status,
+          ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
+          ...(terminal.failureStage ? { failureStage: terminal.failureStage } : {}),
+          allowClosed: params.name === "health_end_run",
+          resultSummary: {
+            resultType: outcome.resultType,
+            ...(terminal.errorCode ? { errorCode: terminal.errorCode } : {}),
+            ...(typeof outcome.structured?.["receiptId"] === "string"
+              ? { receiptId: outcome.structured["receiptId"] } : {}),
+          },
+        });
+      }
       if (outcome.resultType === "input_required") {
         const pending = outcome.structured as {
           requestState?: string;
@@ -263,6 +335,76 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
   );
 
   return server;
+}
+
+async function recordToolAttempt(
+  runs: ReturnType<typeof createRunHandleService>,
+  principal: Principal,
+  runHandle: string,
+  toolName: string,
+  args: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    await runs.recordStep({
+      userId: principal.userId,
+      runHandle,
+      actorId: principal.actorId,
+      stage: "tool_attempt",
+      mcpMethod: "tools/call",
+      mcpName: toolName,
+      arguments: args,
+    });
+    return true;
+  } catch (error) {
+    if (error instanceof RunHandleError) return false;
+    throw error;
+  }
+}
+
+function terminalEvidence(toolName: string, outcome: ToolOutcome): {
+  status: "ok" | "failed" | "refused" | "input_required";
+  errorCode?: string;
+  failureStage?: string;
+} {
+  if (outcome.resultType === "input_required") return { status: "input_required" };
+  if (outcome.isError !== true) return { status: "ok" };
+  const errorCode = typeof outcome.structured?.["error"] === "string"
+    ? outcome.structured["error"]
+    : "internal";
+  const refused = new Set([
+    "actor_mismatch",
+    "health_safety_block",
+    "not_found",
+    "not_owned",
+    "proposal_stale",
+    "run_handle_invalid",
+    "state_conflict",
+    "unauthorized_actor",
+  ]).has(errorCode);
+  return {
+    status: refused ? "refused" : "failed",
+    errorCode,
+    failureStage: failureStageFor(toolName, errorCode),
+  };
+}
+
+function failureStageFor(toolName: string, errorCode: string): string {
+  if (["actor_mismatch", "not_owned", "run_handle_invalid", "unauthorized_actor"].includes(errorCode)) {
+    return "authorization";
+  }
+  if (errorCode === "not_found") return "target_lookup";
+  if (["proposal_stale", "state_conflict", "idempotency_conflict", "invalid_session_state"].includes(errorCode)) {
+    return "precondition";
+  }
+  if (errorCode === "health_safety_block") return "safety";
+  if (errorCode === "domain_unavailable" && toolName === "health_replay_projection") return "projection";
+  if (errorCode === "validation_failed") return "validation";
+  return "execution";
+}
+
+function stringArgument(args: Record<string, unknown>, name: string): string | undefined {
+  const value = args[name];
+  return typeof value === "string" && value.trim() !== "" ? value.trim() : undefined;
 }
 
 const SUPPORTED_LIST = ["2026-07-28"];

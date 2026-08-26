@@ -14,6 +14,7 @@ import { and, eq, sql } from "drizzle-orm";
 
 import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
+import { resolveActor, type ActorProfileInput } from "../auth/actor-registry.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -54,6 +55,8 @@ export function createRunHandleService(db: Db) {
     objective: string;
     inputChannel?: string;
     actor?: string;
+    actorId?: string;
+    actorProfile?: ActorProfileInput;
     mode?: "production" | "shadow" | "limited_write" | "review";
     parentRunId?: string;
   }): Promise<{
@@ -62,9 +65,17 @@ export function createRunHandleService(db: Db) {
     actor: string;
     stateRevision: number;
   }> {
+    const actor = await resolveActor(db, {
+      actor: input.actor,
+      ...(input.actorProfile ? { actorProfile: input.actorProfile } : {}),
+    });
+    if (input.actorId !== undefined && input.actorId !== actor.id) {
+      throw new RunHandleError("actor_mismatch");
+    }
     const journeyId = `journey_${crypto.randomUUID()}`;
     const [run] = await db.insert(schema.agentRuns).values({
       userId: input.userId,
+      actorId: actor.id,
       journeyId,
       objective: input.objective.slice(0, 500),
       inputChannel: input.inputChannel ?? "mcp",
@@ -73,6 +84,16 @@ export function createRunHandleService(db: Db) {
       parentRunId: input.parentRunId ?? null,
     }).returning();
     if (!run) throw new Error("agent run insert returned no row");
+
+    await db.insert(schema.interactionEvents).values({
+      userId: input.userId,
+      requestId: run.id,
+      journeyId,
+      actor: `mcp:${actor.verifiedActor}`,
+      stage: "agent_run",
+      stageCode: "started",
+      detailJson: { runId: run.id, inputChannel: input.inputChannel ?? "mcp" },
+    });
 
     await db.insert(schema.agentRunSteps).values({
       runId: run.id,
@@ -85,7 +106,7 @@ export function createRunHandleService(db: Db) {
     });
 
     const stateRevision = await latestRevision(db, input.userId);
-    return { runHandle: run.id, journeyId, actor: input.actor ?? "codex-primary", stateRevision };
+    return { runHandle: run.id, journeyId, actor: actor.verifiedActor, stateRevision };
   }
 
   /**
@@ -98,6 +119,7 @@ export function createRunHandleService(db: Db) {
     outcome: "completed" | "failed" | "abandoned";
     responseSummary?: string;
     userAccepted?: boolean;
+    observedOn?: string;
   }): Promise<{ runHandle: string; outcome: string; stepCount: number }> {
     const run = await requireOwnedRun(db, input.userId, input.runHandle);
     if (run.outcome !== "running") {
@@ -130,13 +152,40 @@ export function createRunHandleService(db: Db) {
         },
       });
 
-      await tx.insert(schema.outboxEvents).values({
+      await tx.insert(schema.interactionEvents).values({
         userId: input.userId,
-        aggregateType: "user_decision",
-        aggregateId: run.id,
-        eventType: "agent.run_ended",
-        payloadJson: { outcome: input.outcome, journeyId: run.journeyId },
+        requestId: run.id,
+        journeyId: run.journeyId,
+        actor: "mcp:run-service",
+        stage: "agent_run",
+        stageCode: "ended",
+        detailJson: { runId: run.id, outcome: input.outcome },
       });
+      if (input.userAccepted !== undefined) {
+        const [decision] = await tx.insert(schema.userDecisionEvents).values({
+          userId: input.userId,
+          decisionType: input.userAccepted ? "accepted" : "rejected",
+          subjectJson: {
+            type: "agent_run_outcome",
+            runId: run.id,
+            accepted: input.userAccepted,
+            outcome: input.outcome,
+          },
+          journeyId: run.journeyId,
+        }).returning({ id: schema.userDecisionEvents.id });
+        if (!decision) throw new Error("run outcome decision insert returned no row");
+        await tx.insert(schema.outboxEvents).values({
+          userId: input.userId,
+          aggregateType: "user_decision",
+          aggregateId: decision.id,
+          eventType: "user.decision_recorded",
+          payloadJson: {
+            observedOn: input.observedOn ?? new Date().toISOString().slice(0, 10),
+            type: "agent_run_outcome",
+            runId: run.id,
+          },
+        });
+      }
     });
 
     return { runHandle: run.id, outcome: input.outcome, stepCount: await countSteps(db, run.id) };
@@ -146,7 +195,7 @@ export function createRunHandleService(db: Db) {
   async function recordStep(input: {
     userId: string;
     runHandle: string;
-    stage: "resource_read" | "tool_call" | "confirmation" | "response";
+    stage: "resource_read" | "tool_attempt" | "tool_result" | "tool_commit" | "tool_call" | "confirmation" | "response";
     mcpMethod?: string;
     mcpName?: string;
     resourceUri?: string;
@@ -154,8 +203,12 @@ export function createRunHandleService(db: Db) {
     aggregateId?: string;
     stateRevisionBefore?: number;
     stateRevisionAfter?: number;
-    status?: "ok" | "failed" | "refused";
+    status?: "ok" | "failed" | "refused" | "input_required";
     errorCode?: string;
+    failureStage?: string;
+    actorId?: string;
+    /** Only dispatch may append health_end_run's terminal result after close. */
+    allowClosed?: boolean;
     arguments?: Record<string, unknown>;
     resultSummary?: Record<string, unknown>;
   }): Promise<{ sequence: number }> {
@@ -171,7 +224,10 @@ export function createRunHandleService(db: Db) {
         .limit(1)
         .for("update");
       if (!run) throw new RunHandleError("not_found_or_not_owned");
-      if (run.outcome !== "running") throw new RunHandleError("closed");
+      if (input.actorId !== undefined && run.actorId !== input.actorId) {
+        throw new RunHandleError("actor_mismatch");
+      }
+      if (run.outcome !== "running" && input.allowClosed !== true) throw new RunHandleError("closed");
       const sequence = await nextSequence(tx, run.id);
       await tx.insert(schema.agentRunSteps).values({
         runId: run.id,
@@ -186,6 +242,7 @@ export function createRunHandleService(db: Db) {
         stateRevisionAfter: input.stateRevisionAfter ?? null,
         status: input.status ?? "ok",
         errorCode: input.errorCode ?? null,
+        failureStage: input.failureStage ?? null,
         argumentsRedactedJson: redactArguments(input.arguments),
         resultSummaryJson: input.resultSummary ?? null,
       });
@@ -193,9 +250,14 @@ export function createRunHandleService(db: Db) {
     });
   }
 
-  async function getRun(userId: string, runHandle: string) {
+  async function getRun(userId: string, runHandle: string, actorId?: string) {
     const run = await requireOwnedRun(db, userId, runHandle);
-    const [steps, receipts] = await Promise.all([
+    if (actorId !== undefined && run.actorId !== actorId) throw new RunHandleError("actor_mismatch");
+    const [actor, steps, receipts] = await Promise.all([
+      db.select().from(schema.agentActors)
+        .where(eq(schema.agentActors.id, run.actorId))
+        .limit(1)
+        .then((rows) => rows[0]),
       db.select().from(schema.agentRunSteps)
         .where(eq(schema.agentRunSteps.runId, run.id))
         .orderBy(schema.agentRunSteps.sequence),
@@ -203,7 +265,19 @@ export function createRunHandleService(db: Db) {
         .where(eq(schema.mcpWriteReceipts.runId, run.id))
         .orderBy(schema.mcpWriteReceipts.createdAt),
     ]);
+    if (!actor) throw new Error("run actor profile is missing");
     return {
+      actor: {
+        id: actor.id,
+        actorType: actor.actorType,
+        runtimeName: actor.runtimeName,
+        runtimeVersion: actor.runtimeVersion,
+        agentProfile: actor.agentProfile,
+        agentProfileVersion: actor.agentProfileVersion,
+        modelProvider: actor.modelProvider,
+        modelName: actor.modelName,
+        status: actor.status,
+      },
       run: {
         runHandle: run.id,
         journeyId: run.journeyId,
@@ -222,6 +296,7 @@ export function createRunHandleService(db: Db) {
         resourceUri: s.resourceUri,
         status: s.status,
         errorCode: s.errorCode,
+        failureStage: s.failureStage,
         aggregateType: s.aggregateType,
         aggregateId: s.aggregateId,
         stateRevisionBefore: s.stateRevisionBefore,

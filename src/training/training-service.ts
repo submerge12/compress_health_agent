@@ -10,7 +10,7 @@
  * - preparing a day filters blocked movement patterns from active
  *   constraints (strictest wins) before proposing anything.
  */
-import { and, eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
@@ -29,6 +29,20 @@ export class SessionStateError extends Error {
   readonly code = "invalid_session_state";
   constructor(readonly from: string, readonly to: string) {
     super(`cannot transition session from ${from} to ${to}`);
+  }
+}
+
+export class TrainingSetValidationError extends RangeError {
+  readonly code = "validation_failed";
+  constructor(readonly field: string, message: string) {
+    super(`${field}: ${message}`);
+  }
+}
+
+export class TrainingSafetyBlockError extends Error {
+  readonly code = "health_safety_block";
+  constructor(readonly dayRole: string, readonly blockedExerciseCount: number) {
+    super(`all ${blockedExerciseCount} exercises for day ${dayRole} are blocked by active health constraints`);
   }
 }
 
@@ -109,6 +123,7 @@ export function createTrainingService(db: Db) {
       eq(schema.healthConstraints.userId, userId),
       isNull(schema.healthConstraints.liftedAt),
       sql`${schema.healthConstraints.activeFrom} <= ${onDate}`,
+      or(isNull(schema.healthConstraints.activeTo), sql`${schema.healthConstraints.activeTo} >= ${onDate}`),
     ));
   }
 
@@ -200,6 +215,9 @@ export function createTrainingService(db: Db) {
 
     const kept = items.filter((item) => !blockedPatterns.has(String(item.movementPattern)));
     const blocked = items.filter((item) => blockedPatterns.has(String(item.movementPattern)));
+    if (items.length > 0 && kept.length === 0) {
+      throw new TrainingSafetyBlockError(dayRole, blocked.length);
+    }
 
     return {
       dayRole,
@@ -405,6 +423,7 @@ export function createTrainingService(db: Db) {
     exerciseCompleted: boolean;
     painResults: PainCommandResult[];
   }> {
+    validateTrainingSetInput(input);
     // Ownership check, replay detection, fact/outbox writes, pain escalation
     // and auto-done all happen in ONE transaction. Projection revision is only
     // assigned asynchronously by the projection worker, never fabricated here.
@@ -556,4 +575,64 @@ export function createTrainingService(db: Db) {
     readBackSession,
     listActiveConstraints,
   };
+}
+
+const MAX_PAIN_ENTRIES = 8;
+const MAX_PAIN_BODY_PART_LENGTH = 100;
+const MAX_PAIN_DESCRIPTION_LENGTH = 500;
+
+function validateTrainingSetInput(input: {
+  setNumber: number;
+  loadValue?: number | null;
+  loadUnit?: "kg" | "lb" | "bodyweight" | null;
+  reps?: number | null;
+  rir?: number | null;
+  targetMuscleFeel?: number | null;
+  pain?: TrainingSetPainInput[];
+}): void {
+  requireInteger(input.setNumber, "setNumber", 1);
+  if (input.reps !== undefined && input.reps !== null) {
+    requireInteger(input.reps, "reps", 0);
+  }
+  if (input.loadValue !== undefined && input.loadValue !== null) {
+    if (!Number.isFinite(input.loadValue) || input.loadValue < 0) {
+      throw new TrainingSetValidationError("loadValue", "must be finite and greater than or equal to zero");
+    }
+  }
+  if (input.rir !== undefined && input.rir !== null) {
+    requireInteger(input.rir, "rir", 0, 10);
+  }
+  if (input.targetMuscleFeel !== undefined && input.targetMuscleFeel !== null) {
+    requireInteger(input.targetMuscleFeel, "targetMuscleFeel", 1, 5);
+  }
+  const pain = input.pain ?? [];
+  if (pain.length > MAX_PAIN_ENTRIES) {
+    throw new TrainingSetValidationError("pain", `must contain at most ${MAX_PAIN_ENTRIES} entries`);
+  }
+  const allowedSeverities = new Set(["mild", "sharp", "worsening", "unstable", "unknown"]);
+  pain.forEach((entry, index) => {
+    const bodyPart = typeof entry.bodyPart === "string" ? entry.bodyPart.trim() : "";
+    if (bodyPart.length === 0 || bodyPart.length > MAX_PAIN_BODY_PART_LENGTH) {
+      throw new TrainingSetValidationError(
+        `pain[${index}].bodyPart`,
+        `must contain 1-${MAX_PAIN_BODY_PART_LENGTH} characters`,
+      );
+    }
+    if (!allowedSeverities.has(entry.severity)) {
+      throw new TrainingSetValidationError(`pain[${index}].severity`, "is invalid");
+    }
+    if (entry.description !== undefined && entry.description.length > MAX_PAIN_DESCRIPTION_LENGTH) {
+      throw new TrainingSetValidationError(
+        `pain[${index}].description`,
+        `must contain at most ${MAX_PAIN_DESCRIPTION_LENGTH} characters`,
+      );
+    }
+  });
+}
+
+function requireInteger(value: number, field: string, minimum: number, maximum?: number): void {
+  if (!Number.isInteger(value) || value < minimum || (maximum !== undefined && value > maximum)) {
+    const range = maximum === undefined ? `>= ${minimum}` : `between ${minimum} and ${maximum}`;
+    throw new TrainingSetValidationError(field, `must be an integer ${range}`);
+  }
 }

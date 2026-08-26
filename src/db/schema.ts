@@ -2,6 +2,7 @@ import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  check,
   date,
   doublePrecision,
   index,
@@ -557,6 +558,19 @@ export const trainingSetLogs = compass.table("training_set_logs", {
   ...timestamps()
 }, (t) => [
   unique("training_set_logs_exercise_set_key").on(t.sessionExerciseId, t.setNumber),
+  check("training_set_logs_set_number_check", sql`${t.setNumber} >= 1`),
+  check("training_set_logs_reps_check", sql`${t.reps} IS NULL OR ${t.reps} >= 0`),
+  check("training_set_logs_load_value_check", sql`${t.loadValue} IS NULL OR (
+    ${t.loadValue} >= 0
+    AND ${t.loadValue} NOT IN ('NaN'::double precision, 'Infinity'::double precision, '-Infinity'::double precision)
+  )`),
+  check("training_set_logs_rir_check", sql`${t.rir} IS NULL OR (
+    ${t.rir} = trunc(${t.rir}) AND ${t.rir} BETWEEN 0 AND 10
+  )`),
+  check("training_set_logs_target_muscle_feel_check", sql`${t.targetMuscleFeel} IS NULL OR ${t.targetMuscleFeel} BETWEEN 1 AND 5`),
+  check("training_set_logs_pain_json_check", sql`${t.painJson} IS NULL OR (
+    jsonb_typeof(${t.painJson}) = 'array' AND jsonb_array_length(${t.painJson}) <= 8
+  )`),
 ]);
 
 export const trainingReflections = compass.table("training_reflections", {
@@ -729,6 +743,7 @@ export const substitutionProposals = compass.table("substitution_proposals", {
 
 export const agentActors = compass.table("agent_actors", {
   id: uuid("id").primaryKey().defaultRandom(),
+  bindingKey: text("binding_key").notNull(),
   /** codex | pi | dsh | other | reviewer */
   actorType: text("actor_type").notNull().default("other"),
   runtimeName: text("runtime_name"),
@@ -740,13 +755,15 @@ export const agentActors = compass.table("agent_actors", {
   status: text("status").notNull().default("active"), // active | retired
   ...timestamps()
 }, (t) => [
+  uniqueIndex("agent_actors_binding_key_uidx").on(t.bindingKey),
   index("agent_actors_type_idx").on(t.actorType, t.status),
 ]);
 
 export const agentRuns = compass.table("agent_runs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
-  actorId: uuid("actor_id"),
+  actorId: uuid("actor_id").notNull()
+    .references(() => agentActors.id),
   journeyId: text("journey_id"),
   objective: text("objective"),
   inputChannel: text("input_channel").notNull().default("mcp"),
@@ -762,6 +779,7 @@ export const agentRuns = compass.table("agent_runs", {
   ...timestamps()
 }, (t) => [
   index("agent_runs_user_started_idx").on(t.userId, t.startedAt),
+  index("agent_runs_actor_idx").on(t.actorId, t.startedAt),
   index("agent_runs_journey_idx").on(t.journeyId),
 ]);
 
@@ -779,8 +797,9 @@ export const agentRunSteps = compass.table("agent_run_steps", {
   aggregateId: text("aggregate_id"),
   stateRevisionBefore: integer("state_revision_before"),
   stateRevisionAfter: integer("state_revision_after"),
-  status: text("status").notNull().default("ok"), // ok | failed | refused
+  status: text("status").notNull().default("ok"), // ok | failed | refused | input_required
   errorCode: text("error_code"),
+  failureStage: text("failure_stage"),
   /** Redacted arguments: no tokens, no free-text health bodies beyond need. */
   argumentsRedactedJson: jsonb("arguments_redacted_json").$type<Record<string, unknown>>(),
   resultSummaryJson: jsonb("result_summary_json").$type<Record<string, unknown>>(),

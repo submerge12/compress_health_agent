@@ -35,13 +35,43 @@ export interface ResourceReadResult {
 
 export const RESOURCE_URIS = [
   "health://profile",
-  "health://daily-state/{date}",
-  "health://constraints/active/{date}",
+  "health://daily-state/today",
+  "health://constraints/active/today",
   "health://plans/training/active",
-  "health://training/sessions/{sessionId}",
   "health://training/cycles/current",
-  "health://diet/logs/{date}",
+  "health://diet/logs/today",
   "health://system/capabilities",
+] as const;
+
+export const RESOURCE_TEMPLATES = [
+  {
+    uriTemplate: "health://daily-state/{date}",
+    name: "Daily health state by date",
+    description: "Rebuildable projection for one day: training, body, diet, constraints. date=YYYY-MM-DD or 'today'.",
+    mimeType: "application/json",
+    _meta: cacheHints(CACHE_TTL_MS.dailyState),
+  },
+  {
+    uriTemplate: "health://constraints/active/{date}",
+    name: "Active constraints by date",
+    description: "Un-lifted pain/activity constraints effective on a date. Read BEFORE any training advice.",
+    mimeType: "application/json",
+    _meta: cacheHints(CACHE_TTL_MS.activeConstraints),
+  },
+  {
+    uriTemplate: "health://training/sessions/{sessionId}",
+    name: "Training session by id",
+    description: "One session with exercises and logged sets.",
+    mimeType: "application/json",
+    _meta: cacheHints(CACHE_TTL_MS.inProgressSession),
+  },
+  {
+    uriTemplate: "health://diet/logs/{date}",
+    name: "Diet logs by date",
+    description: "Effective (non-superseded) diet logs for a date.",
+    mimeType: "application/json",
+    _meta: cacheHints(CACHE_TTL_MS.dailyState),
+  },
 ] as const;
 
 export function createResourceCatalog(
@@ -64,16 +94,16 @@ export function createResourceCatalog(
         _meta: cacheHints(CACHE_TTL_MS.profile),
       },
       {
-        uri: "health://daily-state/{date}",
+        uri: "health://daily-state/today",
         name: "Daily health state",
-        description: "Rebuildable projection for one day: training, body, diet, constraints. date=YYYY-MM-DD or 'today'.",
+        description: "Today's rebuildable daily health-state projection.",
         mimeType: "application/json",
         _meta: cacheHints(CACHE_TTL_MS.dailyState),
       },
       {
-        uri: "health://constraints/active/{date}",
+        uri: "health://constraints/active/today",
         name: "Active constraints",
-        description: "Un-lifted pain/activity constraints effective on a date. Read BEFORE any training advice.",
+        description: "Today's un-lifted pain/activity constraints. Read BEFORE any training advice.",
         mimeType: "application/json",
         _meta: cacheHints(CACHE_TTL_MS.activeConstraints),
       },
@@ -85,13 +115,6 @@ export function createResourceCatalog(
         _meta: cacheHints(CACHE_TTL_MS.activePlan),
       },
       {
-        uri: "health://training/sessions/{sessionId}",
-        name: "Training session",
-        description: "One session with exercises and logged sets.",
-        mimeType: "application/json",
-        _meta: cacheHints(CACHE_TTL_MS.inProgressSession),
-      },
-      {
         uri: "health://training/cycles/current",
         name: "Current cycle position",
         description: "Explicit cycle instance/positions and the engine's advisory next-day decision.",
@@ -99,8 +122,8 @@ export function createResourceCatalog(
         _meta: cacheHints(CACHE_TTL_MS.dailyState),
       },
       {
-        uri: "health://diet/logs/{date}",
-        description: "Effective (non-superseded) diet logs for a date.",
+        uri: "health://diet/logs/today",
+        description: "Today's effective (non-superseded) diet logs.",
         name: "Diet logs",
         mimeType: "application/json",
         _meta: cacheHints(CACHE_TTL_MS.dailyState),
@@ -113,6 +136,14 @@ export function createResourceCatalog(
         _meta: cacheHints(CACHE_TTL_MS.systemCapabilities),
       },
     ].sort((a, b) => String(a.uri).localeCompare(String(b.uri))); // deterministic order
+  }
+
+  async function listResourceTemplates(
+    principal: Principal,
+  ): Promise<Array<Record<string, unknown>>> {
+    void principal;
+    return [...RESOURCE_TEMPLATES]
+      .sort((a, b) => a.uriTemplate.localeCompare(b.uriTemplate));
   }
 
   async function readResource(principal: Principal, uri: string): Promise<ResourceReadResult> {
@@ -213,7 +244,7 @@ export function createResourceCatalog(
     throw new McpProtocolError("not_found", `unknown resource uri: ${uri}`);
   }
 
-  return { listResources, readResource };
+  return { listResources, listResourceTemplates, readResource };
 }
 
 function summarizeResourceRead(
