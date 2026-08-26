@@ -30,7 +30,7 @@ export interface Principal {
   userId: string;
   /** External identity string, e.g. "compass-health:1". */
   externalUserId: string;
-  /** Declared actor label (evidence only, not authorization). */
+  /** Server-verified actor label bound to runs, requestState, receipts, and evidence. */
   actor: string;
   /** Durable formal actor row bound to every run and receipt. */
   actorId: string;

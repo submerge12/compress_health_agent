@@ -45,6 +45,13 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      - name: Install headless media runtime dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+          ffmpeg -version
+          ffprobe -version
+
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
@@ -93,13 +100,6 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-
-      - name: Install headless media runtime dependency
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes ffmpeg
-          ffmpeg -version
-          ffprobe -version
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

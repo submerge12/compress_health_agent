@@ -29,8 +29,8 @@ export async function startMediaRuntime(options: {
   db: Db;
   mode: MediaRuntimeMode;
   baseUrl?: string;
-    signingSecret?: string;
-    ffmpegPath?: string;
+  signingSecret?: string;
+  ffmpegPath?: string;
   ttlMs?: number;
   now?: () => Date;
 }): Promise<MediaRuntimeHandle> {
@@ -279,7 +279,28 @@ async function renderMp4Window(
 }
 
 async function assertFfmpegAvailable(ffmpegPath: string): Promise<void> {
-  await runBinary(ffmpegPath, ["-version"], 1024 * 1024, 10_000);
+  // Exercise the same video/audio encoders and fragmented-MP4 muxer used by
+  // real requests. A version-only probe can pass even when libx264 or AAC was
+  // omitted from a custom FFmpeg build.
+  await runBinary(ffmpegPath, [
+    "-nostdin",
+    "-hide_banner",
+    "-loglevel", "error",
+    "-f", "lavfi",
+    "-i", "color=c=black:s=16x16:r=25:d=0.08",
+    "-f", "lavfi",
+    "-i", "anullsrc=r=44100:cl=mono",
+    "-t", "0.08",
+    "-map", "0:v:0",
+    "-map", "1:a:0",
+    "-c:v", "libx264",
+    "-preset", "ultrafast",
+    "-pix_fmt", "yuv420p",
+    "-c:a", "aac",
+    "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+    "-f", "mp4",
+    "pipe:1",
+  ], 1024 * 1024, 10_000);
 }
 
 function runBinary(command: string, args: string[], maxBytes: number, timeoutMs = 120_000): Promise<Buffer> {

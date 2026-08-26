@@ -220,6 +220,83 @@ describe.skipIf(!isDbAvailable)("projection worker (WO-HS-05)", () => {
     expect(totalProcessed).toBeGreaterThan(0);
   });
 
+  it("serializes same-user/day builds so an older snapshot cannot overwrite newer facts", async () => {
+    const raceDate = "2099-12-30";
+    const state = createDailyStateService(ctx.db!, ctx.repo);
+    const firstFact = await state.recordObservation({
+      userId: ctx.userId,
+      observedOn: raceDate,
+      kind: "sleep",
+      valueJson: { hours: 5 },
+      source: "projection-order-test",
+    }, { commandType: "observation.record", aggregateType: "observation" });
+    const [firstEvent] = await db.select().from(schema.outboxEvents)
+      .where(eq(schema.outboxEvents.aggregateId, firstFact.eventId));
+    if (!firstEvent) throw new Error("first projection-order event missing");
+
+    let releaseFirstBuild!: () => void;
+    let reportFirstBuilt!: () => void;
+    const firstBuilt = new Promise<void>((resolve) => { reportFirstBuilt = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirstBuild = resolve; });
+    const olderWorker = createProjectionWorker(ctx.db!, ctx.repo, {
+      workerId: "projection-order-older",
+      batchSize: 1,
+      afterProjectionBuild: async (eventId) => {
+        if (eventId !== firstEvent.id) return;
+        reportFirstBuilt();
+        await release;
+      },
+    });
+
+    const olderRun = olderWorker.runOnce(undefined, ctx.userId, raceDate);
+    await firstBuilt;
+
+    const probePool = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [probe] = await probePool.unsafe<{ acquired: boolean }[]>(
+        "SELECT pg_try_advisory_xact_lock(hashtext($1), hashtext($2)) AS acquired",
+        [ctx.userId, raceDate],
+      );
+      expect(probe?.acquired).toBe(false);
+    } finally {
+      await probePool.end({ timeout: 3 });
+    }
+
+    const secondFact = await state.recordObservation({
+      userId: ctx.userId,
+      observedOn: raceDate,
+      kind: "fatigue",
+      valueJson: { level: 8 },
+      source: "projection-order-test",
+    }, { commandType: "observation.record", aggregateType: "observation" });
+    const [secondEvent] = await db.select().from(schema.outboxEvents)
+      .where(eq(schema.outboxEvents.aggregateId, secondFact.eventId));
+    if (!secondEvent) throw new Error("second projection-order event missing");
+
+    const newerWorker = createProjectionWorker(ctx.db!, ctx.repo, {
+      workerId: "projection-order-newer",
+      batchSize: 1,
+    });
+    const newerRun = newerWorker.runOnce(undefined, ctx.userId, raceDate);
+    await waitForAttempts(secondEvent.id, 1);
+    releaseFirstBuild();
+    const [olderResult, newerResult] = await Promise.all([olderRun, newerRun]);
+    expect(olderResult).toMatchObject({ succeeded: 1, leaseLost: 0 });
+    expect(newerResult).toMatchObject({ succeeded: 1, leaseLost: 0 });
+
+    const projected = await state.getDailyProjection(ctx.userId, raceDate);
+    expect(projected?.observations.map((entry) => entry.kind)).toEqual(["sleep", "fatigue"]);
+    const rows = await Promise.all([firstEvent.id, secondEvent.id].map(async (id) => {
+      const [row] = await db.select({
+        id: schema.outboxEvents.id,
+        status: schema.outboxEvents.status,
+      }).from(schema.outboxEvents).where(eq(schema.outboxEvents.id, id));
+      return row;
+    }));
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => row?.status === "done")).toBe(true);
+  }, 20_000);
+
   it("persists a claim before processing so a second worker cannot reclaim the event", async () => {
     const [event] = await db.insert(schema.outboxEvents).values({
       userId: ctx.userId,

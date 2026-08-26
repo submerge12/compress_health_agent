@@ -19,7 +19,7 @@ import { and, asc, eq, isNull, or, sql } from "drizzle-orm";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
-import type { Repository } from "../db/repository.js";
+import { createRepository, type Repository } from "../db/repository.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -97,6 +97,21 @@ export interface DailyStateReadModel {
 }
 
 type ProjectionStatus = "fresh" | "lagging" | "failed" | "rebuilding";
+
+/**
+ * Serialize projection builds for one user/day inside the caller's current
+ * PostgreSQL transaction. Hash collisions only reduce concurrency; they
+ * cannot weaken correctness.
+ */
+export async function acquireDailyProjectionTransactionLock(
+  db: Db,
+  userId: string,
+  localDate: string,
+): Promise<void> {
+  await db.execute(sql`
+    SELECT pg_advisory_xact_lock(hashtext(${userId}), hashtext(${localDate}))
+  `);
+}
 
 export function createDailyStateService(db: Db, repo: Repository) {
   // ── Facts ────────────────────────────────────────────────────────────────
@@ -302,13 +317,22 @@ export function createDailyStateService(db: Db, repo: Repository) {
     timezone: string,
     status: ProjectionStatus = "fresh",
   ): Promise<DailyStateReadModel> {
-    return persistBuiltProjection(await buildDailyState(userId, localDate, timezone), status);
+    return db.transaction(async (tx) => {
+      const transactionDb = tx as unknown as Db;
+      await acquireDailyProjectionTransactionLock(transactionDb, userId, localDate);
+      const transactionState = createDailyStateService(
+        transactionDb,
+        createRepository(transactionDb),
+      );
+      const state = await transactionState.buildDailyState(userId, localDate, timezone);
+      return transactionState.persistBuiltProjection(state, status);
+    });
   }
 
   /**
-   * Persist an already-built read model. A projection worker can call this on
-   * a transaction-scoped service after locking and re-checking its outbox
-   * lease, so a stale worker never mutates the projection.
+   * Persist an already-built read model. The caller must hold the user/day
+   * transaction lock above; projection workers also lock and re-check their
+   * outbox lease in that same transaction.
    */
   async function persistBuiltProjection(
     state: DailyStateReadModel,

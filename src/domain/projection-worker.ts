@@ -18,8 +18,8 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 
 import * as schema from "../db/schema.js";
 import {
+  acquireDailyProjectionTransactionLock,
   createDailyStateService,
-  type DailyStateReadModel,
   type DailyStateService,
 } from "./daily-state.js";
 import { createTimezoneResolver, createUserLocalDateResolver } from "./timezone.js";
@@ -77,11 +77,18 @@ export interface ProjectionWorkerOptions {
   renewLease?: (eventId: string, expiresAt: Date, workerId: string) => Promise<boolean>;
   /** Test/fault seam used to hold projection work without taking database locks. */
   beforeProjection?: (eventId: string) => Promise<void>;
+  /** Test/fault seam called after the read model has been built but before it is persisted. */
+  afterProjectionBuild?: (eventId: string) => Promise<void>;
 }
 
 type ProcessOutcome =
-  | { kind: "success"; state: DailyStateReadModel }
+  | { kind: "success"; localDate: string }
   | { kind: "unsupported"; lastError: string }
+  | { kind: "failed"; lastError: string };
+
+type CommitOutcome =
+  | { kind: "success" }
+  | { kind: "lease_lost" }
   | { kind: "failed"; lastError: string };
 
 export class ProjectionReplayError extends Error {
@@ -225,10 +232,7 @@ export function createProjectionWorker(
         throw new Error(`unsupported_event_type:${event.aggregateType}`);
       }
       await options.beforeProjection?.(event.id);
-      // Every known aggregate feeds the user/day projection of its event day.
-      const tz = await resolveTimezone(event.userId);
-      const state = await dailyState.buildDailyState(event.userId, await extractEventDay(event), tz);
-      return { kind: "success", state };
+      return { kind: "success", localDate: await extractEventDay(event) };
     } catch (error) {
       if (String(error instanceof Error ? error.message : error).startsWith("unsupported_event_type")) {
         return { kind: "unsupported", lastError: `unsupported_event_type:${event.aggregateType}` };
@@ -259,34 +263,50 @@ export function createProjectionWorker(
 
   async function commitSuccessfulProjection(
     event: typeof schema.outboxEvents.$inferSelect,
-    state: DailyStateReadModel,
-  ): Promise<boolean> {
-    return db.transaction(async (tx) => {
-      const commitAt = now();
-      const [owned] = await tx.select({ id: schema.outboxEvents.id })
-        .from(schema.outboxEvents)
-        .where(activelyOwnedEvent(event.id, commitAt))
-        .limit(1)
-        .for("update");
-      if (!owned) return false;
+    localDate: string,
+  ): Promise<CommitOutcome> {
+    try {
+      const committed = await db.transaction(async (tx) => {
+        const commitAt = now();
+        const [owned] = await tx.select({ id: schema.outboxEvents.id })
+          .from(schema.outboxEvents)
+          .where(activelyOwnedEvent(event.id, commitAt))
+          .limit(1)
+          .for("update");
+        if (!owned) return false;
 
-      const transactionDb = tx as unknown as Db;
-      const transactionState = createDailyStateService(
-        transactionDb,
-        createRepository(transactionDb),
-      );
-      await transactionState.persistBuiltProjection(state);
-      const completed = await tx.update(schema.outboxEvents).set({
-        status: "done",
-        processedAt: commitAt,
-        lockedBy: null,
-        lockExpiresAt: null,
-      }).where(activelyOwnedEvent(event.id, commitAt)).returning({ id: schema.outboxEvents.id });
-      if (completed.length !== 1) {
-        throw new Error("projection lease changed while its row was locked");
-      }
-      return true;
-    });
+        const transactionDb = tx as unknown as Db;
+        await acquireDailyProjectionTransactionLock(transactionDb, event.userId, localDate);
+        const transactionState = createDailyStateService(
+          transactionDb,
+          createRepository(transactionDb),
+        );
+        const transactionTimezone = createTimezoneResolver(transactionDb);
+        const state = await transactionState.buildDailyState(
+          event.userId,
+          localDate,
+          await transactionTimezone(event.userId),
+        );
+        await options.afterProjectionBuild?.(event.id);
+        await transactionState.persistBuiltProjection(state);
+        const completed = await tx.update(schema.outboxEvents).set({
+          status: "done",
+          processedAt: commitAt,
+          lockedBy: null,
+          lockExpiresAt: null,
+        }).where(activelyOwnedEvent(event.id, commitAt)).returning({ id: schema.outboxEvents.id });
+        if (completed.length !== 1) {
+          throw new Error("projection lease changed while its row was locked");
+        }
+        return true;
+      });
+      return committed ? { kind: "success" } : { kind: "lease_lost" };
+    } catch (error) {
+      return {
+        kind: "failed",
+        lastError: error instanceof Error ? error.message.slice(0, 500) : String(error).slice(0, 500),
+      };
+    }
   }
 
   async function runOnce(
@@ -306,7 +326,7 @@ export function createProjectionWorker(
       if (!event) break;
       result.processed += 1;
       const heartbeat = startLeaseHeartbeat(event.id);
-      const outcome = await processOne(event);
+      let outcome = await processOne(event);
       await heartbeat.stop();
       if (heartbeat.leaseWasLost()) {
         result.leaseLost += 1;
@@ -315,13 +335,17 @@ export function createProjectionWorker(
       }
 
       if (outcome.kind === "success") {
-        if (await commitSuccessfulProjection(event, outcome.state)) {
+        const commit = await commitSuccessfulProjection(event, outcome.localDate);
+        if (commit.kind === "success") {
           result.succeeded += 1;
-        } else {
+          continue;
+        }
+        if (commit.kind === "lease_lost") {
           result.leaseLost += 1;
           await recordLeaseLoss(event);
+          continue;
         }
-        continue;
+        outcome = commit;
       }
 
       if (outcome.kind === "unsupported") {
