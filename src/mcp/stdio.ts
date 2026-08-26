@@ -16,6 +16,8 @@
  * - COMPASS_HEALTH_ACTOR_TYPE / RUNTIME_NAME / RUNTIME_VERSION
  * - COMPASS_HEALTH_AGENT_PROFILE / AGENT_PROFILE_VERSION
  * - COMPASS_HEALTH_MODEL_PROVIDER / MODEL_NAME
+ * - COMPASS_HEALTH_SENSITIVE_PAYLOAD_KEY (optional, 32+ characters; without it raw free text is dropped)
+ * - COMPASS_HEALTH_SENSITIVE_PAYLOAD_KEY_VERSION (optional, default v1)
  *                                     (optional) formal Actor Profile fields
  * - COMPASS_HEALTH_FFMPEG_PATH         (optional) ffmpeg executable for exact
  *                                     embedded media-window rendering
@@ -31,6 +33,7 @@ import { assertSchemaReady } from "../db/migrate.js";
 import { startEmbeddedProjectionWorker } from "../domain/projection-worker-main.js";
 import { startMediaRuntime, type MediaRuntimeMode } from "../media/runtime-server.js";
 import { createHealthMcpServer } from "./server-core.js";
+import { createSensitivePayloadService } from "./evidence/sensitive-payloads.js";
 
 async function main(): Promise<void> {
   const databaseUrl = process.env.DATABASE_URL
@@ -59,6 +62,10 @@ async function main(): Promise<void> {
     process.stderr.write("compass-health MCP: database-backed context is required\n");
     process.exit(2);
   }
+
+  // Retention cleanup is key-independent: expired ciphertext is crypto-shred
+  // on every server start even when this process is configured read-only.
+  await createSensitivePayloadService(ctx.db).purgeExpired();
 
   const projectionMode = process.env.COMPASS_HEALTH_PROJECTION_WORKER_MODE
     ?? (process.env.NODE_ENV === "test" ? "disabled" : "embedded");

@@ -15,6 +15,15 @@ import { and, eq, sql } from "drizzle-orm";
 import * as schema from "../../db/schema.js";
 import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import { resolveActor, type ActorProfileInput } from "../auth/actor-registry.js";
+import {
+  redactEvidenceRecord,
+  redactEvidenceValue,
+  SENSITIVE_RETENTION_POLICY,
+} from "./privacy-policy.js";
+import {
+  createSensitivePayloadService,
+  type SensitivePayloadServiceOptions,
+} from "./sensitive-payloads.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -25,27 +34,17 @@ export class RunHandleError extends Error {
   }
 }
 
+export { redactEvidenceValue };
+
 /** Redact tool arguments before persisting them as evidence. */
 export function redactArguments(args: Record<string, unknown> | undefined): Record<string, unknown> {
-  if (!args) return {};
-  const REDACT_KEYS = new Set([
-    "token", "password", "secret", "apiKey", "api_key", "authorization",
-    "description", "notes", "reason", "objective", "responseSummary",
-  ]);
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(args)) {
-    if (REDACT_KEYS.has(key)) {
-      out[key] = typeof value === "string" ? `<redacted:${value.length}>` : "<redacted>";
-    } else if (value !== null && typeof value === "object" && !Array.isArray(value)) {
-      out[key] = redactArguments(value as Record<string, unknown>);
-    } else {
-      out[key] = value;
-    }
-  }
-  return out;
+  return redactEvidenceRecord(args);
 }
 
-export function createRunHandleService(db: Db) {
+export function createRunHandleService(
+  db: Db,
+  options: { sensitivePayloads?: SensitivePayloadServiceOptions } = {},
+) {
   /**
    * Begin a run. The actor label is recorded for attribution; authorization
    * was already resolved from the transport binding.
@@ -65,48 +64,61 @@ export function createRunHandleService(db: Db) {
     actor: string;
     stateRevision: number;
   }> {
-    const actor = await resolveActor(db, {
-      actor: input.actor,
-      ...(input.actorProfile ? { actorProfile: input.actorProfile } : {}),
-    });
-    if (input.actorId !== undefined && input.actorId !== actor.id) {
-      throw new RunHandleError("actor_mismatch");
-    }
-    const journeyId = `journey_${crypto.randomUUID()}`;
-    const [run] = await db.insert(schema.agentRuns).values({
-      userId: input.userId,
-      actorId: actor.id,
-      journeyId,
-      objective: input.objective.slice(0, 500),
-      inputChannel: input.inputChannel ?? "mcp",
-      mode: input.mode ?? "production",
-      outcome: "running",
-      parentRunId: input.parentRunId ?? null,
-    }).returning();
-    if (!run) throw new Error("agent run insert returned no row");
+    return db.transaction(async (tx) => {
+      const transactionDb = tx as unknown as Db;
+      const actor = await resolveActor(transactionDb, {
+        actor: input.actor,
+        ...(input.actorProfile ? { actorProfile: input.actorProfile } : {}),
+      });
+      if (input.actorId !== undefined && input.actorId !== actor.id) {
+        throw new RunHandleError("actor_mismatch");
+      }
+      const objective = await createSensitivePayloadService(
+        transactionDb,
+        options.sensitivePayloads,
+      ).protectText({
+        userId: input.userId,
+        payloadType: "agent_objective",
+        plaintext: input.objective.slice(0, 500),
+        retentionDays: SENSITIVE_RETENTION_POLICY.agentObjective.days,
+      });
+      const journeyId = `journey_${crypto.randomUUID()}`;
+      const [run] = await tx.insert(schema.agentRuns).values({
+        userId: input.userId,
+        actorId: actor.id,
+        journeyId,
+        objective: objective.evidenceText.slice(0, 500),
+        objectivePayloadId: objective.payloadId,
+        inputChannel: input.inputChannel ?? "mcp",
+        mode: input.mode ?? "production",
+        outcome: "running",
+        parentRunId: input.parentRunId ?? null,
+      }).returning();
+      if (!run) throw new Error("agent run insert returned no row");
 
-    await db.insert(schema.interactionEvents).values({
-      userId: input.userId,
-      requestId: run.id,
-      journeyId,
-      actor: `mcp:${actor.verifiedActor}`,
-      stage: "agent_run",
-      stageCode: "started",
-      detailJson: { runId: run.id, inputChannel: input.inputChannel ?? "mcp" },
-    });
+      await tx.insert(schema.interactionEvents).values({
+        userId: input.userId,
+        requestId: run.id,
+        journeyId,
+        actor: `mcp:${actor.verifiedActor}`,
+        stage: "agent_run",
+        stageCode: "started",
+        detailJson: { runId: run.id, inputChannel: input.inputChannel ?? "mcp" },
+      });
 
-    await db.insert(schema.agentRunSteps).values({
-      runId: run.id,
-      sequence: 0,
-      stage: "response",
-      mcpMethod: "tools/call",
-      mcpName: "health_begin_run",
-      status: "ok",
-      resultSummaryJson: { objective: `<redacted:${input.objective.length}>`, channel: input.inputChannel ?? "mcp" },
-    });
+      await tx.insert(schema.agentRunSteps).values({
+        runId: run.id,
+        sequence: 0,
+        stage: "response",
+        mcpMethod: "tools/call",
+        mcpName: "health_begin_run",
+        status: "ok",
+        resultSummaryJson: { objective: objective.evidenceText, channel: input.inputChannel ?? "mcp" },
+      });
 
-    const stateRevision = await latestRevision(db, input.userId);
-    return { runHandle: run.id, journeyId, actor: actor.verifiedActor, stateRevision };
+      const stateRevision = await latestRevision(transactionDb, input.userId);
+      return { runHandle: run.id, journeyId, actor: actor.verifiedActor, stateRevision };
+    });
   }
 
   /**
@@ -132,12 +144,27 @@ export function createRunHandleService(db: Db) {
           outcome: input.outcome,
           finishedAt: new Date(),
           updatedAt: new Date(),
-          ...(input.responseSummary !== undefined
-            ? { responseSummary: input.responseSummary.slice(0, 1000) } : {}),
         })
         .where(and(eq(schema.agentRuns.id, run.id), eq(schema.agentRuns.outcome, "running")))
         .returning({ id: schema.agentRuns.id });
       if (updated.length === 0) return; // concurrent endRun won; keep first
+
+      if (input.responseSummary !== undefined) {
+        const responseSummary = await createSensitivePayloadService(
+          tx as unknown as Db,
+          options.sensitivePayloads,
+        ).protectText({
+          userId: input.userId,
+          payloadType: "agent_response_summary",
+          plaintext: input.responseSummary.slice(0, 1000),
+          retentionDays: SENSITIVE_RETENTION_POLICY.agentResponseSummary.days,
+        });
+        await tx.update(schema.agentRuns).set({
+          responseSummary: responseSummary.evidenceText.slice(0, 1000),
+          responseSummaryPayloadId: responseSummary.payloadId,
+          updatedAt: new Date(),
+        }).where(eq(schema.agentRuns.id, run.id));
+      }
 
       await tx.insert(schema.agentRunSteps).values({
         runId: run.id,
@@ -244,7 +271,9 @@ export function createRunHandleService(db: Db) {
         errorCode: input.errorCode ?? null,
         failureStage: input.failureStage ?? null,
         argumentsRedactedJson: redactArguments(input.arguments),
-        resultSummaryJson: input.resultSummary ?? null,
+        resultSummaryJson: input.resultSummary === undefined
+          ? null
+          : redactArguments(input.resultSummary),
       });
       return { sequence };
     });
@@ -282,6 +311,9 @@ export function createRunHandleService(db: Db) {
         runHandle: run.id,
         journeyId: run.journeyId,
         objective: run.objective,
+        objectivePayloadRef: run.objectivePayloadId,
+        responseSummary: run.responseSummary,
+        responseSummaryPayloadRef: run.responseSummaryPayloadId,
         mode: run.mode,
         inputChannel: run.inputChannel,
         outcome: run.outcome,
@@ -301,8 +333,12 @@ export function createRunHandleService(db: Db) {
         aggregateId: s.aggregateId,
         stateRevisionBefore: s.stateRevisionBefore,
         stateRevisionAfter: s.stateRevisionAfter,
-        argumentsRedacted: s.argumentsRedactedJson ?? {},
-        resultSummary: s.resultSummaryJson,
+        // Re-apply current policy on read so legacy rows written before a new
+        // sensitive-key rule cannot leak through evidence retrieval.
+        argumentsRedacted: redactArguments(s.argumentsRedactedJson ?? {}),
+        resultSummary: s.resultSummaryJson === null
+          ? null
+          : redactArguments(s.resultSummaryJson),
       })),
       receipts: receipts.map((receipt) => ({
         receiptId: receipt.id,

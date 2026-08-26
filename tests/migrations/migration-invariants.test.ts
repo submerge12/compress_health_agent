@@ -99,6 +99,37 @@ describe("migrations (live, throwaway databases)", () => {
       WHERE table_schema='compass_health' AND table_name='diet_logs'
         AND column_name='idempotency_key'`;
     expect(columnCount[0]?.n).toBe(1);
+
+    // Re-running the privacy migration must remove legacy free text without
+    // needing an application encryption key inside SQL migration tooling.
+    const [legacyEvidenceUser] = await sql`
+      INSERT INTO compass_health.users (external_id)
+      VALUES (${"migration-legacy-evidence"}) RETURNING id`;
+    const [legacyActor] = await sql`
+      INSERT INTO compass_health.agent_actors
+        (binding_key, actor_type, runtime_name, agent_profile)
+      VALUES (${"migration-legacy-evidence-actor"}, 'codex', 'migration-test', 'migration-test')
+      RETURNING id`;
+    const [legacyRun] = await sql`
+      INSERT INTO compass_health.agent_runs
+        (user_id, actor_id, objective, response_summary)
+      VALUES (
+        ${legacyEvidenceUser!.id}::uuid,
+        ${legacyActor!.id}::uuid,
+        'private legacy shoulder pain objective',
+        'private legacy shoulder pain response'
+      )
+      RETURNING id`;
+    const privacyScript = await import("node:fs/promises").then((fs) =>
+      fs.readFile(join(MIGRATIONS_DIR, "0024_evidence_privacy.sql"), "utf8"),
+    );
+    await sql.unsafe(privacyScript);
+    const [redactedRun] = await sql`
+      SELECT objective, response_summary, objective_payload_id, response_summary_payload_id
+      FROM compass_health.agent_runs WHERE id = ${legacyRun!.id}::uuid`;
+    expect(String(redactedRun?.objective)).toMatch(/^<legacy-redacted:/);
+    expect(String(redactedRun?.response_summary)).toMatch(/^<legacy-redacted:/);
+    expect(JSON.stringify(redactedRun)).not.toContain("shoulder pain");
     await sql.end({ timeout: 3 });
 
     await assertSchemaReady(cleanUrl);

@@ -57,6 +57,11 @@ import { createCycleEngine } from "../../training/cycle-engine.js";
 import { handleSmartGenerateMealPlan } from "../../tools/handlers.js";
 import type { NutritionEstimateResult } from "../../tools/nutrition-estimate.js";
 import { createRunHandleService } from "../evidence/run-handles.js";
+import { SENSITIVE_RETENTION_POLICY } from "../evidence/privacy-policy.js";
+import {
+  createSensitivePayloadService,
+  type SensitivePayloadServiceOptions,
+} from "../evidence/sensitive-payloads.js";
 import { createResourceCatalog } from "../resources/catalog.js";
 import {
   createRequestStateService,
@@ -259,12 +264,13 @@ export function createHealthToolCatalog(
     now?: () => Date;
     /** null means explicitly disabled; undefined preserves legacy BFF paths. */
     mediaStreamUrlIssuer?: MediaStreamUrlIssuer | null;
+    sensitivePayloads?: SensitivePayloadServiceOptions;
   } = {},
 ) {
-  const runs = createRunHandleService(db);
+  const runs = createRunHandleService(db, { sensitivePayloads: options.sensitivePayloads });
   const diet = createDietLogService(db, repo);
   const requestStates = createRequestStateService(db);
-  const writes = createWriteCommandService(db);
+  const writes = createWriteCommandService(db, { sensitivePayloads: options.sensitivePayloads });
   const getUserLocalDate = createUserLocalDateResolver(db, options.now);
   const resourceCatalog = createResourceCatalog(db, repo, { now: options.now });
 
@@ -536,7 +542,7 @@ export function createHealthToolCatalog(
       inputSchema: {
         type: "object",
         properties: {
-          objective: { type: "string", description: "What this journey tries to do (one line)." },
+          objective: { type: "string", maxLength: 500, description: "What this journey tries to do (one line)." },
           inputChannel: { type: "string", enum: ["gpt-live", "xiaomi-voice", "mcp", "web"] },
           idempotencyKey: { type: "string" },
         },
@@ -565,7 +571,7 @@ export function createHealthToolCatalog(
         properties: {
           runHandle: { type: "string" },
           outcome: { type: "string", enum: ["completed", "failed", "abandoned"] },
-          responseSummary: { type: "string" },
+          responseSummary: { type: "string", maxLength: 1000 },
           userAccepted: { type: "boolean" },
           idempotencyKey: { type: "string" },
         },
@@ -584,12 +590,27 @@ export function createHealthToolCatalog(
         const result = await writes.execute(
           writeInput(inv, "health_end_run", runHandle),
           async (tx) => {
+            const rawResponseSummary = optStr(inv.args, "responseSummary");
+            const protectedResponseSummary = rawResponseSummary === undefined
+              ? undefined
+              : await createSensitivePayloadService(
+                  tx as unknown as Db,
+                  options.sensitivePayloads,
+                ).protectText({
+                  userId: inv.principalUserId,
+                  payloadType: "agent_response_summary",
+                  plaintext: rawResponseSummary.slice(0, 1000),
+                  retentionDays: SENSITIVE_RETENTION_POLICY.agentResponseSummary.days,
+                });
             const [updated] = await tx.update(schema.agentRuns).set({
               outcome,
               finishedAt: new Date(),
               updatedAt: new Date(),
-              ...(optStr(inv.args, "responseSummary")
-                ? { responseSummary: optStr(inv.args, "responseSummary")!.slice(0, 1000) }
+              ...(protectedResponseSummary
+                ? {
+                    responseSummary: protectedResponseSummary.evidenceText.slice(0, 1000),
+                    responseSummaryPayloadId: protectedResponseSummary.payloadId,
+                  }
                 : {}),
             }).where(and(
               eq(schema.agentRuns.id, runHandle),

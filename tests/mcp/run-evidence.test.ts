@@ -4,7 +4,10 @@ import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 
 import * as schema from "../../src/db/schema.js";
-import { createRunHandleService } from "../../src/mcp/evidence/run-handles.js";
+import {
+  createRunHandleService,
+  redactArguments,
+} from "../../src/mcp/evidence/run-handles.js";
 
 const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgres://compass:compass@localhost:5433/compass_health";
@@ -13,6 +16,40 @@ const isDbAvailable = await postgres(DATABASE_URL, { max: 1, connect_timeout: 3 
   .unsafe("SELECT 1")
   .then(() => true)
   .catch(() => false);
+
+describe("run evidence privacy", () => {
+  it("recursively redacts sensitive fields inside arrays and nested arrays", () => {
+    const sensitiveTerms = [
+      "right shoulder sharp pain",
+      "reduce pressing volume",
+      "bench still hurts",
+      "pain worsened on rep three",
+      "raw voice transcript",
+      "private coach feedback",
+    ];
+    const redacted = redactArguments({
+      pain: [{ bodyPart: "right_shoulder", description: sensitiveTerms[0] }],
+      changes: [{ kind: "reduce_sets", reason: sensitiveTerms[1] }],
+      unresolvedIssues: [sensitiveTerms[2]],
+      painSummary: [{ severity: "sharp", notes: sensitiveTerms[3] }],
+      nested: [[{ rawTranscript: sensitiveTerms[4] }]],
+      feedback: sensitiveTerms[5],
+      safe: { severity: "sharp", setNumber: 3 },
+    });
+
+    const serialized = JSON.stringify(redacted);
+    for (const term of sensitiveTerms) expect(serialized).not.toContain(term);
+    expect(redacted).toMatchObject({
+      pain: [{ bodyPart: "right_shoulder", description: expect.stringContaining("<redacted") }],
+      changes: [{ kind: "reduce_sets", reason: expect.stringContaining("<redacted") }],
+      unresolvedIssues: expect.stringContaining("<redacted"),
+      painSummary: expect.stringContaining("<redacted"),
+      nested: [[{ rawTranscript: expect.stringContaining("<redacted") }]],
+      feedback: expect.stringContaining("<redacted"),
+      safe: { severity: "sharp", setNumber: 3 },
+    });
+  });
+});
 
 describe.skipIf(!isDbAvailable)("run evidence concurrency and lifecycle", () => {
   const pool = postgres(DATABASE_URL, { max: 12, prepare: false });
@@ -50,7 +87,14 @@ describe.skipIf(!isDbAvailable)("run evidence concurrency and lifecycle", () => 
         resourceUri: `health://test/${index}`,
         aggregateType: "test_resource",
         aggregateId: String(index),
-        resultSummary: { index, safe: true },
+        resultSummary: index === 7
+          ? {
+              index,
+              safe: true,
+              pain: [{ description: "private result pain narrative" }],
+              changes: [{ reason: "private result adjustment reason" }],
+            }
+          : { index, safe: true },
       })));
     const allocated = recorded.map((step) => step.sequence);
     expect(new Set(allocated).size).toBe(recorded.length);
@@ -63,13 +107,19 @@ describe.skipIf(!isDbAvailable)("run evidence concurrency and lifecycle", () => 
     );
 
     const evidence = await runs.getRun(user!.id, begun.runHandle);
-    expect(evidence.steps).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        aggregateType: "test_resource",
-        aggregateId: "7",
-        resultSummary: { index: 7, safe: true },
-      }),
-    ]));
+    const resultStep = evidence.steps.find((step) => step.aggregateId === "7");
+    expect(resultStep).toMatchObject({
+      aggregateType: "test_resource",
+      aggregateId: "7",
+      resultSummary: {
+        index: 7,
+        safe: true,
+        pain: [{ description: expect.stringContaining("<redacted") }],
+        changes: [{ reason: expect.stringContaining("<redacted") }],
+      },
+    });
+    expect(JSON.stringify(resultStep)).not.toContain("private result pain narrative");
+    expect(JSON.stringify(resultStep)).not.toContain("private result adjustment reason");
 
     await runs.endRun({
       userId: user!.id,

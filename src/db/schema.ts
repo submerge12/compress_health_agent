@@ -742,6 +742,26 @@ export const substitutionProposals = compass.table("substitution_proposals", {
 // High-level structure of one agent user journey. interaction_events stays the
 // low-level domain log; runs/steps index it without copying payloads.
 
+export const sensitivePayloads = compass.table("sensitive_payloads", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: userId(),
+  payloadType: text("payload_type").notNull(),
+  /** AES-GCM envelope; NULL only after retention cleanup crypto-shreds it. */
+  ciphertext: text("ciphertext"),
+  keyVersion: text("key_version").notNull(),
+  contentHash: text("content_hash").notNull(),
+  contentLength: integer("content_length").notNull(),
+  metadataJson: jsonb("metadata_json").$type<Record<string, unknown>>().notNull().default(sql`'{}'::jsonb`),
+  retentionUntil: timestamp("retention_until", { withTimezone: true }).notNull(),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  ...timestamps(),
+}, (t) => [
+  index("sensitive_payloads_user_type_idx").on(t.userId, t.payloadType, t.createdAt),
+  index("sensitive_payloads_retention_idx").on(t.retentionUntil, t.deletedAt),
+  check("sensitive_payloads_length_check", sql`${t.contentLength} >= 0`),
+  check("sensitive_payloads_ciphertext_lifecycle_check", sql`${t.ciphertext} is not null or ${t.deletedAt} is not null`),
+]);
+
 export const agentActors = compass.table("agent_actors", {
   id: uuid("id").primaryKey().defaultRandom(),
   bindingKey: text("binding_key").notNull(),
@@ -760,6 +780,22 @@ export const agentActors = compass.table("agent_actors", {
   index("agent_actors_type_idx").on(t.actorType, t.status),
 ]);
 
+export const sensitivePayloadAccessGrants = compass.table("sensitive_payload_access_grants", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  payloadId: uuid("payload_id").notNull()
+    .references(() => sensitivePayloads.id, { onDelete: "cascade" }),
+  reviewerActorId: uuid("reviewer_actor_id").notNull()
+    .references(() => agentActors.id, { onDelete: "cascade" }),
+  grantedByActorId: uuid("granted_by_actor_id").notNull()
+    .references(() => agentActors.id),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  ...timestamps(),
+}, (t) => [
+  unique("sensitive_payload_access_grants_payload_reviewer_key")
+    .on(t.payloadId, t.reviewerActorId),
+  index("sensitive_payload_access_grants_reviewer_idx").on(t.reviewerActorId, t.revokedAt),
+]);
+
 export const agentRuns = compass.table("agent_runs", {
   id: uuid("id").primaryKey().defaultRandom(),
   userId: userId(),
@@ -767,6 +803,8 @@ export const agentRuns = compass.table("agent_runs", {
     .references(() => agentActors.id),
   journeyId: text("journey_id"),
   objective: text("objective"),
+  objectivePayloadId: uuid("objective_payload_id")
+    .references(() => sensitivePayloads.id, { onDelete: "set null" }),
   inputChannel: text("input_channel").notNull().default("mcp"),
   /** production | shadow | limited_write | review */
   mode: text("mode").notNull().default("production"),
@@ -775,6 +813,8 @@ export const agentRuns = compass.table("agent_runs", {
   /** running | completed | failed | abandoned */
   outcome: text("outcome").notNull().default("running"),
   responseSummary: text("response_summary"),
+  responseSummaryPayloadId: uuid("response_summary_payload_id")
+    .references(() => sensitivePayloads.id, { onDelete: "set null" }),
   parentRunId: uuid("parent_run_id"),
   comparisonGroupId: uuid("comparison_group_id"),
   ...timestamps()

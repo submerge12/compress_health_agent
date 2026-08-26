@@ -111,6 +111,14 @@ describe("database schema", () => {
     expect(schema.dailyHealthStateProjection).toHaveProperty("schemaVersion");
   });
 
+  test("test_agent_evidence_uses_encrypted_sensitive_payload_references", () => {
+    expect(schema.sensitivePayloads).toHaveProperty("ciphertext");
+    expect(schema.sensitivePayloads).toHaveProperty("retentionUntil");
+    expect(schema.sensitivePayloadAccessGrants).toHaveProperty("reviewerActorId");
+    expect(schema.agentRuns).toHaveProperty("objectivePayloadId");
+    expect(schema.agentRuns).toHaveProperty("responseSummaryPayloadId");
+  });
+
   test("test_connection_module_imports_without_requiring_a_live_query", async () => {
     const connection = await import("../../src/db/connection.js");
 

@@ -40,6 +40,7 @@ import {
 import { createResourceCatalog } from "./resources/catalog.js";
 import { createHealthToolCatalog, type ToolOutcome } from "./tools/catalog.js";
 import { createRunHandleService, RunHandleError } from "./evidence/run-handles.js";
+import type { SensitivePayloadServiceOptions } from "./evidence/sensitive-payloads.js";
 import { createRequestStateService } from "./input/request-state.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
@@ -54,6 +55,7 @@ export interface CreateHealthMcpServerOptions extends ActorBindingOptions {
   conformanceProfile?: boolean;
   /** Signed stream URL issuer supplied by the headless media runtime. */
   mediaStreamUrlIssuer?: MediaStreamUrlIssuer | null;
+  sensitivePayloads?: SensitivePayloadServiceOptions;
 }
 
 export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Server {
@@ -63,7 +65,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     expectedUserId: options.toolContext.userId,
   });
   const resources = createResourceCatalog(db, repo, { now: options.now });
-  const runs = createRunHandleService(db);
+  const runs = createRunHandleService(db, { sensitivePayloads: options.sensitivePayloads });
   const requestStates = createRequestStateService(db);
   const configuredActor = verifiedActor(options);
 
@@ -216,6 +218,7 @@ export function createHealthMcpServer(options: CreateHealthMcpServerOptions): Se
     toolContext: options.toolContext,
     conformanceProfile: options.conformanceProfile,
     now: options.now,
+    sensitivePayloads: options.sensitivePayloads,
     ...(options.mediaStreamUrlIssuer !== undefined
       ? { mediaStreamUrlIssuer: options.mediaStreamUrlIssuer }
       : {}),

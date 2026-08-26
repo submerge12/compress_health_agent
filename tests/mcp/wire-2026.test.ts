@@ -97,6 +97,7 @@ class WireClient {
     mediaRuntime?: "embedded" | "external" | "off";
     allowUserProvisioning?: boolean;
     testNow?: string;
+    sensitivePayloadKey?: string;
   } = {}) {
     const binding = options.externalUserId ?? externalUserId;
     testExternalUserIds.add(binding);
@@ -114,6 +115,12 @@ class WireClient {
           options.allowUserProvisioning === false ? "false" : "true",
         COMPASS_HEALTH_MEDIA_RUNTIME: options.mediaRuntime ?? "off",
         ...(options.testNow ? { COMPASS_HEALTH_TEST_NOW: options.testNow } : {}),
+        ...(options.sensitivePayloadKey
+          ? {
+              COMPASS_HEALTH_SENSITIVE_PAYLOAD_KEY: options.sensitivePayloadKey,
+              COMPASS_HEALTH_SENSITIVE_PAYLOAD_KEY_VERSION: "wire-test-v1",
+            }
+          : {}),
         NODE_ENV: "test",
       },
       stdio: "pipe",
@@ -664,6 +671,57 @@ describe("MCP 2026-07-28 stdio wire", () => {
         lifecycle_outbox: 0,
         decision_outbox: 1,
       });
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 25_000);
+
+  it("keeps objective and response summary plaintext out of wire-level run evidence", async () => {
+    const binding = `mcp-wire-private-evidence-${process.pid}-${Date.now()}`;
+    const client = new WireClient({
+      externalUserId: binding,
+      sensitivePayloadKey: "wire-test-sensitive-payload-key-with-at-least-32-characters",
+    });
+    clients.push(client);
+    const objective = "private objective about sharp right shoulder pain";
+    const responseSummary = "private response summary about unresolved shoulder pain";
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective,
+      idempotencyKey: "wire-private-evidence-begin",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const ended = await client.request(toolCall(2, "health_end_run", {
+      runHandle,
+      outcome: "completed",
+      responseSummary,
+      idempotencyKey: "wire-private-evidence-end",
+    }));
+    expect(ended.result?.resultType).toBe("complete");
+    const evidence = await client.request(toolCall(3, "health_get_run_evidence", { runHandle }));
+    const evidenceJson = JSON.stringify(evidence.result?.structuredContent);
+    expect(evidenceJson).not.toContain(objective);
+    expect(evidenceJson).not.toContain(responseSummary);
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [run] = await sql`
+        SELECT objective, response_summary, objective_payload_id, response_summary_payload_id
+        FROM compass_health.agent_runs
+        WHERE id = ${runHandle}::uuid`;
+      expect(String(run?.objective)).not.toContain(objective);
+      expect(String(run?.response_summary)).not.toContain(responseSummary);
+      expect(run?.objective_payload_id).toEqual(expect.any(String));
+      expect(run?.response_summary_payload_id).toEqual(expect.any(String));
+      const payloads = await sql`
+        SELECT payload_type, ciphertext, content_hash, content_length
+        FROM compass_health.sensitive_payloads
+        WHERE id IN (${run!.objective_payload_id}::uuid, ${run!.response_summary_payload_id}::uuid)
+        ORDER BY payload_type`;
+      expect(payloads).toHaveLength(2);
+      expect(JSON.stringify(payloads)).not.toContain(objective);
+      expect(JSON.stringify(payloads)).not.toContain(responseSummary);
+      expect(payloads.every((payload) => /^[a-f0-9]{64}$/.test(String(payload.content_hash))))
+        .toBe(true);
     } finally {
       await sql.end({ timeout: 3 });
     }

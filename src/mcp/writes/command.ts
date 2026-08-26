@@ -5,6 +5,11 @@ import * as schema from "../../db/schema.js";
 import { hashArguments, type HealthTransaction } from "../input/request-state.js";
 import { redactArguments } from "../evidence/run-handles.js";
 import { resolveActor, type ActorProfileInput } from "../auth/actor-registry.js";
+import { SENSITIVE_RETENTION_POLICY } from "../evidence/privacy-policy.js";
+import {
+  createSensitivePayloadService,
+  type SensitivePayloadServiceOptions,
+} from "../evidence/sensitive-payloads.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -58,7 +63,10 @@ export interface BeginRunInput {
  * transaction. This module then performs read-back, records run evidence,
  * and writes the idempotency receipt before the same transaction commits.
  */
-export function createWriteCommandService(db: Db) {
+export function createWriteCommandService(
+  db: Db,
+  options: { sensitivePayloads?: SensitivePayloadServiceOptions } = {},
+) {
   async function beginRun(input: BeginRunInput): Promise<WriteCommandResult> {
     const argumentHash = hashArguments(input.arguments);
     return db.transaction(async (tx) => {
@@ -99,12 +107,22 @@ export function createWriteCommandService(db: Db) {
         };
       }
 
+      const protectedObjective = await createSensitivePayloadService(
+        tx as unknown as Db,
+        options.sensitivePayloads,
+      ).protectText({
+        userId: input.userId,
+        payloadType: "agent_objective",
+        plaintext: input.objective.slice(0, 500),
+        retentionDays: SENSITIVE_RETENTION_POLICY.agentObjective.days,
+      });
       const journeyId = `journey_${crypto.randomUUID()}`;
       const [run] = await tx.insert(schema.agentRuns).values({
         userId: input.userId,
         actorId: actor.id,
         journeyId,
-        objective: input.objective.slice(0, 500),
+        objective: protectedObjective.evidenceText.slice(0, 500),
+        objectivePayloadId: protectedObjective.payloadId,
         inputChannel: input.inputChannel,
         mode: "production",
         outcome: "running",
