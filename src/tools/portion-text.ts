@@ -1,5 +1,5 @@
 const QUANTITY_PATTERN = String.raw`(?:\d+(?:\.\d+)?|[零〇一二两三四五六七八九十半]+)`;
-const COUNT_UNIT_PATTERN = String.raw`(?:个|只|颗|枚|碗|杯|份|片|根|勺|汤匙|茶匙|pieces?|piece|bowls?|bowl|cups?|cup|servings?|serving)`;
+const COUNT_UNIT_PATTERN = String.raw`(?:个|只|颗|枚|碗|杯|份|片|根|把|棵|勺|汤匙|茶匙|pieces?|piece|bowls?|bowl|cups?|cup|servings?|serving)`;
 
 const GRAMS = new RegExp(`(${QUANTITY_PATTERN})\\s*(?:g|grams?|克)`, "i");
 const MILLILITERS = new RegExp(`(${QUANTITY_PATTERN})\\s*(?:ml|milliliters?|毫升)`, "i");

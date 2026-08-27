@@ -656,6 +656,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
     for (const [journey, required] of Object.entries(coverage)) {
       expect(required.filter((name) => !names.has(name)), `${journey} missing tools`).toEqual([]);
     }
+    const mealTool = discoveredTools.find((tool) => tool.name === "health_log_meal")!;
+    expect(mealTool.inputSchema.required).toEqual(expect.arrayContaining(["items", "resolutionMode"]));
     expect(names).toContain("health_get_run_evidence");
     for (const name of [
       "health_get_daily_state",
@@ -1850,6 +1852,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
       date: generatedBody.startDate,
       mealType: "lunch",
       description: "牛肉150克",
+      items: [{ name: "牛肉", quantity: 150, unit: "克" }],
+      resolutionMode: "confirm",
       idempotencyKey: "wire-diet-plan-actual",
     }));
     expect(actual.result?.resultType).toBe("complete");
@@ -1912,6 +1916,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
       date: "2026-08-23",
       mealType: "lunch",
       description: "150g rice",
+      items: [{ name: "rice", quantity: 150, unit: "g" }],
+      resolutionMode: "confirm",
       idempotencyKey: "wire-meal-candidate-once",
     };
     const pending = await client.request(toolCall(2, "health_log_meal", args));
@@ -1981,6 +1987,7 @@ describe("MCP 2026-07-28 stdio wire", () => {
         { name: "水煮鸡蛋", quantity: 2, unit: "个" },
         { name: "无糖原味豆浆", quantity: 600, unit: "ml" },
       ],
+      resolutionMode: "confirm",
       idempotencyKey: "wire-chinese-breakfast-once",
     };
 
@@ -2036,6 +2043,103 @@ describe("MCP 2026-07-28 stdio wire", () => {
     }
   }, 30_000);
 
+  it("lets the Agent record an uncertain colloquial lunch without another user question", async () => {
+    const binding = `mcp-wire-colloquial-lunch-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire Agent-converted colloquial lunch",
+      idempotencyKey: "wire-run-colloquial-lunch",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const args = {
+      runHandle,
+      date: "2026-08-27",
+      mealType: "lunch",
+      description: "中午吃的一个烧饼，蒜蓉粉丝娃娃菜虾；虾大概是200g带壳，粉丝一把，娃娃菜一个",
+      items: [
+        { name: "烧饼", quantity: 1, unit: "个" },
+        { name: "带壳虾", quantity: 200, unit: "克" },
+        { name: "粉丝", quantity: 1, unit: "把" },
+        { name: "娃娃菜", quantity: 1, unit: "个" },
+      ],
+      resolutionMode: "agent_estimate",
+      idempotencyKey: "wire-colloquial-lunch-once",
+    };
+
+    const logged = await client.request(toolCall(2, "health_log_meal", args));
+    expect(logged.result?.resultType).toBe("complete");
+    const body = logged.result?.structuredContent as {
+      dietLogId: string;
+      receiptId: string;
+      replayed: boolean;
+    };
+    expect(body).toMatchObject({
+      dietLogId: expect.any(String),
+      receiptId: expect.any(String),
+      replayed: false,
+    });
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const [row] = await sql<Array<{
+        ingredients_json: Array<{ slug: string; grams: number }>;
+        uncertain: boolean;
+        estimate_confidence: number;
+        pending_count: number;
+      }>>`
+        SELECT
+          log.ingredients_json,
+          log.uncertain,
+          log.estimate_confidence,
+          (
+            SELECT count(*)::int
+            FROM compass_health.mcp_pending_input_requests pending
+            WHERE pending.run_id = ${runHandle}::uuid
+              AND pending.tool_name = 'health_log_meal'
+          ) AS pending_count
+        FROM compass_health.diet_logs log
+        WHERE log.id = ${body.dietLogId}::uuid`;
+      expect(row).toMatchObject({ uncertain: true, estimate_confidence: 0, pending_count: 0 });
+      expect(row!.ingredients_json).toEqual(expect.arrayContaining([
+        { slug: "烧饼", grams: 100 },
+        { slug: "glass_noodles", grams: 50 },
+        { slug: "baby_napa", grams: 200 },
+      ]));
+      expect(row!.ingredients_json).toHaveLength(4);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 30_000);
+
+  it("rejects description-only meal calls before they can trigger a user question", async () => {
+    const binding = `mcp-wire-description-only-meal-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire reject legacy description-only meal",
+      idempotencyKey: "wire-run-description-only-meal",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+
+    const rejected = await client.request(toolCall(2, "health_log_meal", {
+      runHandle,
+      date: "2026-08-27",
+      mealType: "lunch",
+      description: "一个烧饼和一把粉丝",
+      idempotencyKey: "wire-description-only-meal",
+    }));
+
+    expect(rejected.result).toMatchObject({
+      resultType: "complete",
+      isError: true,
+      structuredContent: {
+        error: "validation_failed",
+        message: "items must be a non-empty Agent-converted array",
+      },
+    });
+  }, 20_000);
+
   it("keeps an ambiguous meal correction pending until its chosen candidate is confirmed", async () => {
     const binding = `mcp-wire-correct-meal-${process.pid}-${Date.now()}`;
     const client = new WireClient({ externalUserId: binding });
@@ -2050,6 +2154,8 @@ describe("MCP 2026-07-28 stdio wire", () => {
       date: "2026-08-18",
       mealType: "lunch",
       description: "牛肉150克",
+      items: [{ name: "牛肉", quantity: 150, unit: "克" }],
+      resolutionMode: "confirm",
       idempotencyKey: "wire-correct-meal-base",
     }));
     const originalLogId = (logged.result?.structuredContent as { dietLogId: string }).dietLogId;
@@ -2186,6 +2292,11 @@ describe("MCP 2026-07-28 stdio wire", () => {
       date: "2026-08-19",
       mealType: "dinner",
       description: "150g rice、100g mystery food",
+      items: [
+        { name: "rice", quantity: 150, unit: "g" },
+        { name: "mystery food", quantity: 100, unit: "g" },
+      ],
+      resolutionMode: "confirm",
       idempotencyKey: "wire-multi-meal",
     };
     const pending = await client.request(toolCall(2, "health_log_meal", args));

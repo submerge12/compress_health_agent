@@ -120,6 +120,8 @@ describe.skipIf(!isDbAvailable)("MCP write tools + run handles + MRTR (P2)", () 
     const res = await call("health_log_meal", {
       runHandle, mealType: "lunch",
       description: "牛肉150克",
+      items: [{ name: "牛肉", quantity: 150, unit: "克" }],
+      resolutionMode: "confirm",
       idempotencyKey: `p2-meal-${Date.now()}`,
     });
     const body = JSON.parse(res.content[0]!.text) as { dietLogId?: string; replayed?: boolean; error?: string };

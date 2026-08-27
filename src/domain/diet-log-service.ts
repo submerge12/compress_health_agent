@@ -21,7 +21,11 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as schema from "../db/schema.js";
 import type { Repository } from "../db/repository.js";
 import { handleNutritionEstimate } from "../tools/handlers.js";
-import type { NutritionEstimateResult } from "../tools/nutrition-estimate.js";
+import type {
+  NutritionEstimateResult,
+  NutritionResolutionMode,
+} from "../tools/nutrition-estimate.js";
+import { FALLBACK_FOOD_SLUG } from "../tools/nutrition-estimate.js";
 import type { ToolContext } from "../tools/context.js";
 import { aggregateNutrition } from "../engine/nutrition.js";
 import { resolveNaturalPortion } from "../engine/natural-units.js";
@@ -71,12 +75,14 @@ export function createDietLogService(db: Db, repo: Repository) {
     description: string;
     date: string;
     mealType: string;
+    resolutionMode?: NutritionResolutionMode;
   }): Promise<DietPreview> {
     const estimate = await handleNutritionEstimate(ctx, input);
-    const needsConfirmation =
+    const needsConfirmation = input.resolutionMode !== "agent_estimate" && (
       (estimate.needsConfirmation?.length ?? 0) > 0 ||
       (estimate.unmatched?.length ?? 0) > 0 ||
-      estimate.uncertain === true;
+      estimate.uncertain === true
+    );
     return { status: needsConfirmation ? "needs_confirmation" : "ok", estimate };
   }
 
@@ -165,7 +171,13 @@ export function createDietLogService(db: Db, repo: Repository) {
           mealType: input.mealType,
           description: input.description,
           source: input.source ?? "agent",
-          ingredientsJson: estimate.items.map((item) => ({ slug: item.slug, grams: item.grams } as Record<string, unknown>)) as Array<Record<string, unknown>>,
+          ingredientsJson: [
+            ...estimate.items.map((item) => ({ slug: item.slug, grams: item.grams })),
+            ...(estimate.fallbackEstimates ?? []).map((item) => ({
+              slug: FALLBACK_FOOD_SLUG,
+              grams: item.grams,
+            })),
+          ] as Array<Record<string, unknown>>,
           seasoningsJson: [],
           caloriesKcal: estimate.kcal,
           proteinGrams: estimate.proteinGrams,

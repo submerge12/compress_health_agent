@@ -76,22 +76,6 @@ import type { ActorProfileInput } from "../auth/actor-registry.js";
 type Db = PostgresJsDatabase<typeof schema>;
 
 const ISO_DATE = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
-const MEAL_ITEM_UNITS = [
-  "g",
-  "克",
-  "ml",
-  "毫升",
-  "个",
-  "只",
-  "颗",
-  "枚",
-  "碗",
-  "杯",
-  "份",
-  "片",
-  "根",
-] as const;
-type MealItemUnit = typeof MEAL_ITEM_UNITS[number];
 const PLAN_TARGET_PROPERTIES = {
   dayRole: { type: "string", enum: ["A", "B", "C"] },
   exerciseSlug: { type: "string", minLength: 1 },
@@ -450,12 +434,10 @@ export function createHealthToolCatalog(
    */
   function mealDescriptionForEstimate(args: Record<string, unknown>): string {
     const rawItems = args["items"];
-    if (rawItems === undefined || rawItems === null) return str(args, "description");
     if (!Array.isArray(rawItems) || rawItems.length === 0) {
-      throw new RangeError("items must be a non-empty array when provided");
+      throw new RangeError("items must be a non-empty Agent-converted array");
     }
 
-    const allowedUnits = new Set<string>(MEAL_ITEM_UNITS);
     return rawItems.map((rawItem, index) => {
       if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
         throw new RangeError(`items[${index}] must be an object`);
@@ -468,9 +450,19 @@ export function createHealthToolCatalog(
       if (!Number.isFinite(quantity) || quantity <= 0) {
         throw new RangeError(`items[${index}].quantity must be greater than zero`);
       }
-      if (!allowedUnits.has(unit)) throw new RangeError(`items[${index}].unit is invalid`);
-      return `${quantity}${unit as MealItemUnit}${name}`;
+      if (!unit || unit.length > 30 || /[,，、;；+]/.test(unit)) {
+        throw new RangeError(`items[${index}].unit is invalid`);
+      }
+      return `${quantity}${unit}${name}`;
     }).join("，");
+  }
+
+  function mealResolutionMode(args: Record<string, unknown>): "confirm" | "agent_estimate" {
+    const mode = str(args, "resolutionMode");
+    if (mode !== "confirm" && mode !== "agent_estimate") {
+      throw new RangeError("resolutionMode must be confirm or agent_estimate");
+    }
+    return mode;
   }
 
   function acceptedSelections(responses: Record<string, unknown> | undefined): Record<string, string> {
@@ -1282,7 +1274,7 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_log_meal",
-      description: "Log a meal after converting the user's natural language into structured food items. Preserve the user's original words in description; put each resolved food name, quantity, and unit in items. The server validates catalog matches and portions, and returns standard MCP input_required only for genuine ambiguity.",
+      description: "Log a meal only after the Agent converts the user's natural language into structured food items. Preserve the user's original words in description. items and resolutionMode are mandatory: use confirm when the user wants candidate confirmation; use agent_estimate when the user asked the Agent to handle uncertainty without another question. agent_estimate persists low-confidence assumptions as uncertain instead of silently treating them as exact.",
       risk: "revocable-write",
       inputSchema: {
         type: "object",
@@ -1301,16 +1293,26 @@ export function createHealthToolCatalog(
               properties: {
                 name: { type: "string", minLength: 1, maxLength: 200 },
                 quantity: { type: "number", exclusiveMinimum: 0 },
-                unit: { type: "string", enum: MEAL_ITEM_UNITS },
+                unit: {
+                  type: "string",
+                  minLength: 1,
+                  maxLength: 30,
+                  description: "Reported or Agent-normalized unit, including catalog units such as 个、把、棵、克、毫升.",
+                },
               },
               required: ["name", "quantity", "unit"],
               additionalProperties: false,
             },
           },
+          resolutionMode: {
+            type: "string",
+            enum: ["confirm", "agent_estimate"],
+            description: "confirm uses MRTR for ambiguity; agent_estimate records explicit low-confidence assumptions without asking again.",
+          },
           idempotencyKey: { type: "string", description: "Stable key for retries." },
           expectedRevision: { type: "number" },
         },
-        required: ["runHandle", "mealType", "description", "idempotencyKey"],
+        required: ["runHandle", "mealType", "description", "items", "resolutionMode", "idempotencyKey"],
       },
       execute: async (inv) => {
         await requireRun(inv);
@@ -1385,6 +1387,7 @@ export function createHealthToolCatalog(
             description: mealDescriptionForEstimate(inv.args),
             date: optStr(inv.args, "date") ?? await today(inv.principalUserId),
             mealType: str(inv.args, "mealType"),
+            resolutionMode: mealResolutionMode(inv.args),
           });
           if (previewResult.status === "needs_confirmation") {
             const date = optStr(inv.args, "date") ?? await today(inv.principalUserId);

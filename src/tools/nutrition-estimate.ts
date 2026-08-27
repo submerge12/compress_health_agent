@@ -35,7 +35,11 @@ export interface MealCatalog {
 
 export interface NutritionEstimateInput {
   description: string;
+  /** confirm preserves MRTR; agent_estimate records low-confidence assumptions without another question. */
+  resolutionMode?: NutritionResolutionMode;
 }
+
+export type NutritionResolutionMode = "confirm" | "agent_estimate";
 
 export interface FoodMatchCandidateSummary {
   slug: string;
@@ -67,6 +71,14 @@ export interface FallbackEstimateDiagnostic {
   assumption: string;
 }
 
+export interface BestEffortEstimateDiagnostic {
+  segment: string;
+  slug: string;
+  grams: number;
+  confidence: "low";
+  assumption: string;
+}
+
 export interface NutritionEstimateResult extends NutrientSnapshot {
   description: string;
   items: NutritionEntry[];
@@ -74,6 +86,7 @@ export interface NutritionEstimateResult extends NutrientSnapshot {
   unmatched?: FoodResolutionDiagnostic[];
   basisWarnings?: WeightBasisDiagnostic[];
   fallbackEstimates?: FallbackEstimateDiagnostic[];
+  bestEffortEstimates?: BestEffortEstimateDiagnostic[];
   uncertain?: boolean;
 }
 
@@ -103,6 +116,7 @@ interface MatchedFood {
   food: FoodCatalogRecord;
   label: string;
   score: number;
+  estimatedMatch?: boolean;
 }
 
 const SPLIT_PATTERN = /\s*(?:\+|,|，|、|;|；|\band\b)\s*|(?<=[一-鿿])\s+(?=\d)/;
@@ -127,7 +141,7 @@ export function nutritionEstimate(
 ): NutritionEstimateResult {
   const fields = requireInputObject(input, "input");
   const description = requireText(fields.description, "description");
-  const resolution = resolveMealItems(description, catalog);
+  const resolution = resolveMealItems(description, catalog, resolutionMode(fields.resolutionMode));
   return nutritionEstimateFromResolution(description, catalog, resolution);
 }
 
@@ -138,7 +152,12 @@ export async function nutritionEstimateWithSemanticFallback(
 ): Promise<NutritionEstimateResult> {
   const fields = requireInputObject(input, "input");
   const description = requireText(fields.description, "description");
-  const resolution = await resolveMealItemsWithSemanticFallback(description, catalog, options);
+  const resolution = await resolveMealItemsWithSemanticFallback(
+    description,
+    catalog,
+    options,
+    resolutionMode(fields.resolutionMode),
+  );
   return nutritionEstimateFromResolution(description, catalog, resolution);
 }
 
@@ -201,9 +220,14 @@ interface MealResolution {
   needsConfirmation: FoodResolutionDiagnostic[];
   unmatched: FoodResolutionDiagnostic[];
   basisWarnings: WeightBasisDiagnostic[];
+  bestEffortEstimates: BestEffortEstimateDiagnostic[];
 }
 
-function resolveMealItems(description: string, catalog: MealCatalog): MealResolution {
+function resolveMealItems(
+  description: string,
+  catalog: MealCatalog,
+  mode: NutritionResolutionMode = "confirm",
+): MealResolution {
   validateCatalog(catalog);
   const safeDescription = requireText(description, "description");
   const segments = safeDescription.split(SPLIT_PATTERN).map((part) => part.trim()).filter(Boolean);
@@ -211,13 +235,17 @@ function resolveMealItems(description: string, catalog: MealCatalog): MealResolu
   const needsConfirmation: FoodResolutionDiagnostic[] = [];
   const unmatched: FoodResolutionDiagnostic[] = [];
   const basisWarnings: WeightBasisDiagnostic[] = [];
+  const bestEffortEstimates: BestEffortEstimateDiagnostic[] = [];
 
   for (const segment of segments) {
-    const resolution = parseMealSegment(segment, catalog);
+    const resolution = parseMealSegment(segment, catalog, mode);
     if (resolution.kind === "matched") {
       items.push(resolution.item);
       if (resolution.basisWarning !== undefined) {
         basisWarnings.push(resolution.basisWarning);
+      }
+      if (resolution.bestEffortEstimate !== undefined) {
+        bestEffortEstimates.push(resolution.bestEffortEstimate);
       }
     } else if (resolution.kind === "needs_confirmation") {
       needsConfirmation.push({ segment, candidates: resolution.candidates });
@@ -226,13 +254,14 @@ function resolveMealItems(description: string, catalog: MealCatalog): MealResolu
     }
   }
 
-  return { items, needsConfirmation, unmatched, basisWarnings };
+  return { items, needsConfirmation, unmatched, basisWarnings, bestEffortEstimates };
 }
 
 async function resolveMealItemsWithSemanticFallback(
   description: string,
   catalog: MealCatalog,
   options: SemanticNutritionResolutionOptions,
+  mode: NutritionResolutionMode = "confirm",
 ): Promise<MealResolution> {
   validateCatalog(catalog);
   const safeDescription = requireText(description, "description");
@@ -241,13 +270,17 @@ async function resolveMealItemsWithSemanticFallback(
   const needsConfirmation: FoodResolutionDiagnostic[] = [];
   const unmatched: FoodResolutionDiagnostic[] = [];
   const basisWarnings: WeightBasisDiagnostic[] = [];
+  const bestEffortEstimates: BestEffortEstimateDiagnostic[] = [];
 
   for (const segment of segments) {
-    const resolution = await parseMealSegmentWithSemanticFallback(segment, catalog, options);
+    const resolution = await parseMealSegmentWithSemanticFallback(segment, catalog, options, mode);
     if (resolution.kind === "matched") {
       items.push(resolution.item);
       if (resolution.basisWarning !== undefined) {
         basisWarnings.push(resolution.basisWarning);
+      }
+      if (resolution.bestEffortEstimate !== undefined) {
+        bestEffortEstimates.push(resolution.bestEffortEstimate);
       }
     } else if (resolution.kind === "needs_confirmation") {
       needsConfirmation.push({ segment, candidates: resolution.candidates });
@@ -256,17 +289,26 @@ async function resolveMealItemsWithSemanticFallback(
     }
   }
 
-  return { items, needsConfirmation, unmatched, basisWarnings };
+  return { items, needsConfirmation, unmatched, basisWarnings, bestEffortEstimates };
 }
 
 type SegmentResolution =
-  | { kind: "matched"; item: NutritionEntry; basisWarning?: WeightBasisDiagnostic }
+  | {
+      kind: "matched";
+      item: NutritionEntry;
+      basisWarning?: WeightBasisDiagnostic;
+      bestEffortEstimate?: BestEffortEstimateDiagnostic;
+    }
   | { kind: "needs_confirmation"; candidates: FoodMatchCandidateSummary[] }
   | { kind: "unmatched"; candidates: FoodMatchCandidateSummary[] };
 
-function parseMealSegment(segment: string, catalog: MealCatalog): SegmentResolution {
+function parseMealSegment(
+  segment: string,
+  catalog: MealCatalog,
+  mode: NutritionResolutionMode,
+): SegmentResolution {
   const candidates = rankFoodCandidates(segment, catalog, CANDIDATE_LIMIT);
-  const match = selectFoodMatch(candidates);
+  const match = selectFoodMatch(candidates, mode);
   if (match.kind !== "matched") return match;
 
   try {
@@ -276,8 +318,12 @@ function parseMealSegment(segment: string, catalog: MealCatalog): SegmentResolut
       kind: "matched",
       item: { slug: match.food.slug, grams: resolved.grams },
       basisWarning: basisWarningForSegment(segment, match.food, resolved.source),
+      ...(match.estimatedMatch === true
+        ? { bestEffortEstimate: bestEffortCandidate(segment, match.food.slug, resolved.grams) }
+        : {}),
     };
   } catch {
+    if (mode === "agent_estimate") return bestEffortPortion(segment, match, catalog);
     return { kind: "unmatched", candidates: summarizeCandidates(candidates) };
   }
 }
@@ -286,6 +332,7 @@ async function parseMealSegmentWithSemanticFallback(
   segment: string,
   catalog: MealCatalog,
   options: SemanticNutritionResolutionOptions,
+  mode: NutritionResolutionMode,
 ): Promise<SegmentResolution> {
   let candidates = rankFoodCandidates(segment, catalog, CANDIDATE_LIMIT);
   const [bestLexical] = candidates;
@@ -296,7 +343,7 @@ async function parseMealSegmentWithSemanticFallback(
     }
   }
 
-  const match = selectFoodMatch(candidates);
+  const match = selectFoodMatch(candidates, mode);
   if (match.kind !== "matched") return match;
 
   try {
@@ -306,8 +353,12 @@ async function parseMealSegmentWithSemanticFallback(
       kind: "matched",
       item: { slug: match.food.slug, grams: resolved.grams },
       basisWarning: basisWarningForSegment(segment, match.food, resolved.source),
+      ...(match.estimatedMatch === true
+        ? { bestEffortEstimate: bestEffortCandidate(segment, match.food.slug, resolved.grams) }
+        : {}),
     };
   } catch {
+    if (mode === "agent_estimate") return bestEffortPortion(segment, match, catalog);
     return { kind: "unmatched", candidates: summarizeCandidates(candidates) };
   }
 }
@@ -359,7 +410,10 @@ function hasDryBasisCue(segment: string): boolean {
     /[\u5e72\u751f][\u91cd\u7684]?/.test(segment);
 }
 
-function selectFoodMatch(candidates: readonly FoodMatchCandidate[]): ({ kind: "matched" } & MatchedFood)
+function selectFoodMatch(
+  candidates: readonly FoodMatchCandidate[],
+  mode: NutritionResolutionMode,
+): ({ kind: "matched" } & MatchedFood)
   | { kind: "needs_confirmation"; candidates: FoodMatchCandidateSummary[] }
   | { kind: "unmatched"; candidates: FoodMatchCandidateSummary[] } {
   const [best, second] = candidates;
@@ -368,9 +422,68 @@ function selectFoodMatch(candidates: readonly FoodMatchCandidate[]): ({ kind: "m
     return { kind: "unmatched", candidates: summaries };
   }
   if (best.score < HIGH_CONFIDENCE || isAmbiguous(best, second)) {
+    if (mode === "agent_estimate") {
+      return {
+        kind: "matched",
+        food: best.food,
+        label: best.label,
+        score: best.score,
+        estimatedMatch: true,
+      };
+    }
     return { kind: "needs_confirmation", candidates: summaries };
   }
   return { kind: "matched", food: best.food, label: best.label, score: best.score };
+}
+
+function bestEffortPortion(
+  segment: string,
+  match: MatchedFood,
+  catalog: MealCatalog,
+): SegmentResolution {
+  const portion = extractExplicitPortion(segment);
+  const count = portion?.match(/^(\d+(?:\.\d+)?)(.+)$/);
+  const quantity = count?.[1] === undefined ? 1 : Number(count[1]);
+  const unit = count?.[2] ?? "default portion";
+  const naturalUnits = catalog.naturalUnits.filter((entry) => entry.foodSlug === match.food.slug);
+  const genericCounter = /^(?:个|棵|只|颗|枚|根|片|份|piece|serving)$/i.test(unit);
+  const soleNaturalUnit = genericCounter && naturalUnits.length === 1 ? naturalUnits[0] : undefined;
+  const grams = soleNaturalUnit !== undefined
+    ? roundTo(quantity * soleNaturalUnit.grams, 3)
+    : roundTo(quantity * (match.food.defaultGrams ?? 100), 3);
+  const assumptions = [
+    ...(match.estimatedMatch === true ? ["used the highest-ranked catalog candidate"] : []),
+    [
+      soleNaturalUnit !== undefined
+        ? `mapped ${unit} to the food's only catalog natural unit`
+        : `estimated ${unit} from the food's representative portion`,
+    ],
+  ].flat();
+  return {
+    kind: "matched",
+    item: { slug: match.food.slug, grams },
+    bestEffortEstimate: {
+      segment,
+      slug: match.food.slug,
+      grams,
+      confidence: "low",
+      assumption: assumptions.join("; "),
+    },
+  };
+}
+
+function bestEffortCandidate(
+  segment: string,
+  slug: string,
+  grams: number,
+): BestEffortEstimateDiagnostic {
+  return {
+    segment,
+    slug,
+    grams,
+    confidence: "low",
+    assumption: "used the highest-ranked catalog candidate",
+  };
 }
 
 function summarizeCandidates(candidates: readonly FoodMatchCandidate[]): FoodMatchCandidateSummary[] {
@@ -409,6 +522,9 @@ function nutritionEstimateFromResolution(
       : {}),
     ...(fallbackEstimates.length > 0
       ? { fallbackEstimates, uncertain: true }
+      : {}),
+    ...(resolution.bestEffortEstimates.length > 0
+      ? { bestEffortEstimates: resolution.bestEffortEstimates, uncertain: true }
       : {}),
   };
 }
@@ -523,4 +639,10 @@ function requireInputObject(value: NutritionEstimateInput, name: string): Record
     throw new RangeError(`${name} must be an object`);
   }
   return candidate as Record<string, unknown>;
+}
+
+function resolutionMode(value: unknown): NutritionResolutionMode {
+  if (value === undefined || value === null || value === "confirm") return "confirm";
+  if (value === "agent_estimate") return value;
+  throw new RangeError("resolutionMode must be confirm or agent_estimate");
 }

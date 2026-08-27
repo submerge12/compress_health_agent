@@ -51,9 +51,27 @@ const formalCatalogShape: MealCatalog = {
       nameZh: "豆浆",
       aliases: ["豆浆"],
     }),
+    food({
+      slug: "烧饼",
+      name: "烧饼（加糖）",
+      nameZh: "烧饼（加糖）",
+      aliases: ["烧饼"],
+    }),
+    food({
+      slug: "glass_noodles",
+      name: "Glass noodles (mung bean)",
+      nameZh: "粉丝",
+    }),
+    food({
+      slug: "baby_napa",
+      name: "Baby napa cabbage",
+      nameZh: "娃娃菜",
+    }),
   ],
   naturalUnits: [
     { foodSlug: "egg", unit: "piece", aliases: ["个"], grams: 50 },
+    { foodSlug: "glass_noodles", unit: "bundle (dry)", aliases: ["把"], grams: 50 },
+    { foodSlug: "baby_napa", unit: "plant", aliases: ["棵"], grams: 200 },
   ],
 };
 
@@ -105,5 +123,24 @@ describe("Chinese meal input", () => {
     );
 
     expect(resolved.items).toEqual([{ slug: "egg", grams: 100 }]);
+  });
+
+  test("best-effort Agent conversion records colloquial lunch units without asking", () => {
+    const input = {
+      description: "1个烧饼，200克带壳虾，1把粉丝，1个娃娃菜",
+      resolutionMode: "agent_estimate" as const,
+    };
+    const result = nutritionEstimate(input, formalCatalogShape);
+
+    expect(result.needsConfirmation ?? []).toEqual([]);
+    expect(result.items).toEqual([
+      { slug: "烧饼", grams: 100 },
+      { slug: "glass_noodles", grams: 50 },
+      { slug: "baby_napa", grams: 200 },
+    ]);
+    expect(result.fallbackEstimates).toEqual([
+      expect.objectContaining({ segment: "200克带壳虾", grams: 200, confidence: "low" }),
+    ]);
+    expect(result.uncertain).toBe(true);
   });
 });
