@@ -1,6 +1,7 @@
 import type { FoodPortionRecord, NaturalUnitRecord, ResolvedPortion } from "./types.js";
 
 const GRAMS_PATTERN = /^(\d+(?:\.\d+)?)\s*(?:g|克)$/i;
+const MILLILITERS_PATTERN = /^(\d+(?:\.\d+)?)\s*(?:ml|毫升)$/i;
 const COUNT_UNIT_PATTERN = /^(\d+(?:\.\d+)?)\s*(.+)$/;
 
 export function resolveNaturalPortion(
@@ -21,6 +22,25 @@ export function resolveNaturalPortion(
     }
     const grams = parsePositiveNumber(gramsText, "grams");
     return { grams, quantity: grams, unit: "g", source: "grams" };
+  }
+
+  const millilitersMatch = normalized.match(MILLILITERS_PATTERN);
+  if (millilitersMatch) {
+    const [, millilitersText] = millilitersMatch;
+    if (millilitersText === undefined) {
+      throw new RangeError(`Could not parse portion: ${normalized}`);
+    }
+    const quantity = parsePositiveNumber(millilitersText, "milliliters");
+    const density = food.gramsPerMilliliter;
+    if (density === undefined || density === null) {
+      throw new RangeError(`Food has no milliliter conversion: ${food.slug}`);
+    }
+    return {
+      grams: roundTo(quantity * assertPositiveNumber(density, "gramsPerMilliliter"), 3),
+      quantity,
+      unit: "ml",
+      source: "milliliters",
+    };
   }
 
   const unitMatch = normalized.match(COUNT_UNIT_PATTERN);

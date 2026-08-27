@@ -24,7 +24,9 @@ import { handleNutritionEstimate } from "../tools/handlers.js";
 import type { NutritionEstimateResult } from "../tools/nutrition-estimate.js";
 import type { ToolContext } from "../tools/context.js";
 import { aggregateNutrition } from "../engine/nutrition.js";
+import { resolveNaturalPortion } from "../engine/natural-units.js";
 import type { NutritionEntry } from "../engine/types.js";
+import { extractExplicitPortion } from "../tools/portion-text.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 type DietLogRow = typeof schema.dietLogs.$inferSelect;
@@ -331,9 +333,9 @@ export async function resolveConfirmedFoodCandidates(
     const diagnostic = unmatched[index]!;
     const choice = selections[`unmatched_${index}`];
     if (!choice) throw new CandidateSelectionError(`unmatched_response_missing_${index}`);
-    const weight = diagnostic.segment.match(/\d+(?:\.\d+)?\s*(?:g|grams?|克)/i)?.[0] ?? "";
+    const portion = extractExplicitPortion(diagnostic.segment) ?? "";
     const resolved = await handleNutritionEstimate(ctx, {
-      description: `${choice}${weight}`,
+      description: `${choice}${portion}`,
     });
     if ((resolved.needsConfirmation?.length ?? 0) > 0 || (resolved.unmatched?.length ?? 0) > 0) {
       throw new CandidateSelectionError(`unmatched_choice_did_not_resolve_${index}`);
@@ -367,15 +369,8 @@ function gramsForSelection(
   food: ToolContext["catalog"]["foods"][number],
   ctx: ToolContext,
 ): number {
-  const grams = segment.match(/(\d+(?:\.\d+)?)\s*(?:g|grams?|克)/i);
-  if (grams?.[1]) return Number(grams[1]);
-  const counted = segment.match(/(\d+(?:\.\d+)?)\s*([A-Za-z\u4e00-\u9fff]+)/);
-  if (counted?.[1] && counted[2]) {
-    const unit = ctx.catalog.naturalUnits.find((entry) =>
-      entry.foodSlug === food.slug
-      && (entry.unit === counted[2] || entry.aliases?.includes(counted[2]!)));
-    if (unit) return Number(counted[1]) * unit.grams;
-  }
+  const portion = extractExplicitPortion(segment);
+  if (portion) return resolveNaturalPortion(portion, food, ctx.catalog.naturalUnits).grams;
   return food.defaultGrams ?? 100;
 }
 

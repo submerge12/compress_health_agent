@@ -1138,7 +1138,10 @@ describe("MCP 2026-07-28 stdio wire", () => {
 
   it("replays a successful plan activation from the original receipt", async () => {
     const binding = `mcp-wire-activate-replay-${process.pid}-${Date.now()}`;
-    const client = new WireClient({ externalUserId: binding });
+    const client = new WireClient({
+      externalUserId: binding,
+      testNow: "2026-08-26T04:00:00.000Z",
+    });
     clients.push(client);
     const begun = await client.request(toolCall(1, "health_begin_run", {
       objective: "wire activation success replay",
@@ -1548,6 +1551,9 @@ describe("MCP 2026-07-28 stdio wire", () => {
            WHERE aggregate_id = ${waterLogId}) AS repaired_status,
           (SELECT count(*)::int FROM compass_health.outbox_events
            WHERE type = 'projection.replayed'
+             AND user_id = (
+               SELECT id FROM compass_health.users WHERE external_id = ${externalUserId}
+             )
              AND payload_json ->> 'observedOn' = '2026-08-24') AS replay_outbox,
           (SELECT count(*)::int FROM compass_health.interaction_events interaction
            JOIN compass_health.users usr ON usr.id = interaction.user_id
@@ -1952,6 +1958,79 @@ describe("MCP 2026-07-28 stdio wire", () => {
       expect(rows).toHaveLength(1);
       const ingredients = rows[0]?.ingredients_json as Array<{ slug: string }>;
       expect(ingredients.map((item) => item.slug)).toEqual([chosen]);
+    } finally {
+      await sql.end({ timeout: 3 });
+    }
+  }, 30_000);
+
+  it("logs an explicit Chinese voice breakfast without entering MRTR", async () => {
+    const binding = `mcp-wire-chinese-breakfast-${process.pid}-${Date.now()}`;
+    const client = new WireClient({ externalUserId: binding });
+    clients.push(client);
+    const begun = await client.request(toolCall(1, "health_begin_run", {
+      objective: "wire Chinese voice breakfast",
+      idempotencyKey: "wire-run-chinese-breakfast",
+    }));
+    const runHandle = (begun.result?.structuredContent as { runHandle: string }).runHandle;
+    const args = {
+      runHandle,
+      date: "2026-08-27",
+      mealType: "breakfast",
+      description: "两个水煮鸡蛋，豆浆不到一升；用户随后确认豆浆为600毫升",
+      items: [
+        { name: "水煮鸡蛋", quantity: 2, unit: "个" },
+        { name: "无糖原味豆浆", quantity: 600, unit: "ml" },
+      ],
+      idempotencyKey: "wire-chinese-breakfast-once",
+    };
+
+    const logged = await client.request(toolCall(2, "health_log_meal", args));
+    expect(logged.result?.resultType).toBe("complete");
+    const body = logged.result?.structuredContent as {
+      dietLogId: string;
+      receiptId: string;
+      replayed: boolean;
+    };
+    expect(body).toMatchObject({
+      dietLogId: expect.any(String),
+      receiptId: expect.any(String),
+      replayed: false,
+    });
+
+    const replayed = await client.request(toolCall(3, "health_log_meal", args));
+    expect(replayed.result?.resultType).toBe("complete");
+    expect(replayed.result?.structuredContent).toMatchObject({
+      dietLogId: body.dietLogId,
+      receiptId: body.receiptId,
+      replayed: true,
+    });
+
+    const sql = postgres(DATABASE_URL, { max: 1, prepare: false });
+    try {
+      const rows = await sql<Array<{
+        ingredients_json: Array<{ slug: string; grams: number }>;
+        log_count: number;
+        pending_count: number;
+      }>>`
+        SELECT
+          log.ingredients_json,
+          count(*) OVER ()::int AS log_count,
+          (
+            SELECT count(*)::int
+            FROM compass_health.mcp_pending_input_requests pending
+            WHERE pending.run_id = ${runHandle}::uuid
+              AND pending.tool_name = 'health_log_meal'
+          ) AS pending_count
+        FROM compass_health.diet_logs log
+        JOIN compass_health.users usr ON usr.id = log.user_id
+        WHERE usr.external_id = ${binding}
+          AND log.idempotency_key = 'wire-chinese-breakfast-once'`;
+      expect(rows).toHaveLength(1);
+      expect(rows[0]).toMatchObject({ log_count: 1, pending_count: 0 });
+      expect(rows[0]!.ingredients_json).toEqual([
+        { slug: "egg", grams: 100 },
+        { slug: "soy_milk", grams: 600 },
+      ]);
     } finally {
       await sql.end({ timeout: 3 });
     }

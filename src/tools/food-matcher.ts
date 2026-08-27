@@ -1,4 +1,5 @@
 import type { MealCatalog, FoodCatalogRecord } from "./nutrition-estimate.js";
+import { stripLeadingPortion } from "./portion-text.js";
 
 export type FoodMatchType = "exact" | "alias" | "fuzzy" | "semantic";
 
@@ -16,9 +17,6 @@ interface LabelCandidate {
 }
 
 type FoodSource = MealCatalog | readonly FoodCatalogRecord[];
-
-const LEADING_PORTION_PATTERN =
-  /^\s*\d+(?:\.\d+)?\s*(?:g|grams?|servings?|serving|pieces?|piece|bowls?|bowl|cups?|cup|份|个|只|碗|克)?\s*/i;
 
 const TRADITIONAL_TO_SIMPLIFIED: Readonly<Record<string, string>> = {
   雞: "鸡",
@@ -99,7 +97,7 @@ export function rankFoodCandidates(
     }
   }
 
-  return [...bySlug.values()]
+  return collapseCatalogDuplicates([...bySlug.values()])
     .sort(compareCandidates)
     .slice(0, Math.max(0, limit));
 }
@@ -132,7 +130,7 @@ function addLabel(labels: LabelCandidate[], value: string | null | undefined, is
 function normalizedSegmentForms(segment: string): string[] {
   const forms = [
     normalize(segment),
-    normalize(segment.replace(LEADING_PORTION_PATTERN, "")),
+    normalize(stripLeadingPortion(segment)),
   ];
   return [...new Set(forms.filter(Boolean))];
 }
@@ -193,6 +191,54 @@ function compareCandidates(left: FoodMatchCandidate, right: FoodMatchCandidate):
   const typeOrder = typeRank(right.matchType) - typeRank(left.matchType);
   if (typeOrder !== 0) return typeOrder;
   return left.food.slug.localeCompare(right.food.slug);
+}
+
+function collapseCatalogDuplicates(candidates: FoodMatchCandidate[]): FoodMatchCandidate[] {
+  const kept: FoodMatchCandidate[] = [];
+  for (const candidate of candidates) {
+    const duplicateIndex = kept.findIndex((existing) => sameLegacyFood(existing.food, candidate.food));
+    if (duplicateIndex < 0) {
+      kept.push(candidate);
+      continue;
+    }
+    const existing = kept[duplicateIndex]!;
+    const preferred = foodRecordQuality(candidate.food) > foodRecordQuality(existing.food)
+      ? candidate
+      : existing;
+    kept[duplicateIndex] = {
+      ...preferred,
+      score: Math.max(existing.score, candidate.score),
+    };
+  }
+  return kept;
+}
+
+function sameLegacyFood(left: FoodCatalogRecord, right: FoodCatalogRecord): boolean {
+  const leftPortable = /^[a-z0-9_]+$/.test(left.slug);
+  const rightPortable = /^[a-z0-9_]+$/.test(right.slug);
+  if (leftPortable === rightPortable) return false;
+
+  const leftIdentity = normalize(left.nameZh ?? left.name ?? "");
+  const rightIdentity = normalize(right.nameZh ?? right.name ?? "");
+  if (!leftIdentity || leftIdentity !== rightIdentity) return false;
+
+  return [
+    [left.kcalPer100g, right.kcalPer100g],
+    [left.proteinGramsPer100g, right.proteinGramsPer100g],
+    [left.carbsGramsPer100g, right.carbsGramsPer100g],
+    [left.fatGramsPer100g, right.fatGramsPer100g],
+  ].every(([a, b]) => relativeDifference(a!, b!) <= 0.4);
+}
+
+function foodRecordQuality(food: FoodCatalogRecord): number {
+  return (/^[a-z0-9_]+$/.test(food.slug) ? 8 : 0)
+    + (food.category ? 4 : 0)
+    + Math.min(food.aliases?.length ?? 0, 4)
+    + (food.gramsPerMilliliter ? 2 : 0);
+}
+
+function relativeDifference(left: number, right: number): number {
+  return Math.abs(left - right) / Math.max(Math.abs(left), Math.abs(right), 1);
 }
 
 function typeRank(type: FoodMatchType): number {

@@ -66,6 +66,8 @@ export interface FoodPortionRecord {
   slug: string;
   defaultGrams?: number | null;
   defaultUnit?: string | null;
+  /** Known food density for explicit ml portions. Omitted when volume conversion is unsafe. */
+  gramsPerMilliliter?: number | null;
 }
 
 export interface NaturalUnitRecord {
@@ -75,7 +77,7 @@ export interface NaturalUnitRecord {
   aliases?: readonly string[];
 }
 
-export type PortionSource = "grams" | "natural_unit" | "default_portion";
+export type PortionSource = "grams" | "milliliters" | "natural_unit" | "default_portion";
 
 export interface ResolvedPortion {
   grams: number;

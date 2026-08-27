@@ -76,6 +76,22 @@ import type { ActorProfileInput } from "../auth/actor-registry.js";
 type Db = PostgresJsDatabase<typeof schema>;
 
 const ISO_DATE = { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" } as const;
+const MEAL_ITEM_UNITS = [
+  "g",
+  "克",
+  "ml",
+  "毫升",
+  "个",
+  "只",
+  "颗",
+  "枚",
+  "碗",
+  "杯",
+  "份",
+  "片",
+  "根",
+] as const;
+type MealItemUnit = typeof MEAL_ITEM_UNITS[number];
 const PLAN_TARGET_PROPERTIES = {
   dayRole: { type: "string", enum: ["A", "B", "C"] },
   exerciseSlug: { type: "string", minLength: 1 },
@@ -425,6 +441,36 @@ export function createHealthToolCatalog(
       return value.trim();
     });
     return [...new Set(values)];
+  }
+
+  /**
+   * Prefer the Agent's explicit food/quantity conversion over reparsing the
+   * conversational audit text. The domain estimator still owns catalog
+   * matching, natural-unit conversion, nutrition, and ambiguity handling.
+   */
+  function mealDescriptionForEstimate(args: Record<string, unknown>): string {
+    const rawItems = args["items"];
+    if (rawItems === undefined || rawItems === null) return str(args, "description");
+    if (!Array.isArray(rawItems) || rawItems.length === 0) {
+      throw new RangeError("items must be a non-empty array when provided");
+    }
+
+    const allowedUnits = new Set<string>(MEAL_ITEM_UNITS);
+    return rawItems.map((rawItem, index) => {
+      if (!rawItem || typeof rawItem !== "object" || Array.isArray(rawItem)) {
+        throw new RangeError(`items[${index}] must be an object`);
+      }
+      const item = rawItem as Record<string, unknown>;
+      const name = typeof item["name"] === "string" ? item["name"].trim() : "";
+      const quantity = Number(item["quantity"]);
+      const unit = typeof item["unit"] === "string" ? item["unit"].trim() : "";
+      if (!name) throw new RangeError(`items[${index}].name is required`);
+      if (!Number.isFinite(quantity) || quantity <= 0) {
+        throw new RangeError(`items[${index}].quantity must be greater than zero`);
+      }
+      if (!allowedUnits.has(unit)) throw new RangeError(`items[${index}].unit is invalid`);
+      return `${quantity}${unit as MealItemUnit}${name}`;
+    }).join("，");
   }
 
   function acceptedSelections(responses: Record<string, unknown> | undefined): Record<string, string> {
@@ -1236,7 +1282,7 @@ export function createHealthToolCatalog(
     },
     {
       name: "health_log_meal",
-      description: "Log a meal by description. Ambiguous items return standard MCP input_required candidate choices.",
+      description: "Log a meal after converting the user's natural language into structured food items. Preserve the user's original words in description; put each resolved food name, quantity, and unit in items. The server validates catalog matches and portions, and returns standard MCP input_required only for genuine ambiguity.",
       risk: "revocable-write",
       inputSchema: {
         type: "object",
@@ -1244,7 +1290,23 @@ export function createHealthToolCatalog(
           runHandle: { type: "string" },
           date: ISO_DATE,
           mealType: { type: "string", enum: ["breakfast", "lunch", "dinner", "snack"] },
-          description: { type: "string", description: "Free-text meal description." },
+          description: { type: "string", description: "The user's original meal description, retained as audit text." },
+          items: {
+            type: "array",
+            minItems: 1,
+            maxItems: 30,
+            description: "Agent-converted food entries. Prefer this over asking the user to format their input.",
+            items: {
+              type: "object",
+              properties: {
+                name: { type: "string", minLength: 1, maxLength: 200 },
+                quantity: { type: "number", exclusiveMinimum: 0 },
+                unit: { type: "string", enum: MEAL_ITEM_UNITS },
+              },
+              required: ["name", "quantity", "unit"],
+              additionalProperties: false,
+            },
+          },
           idempotencyKey: { type: "string", description: "Stable key for retries." },
           expectedRevision: { type: "number" },
         },
@@ -1320,7 +1382,7 @@ export function createHealthToolCatalog(
 
           // First call: preview; ambiguous -> MRTR.
           const previewResult = await diet.preview(ctx, {
-            description: str(inv.args, "description"),
+            description: mealDescriptionForEstimate(inv.args),
             date: optStr(inv.args, "date") ?? await today(inv.principalUserId),
             mealType: str(inv.args, "mealType"),
           });

@@ -9,6 +9,7 @@ import type {
   NutritionRecord,
 } from "../engine/types.js";
 import { rankFoodCandidates, type FoodMatchCandidate } from "./food-matcher.js";
+import { extractExplicitPortion } from "./portion-text.js";
 import type { NutrientSnapshot } from "./store.js";
 
 export interface FoodCatalogRecord extends FoodPortionRecord, NutritionRecord {
@@ -105,8 +106,6 @@ interface MatchedFood {
 }
 
 const SPLIT_PATTERN = /\s*(?:\+|,|，|、|;|；|\band\b)\s*|(?<=[一-鿿])\s+(?=\d)/;
-const GRAMS_PATTERN = /(\d+(?:\.\d+)?)\s*(?:g|grams?|克)/i;
-const COUNT_UNIT_PATTERN = /(\d+(?:\.\d+)?)\s*([A-Za-z\u4e00-\u9fff]+)/;
 const HIGH_CONFIDENCE = 0.55;
 const LOW_CONFIDENCE = 0.25;
 const AMBIGUITY_DELTA = 0.001;
@@ -271,7 +270,7 @@ function parseMealSegment(segment: string, catalog: MealCatalog): SegmentResolut
   if (match.kind !== "matched") return match;
 
   try {
-    const portion = extractPortion(segment, match.label);
+    const portion = extractExplicitPortion(segment);
     const resolved = resolveNaturalPortion(portion, match.food, catalog.naturalUnits);
     return {
       kind: "matched",
@@ -301,7 +300,7 @@ async function parseMealSegmentWithSemanticFallback(
   if (match.kind !== "matched") return match;
 
   try {
-    const portion = extractPortion(segment, match.label);
+    const portion = extractExplicitPortion(segment);
     const resolved = resolveNaturalPortion(portion, match.food, catalog.naturalUnits);
     return {
       kind: "matched",
@@ -384,19 +383,6 @@ function summarizeCandidates(candidates: readonly FoodMatchCandidate[]): FoodMat
 
 function isAmbiguous(best: FoodMatchCandidate, second: FoodMatchCandidate | undefined): boolean {
   return second !== undefined && best.score - second.score <= AMBIGUITY_DELTA;
-}
-
-function extractPortion(segment: string, label: string): string | null {
-  const withoutFood = segment.replace(new RegExp(escapePattern(label), "i"), " ").trim();
-  const grams = withoutFood.match(GRAMS_PATTERN);
-  if (grams !== null) {
-    return `${grams[1]}g`;
-  }
-  const counted = withoutFood.match(COUNT_UNIT_PATTERN);
-  if (counted !== null) {
-    return `${counted[1]}${counted[2]}`;
-  }
-  return null;
 }
 
 function nutritionEstimateFromResolution(
@@ -537,8 +523,4 @@ function requireInputObject(value: NutritionEstimateInput, name: string): Record
     throw new RangeError(`${name} must be an object`);
   }
   return candidate as Record<string, unknown>;
-}
-
-function escapePattern(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

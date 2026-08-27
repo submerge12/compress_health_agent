@@ -3,6 +3,7 @@ import type { PostgresJsDatabase } from "drizzle-orm/postgres-js";
 import * as schema from "./schema.js";
 import type { FoodCatalogRecord, MealCatalog } from "../tools/nutrition-estimate.js";
 import type { NaturalUnitRecord, NutritionWeightType } from "../engine/types.js";
+import { gramsPerMilliliterForFood } from "../engine/food-density.js";
 
 type Db = PostgresJsDatabase<typeof schema>;
 
@@ -41,6 +42,7 @@ export async function loadMealCatalog(db: Db): Promise<MealCatalog> {
     category: row.category,
     defaultGrams: null,
     defaultUnit: null,
+    gramsPerMilliliter: gramsPerMilliliterForFood(row.slug),
     kcalPer100g: row.caloriesKcal,
     proteinGramsPer100g: row.proteinGrams,
     carbsGramsPer100g: row.carbsGrams,
